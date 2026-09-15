@@ -1,0 +1,15 @@
+services:
+  uniseller:
+    build: .
+    ports:
+      - "127.0.0.1:5173:5173"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - uniseller-data:/data
+    restart: unless-stopped
+
+volumes:
+  uniseller-data:

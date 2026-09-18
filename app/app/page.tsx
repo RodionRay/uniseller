@@ -1,7 +1,7 @@
 "use client";
 import {useState,useEffect,useCallback,useRef,useMemo,Suspense} from 'react';
 import {useSearchParams} from 'next/navigation';
-import {Users,Radio,Shield,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge} from 'lucide-react';
+import {Users,Radio,Shield,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge,AlertTriangle,BarChart3,Folder,CircleX} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {OverviewDashboard} from '@/components/product/overview-dashboard';
 import {LeadCorePanel} from '@/components/product/lead-core-panel';
@@ -39,12 +39,18 @@ import {
   TELEGRAM_RECOMMENDED_LIMITS,
   JOIN_GAP_DEFAULT_SEC,
   PROXY_STATUS_LABELS,
+  accountAvatarColor,
+  accountLimitsUsage,
   accountStatusTone,
+  accountUpdatedAt,
   cooldownHoursFromNow,
   cooldownLabel,
+  cooldownRemainingShort,
   generateTelegramUsername,
   isAccountUsable,
   isOnCooldown,
+  moscowNextMidnightIso,
+  relativeTimeRu,
   type AccountStatus,
   type SessionMode,
 } from '@/lib/telegram-accounts';
@@ -133,7 +139,7 @@ AI будет использовать этот текст для отбора �
   invite_task:{...DEFAULT_INVITE_TASK},
   mailing_task:{...DEFAULT_MAILING_TASK},
 };
-const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов и черновики: менеджер подключается здесь. Уведомление уходит в Telegram-бота.','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Импорт tdata/session, статусы, лимиты и отлежка.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
+const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов и черновики: менеджер подключается здесь. Уведомление уходит в Telegram-бота.','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
 
 async function api(body?:unknown){
   const r=await fetch('/api/workspace',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});
@@ -360,6 +366,67 @@ function accountRowStatus(data:any){
 
 function isAccountWorkable(data:any){
   return isAccountUsable(data);
+}
+
+function accountDisplayName(data:any){
+  const full=[data.firstName,data.lastName].filter(Boolean).join(' ').trim();
+  return full||String(data.name||'').trim()||'Без имени';
+}
+
+function accountIdentityLine(data:any,id:string){
+  if(data.username)return `@${String(data.username).replace(/^@/,'')}`;
+  if(data.phone)return String(data.phone).replace(/\D/g,'')||data.phone;
+  return id.replace(/-/g,'').slice(0,12);
+}
+
+function AccountStatusCell({status,error,cooldownUntil}:{status:string;error?:string;cooldownUntil?:string}){
+  const tone=accountStatusTone(status);
+  const label=ACCOUNT_STATUS_LABELS[status as AccountStatus]||status;
+  const Icon=
+    status==='active'?Check:
+    status==='spamblock'||status==='frozen'?AlertTriangle:
+    status==='checking'?Loader2:
+    status==='cooldown'?Timer:
+    status==='disconnected'||status==='unauthorized'||status==='proxy_error'?CircleX:
+    status==='setup'?Plug:AlertTriangle;
+  const sub=
+    status==='spamblock'&&error?.includes('PEER_FLOOD')?'PEER_FLOOD':
+    status==='spamblock'&&isOnCooldown(cooldownUntil)?cooldownRemainingShort(cooldownUntil):
+    status==='spamblock'?'Требуется проверка':
+    status==='setup'?'Нужна сессия':
+    status==='checking'?'Идёт проверка…':
+    status==='cooldown'?cooldownRemainingShort(cooldownUntil)||cooldownLabel(cooldownUntil):
+    error?String(error).slice(0,80):'';
+  return (
+    <div className={`acc-status acc-status-${tone}`}>
+      <span className={`acc-status-icon ${status==='checking'?'is-spin':''}`} aria-hidden>
+        <Icon size={14}/>
+      </span>
+      <div className="acc-status-text">
+        <strong>{label}</strong>
+        {sub?<span title={error||sub}>{sub}</span>:null}
+      </div>
+    </div>
+  );
+}
+
+function AccountLimitsCell({data}:{data:any}){
+  const u=accountLimitsUsage(data);
+  const fmt=(used:number,limit:number)=>limit>0?`${used}/${limit}`:`${used}/∞`;
+  const over=(used:number,limit:number)=>limit>0&&used>=limit;
+  return (
+    <div className="acc-limits" title={`Сброс лимитов: ${new Date(moscowNextMidnightIso()).toLocaleString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})} МСК`}>
+      <span className={over(u.joins,u.inviteLimit)?'is-over':''} title="Вступления в группы">
+        <UserPlus size={13}/><em>{fmt(u.joins,u.inviteLimit)}</em>
+      </span>
+      <span className={over(u.messages,u.messageLimit)?'is-over':''} title="Личные сообщения">
+        <Send size={13}/><em>{fmt(u.messages,u.messageLimit)}</em>
+      </span>
+      <span className={over(u.memberInvites,u.memberInviteLimit)?'is-over':''} title="Инвайты людей · чат-лимит">
+        <MessageSquare size={13}/><em>{fmt(u.memberInvites,u.memberInviteLimit||u.chatLimit)}</em>
+      </span>
+    </div>
+  );
 }
 
 function WorkspaceHome(){
@@ -928,12 +995,31 @@ function WorkspaceHome(){
       toast.error('Запустите: npm run tg:worker');
       return;
     }
-    let toAdd=items.filter(i=>i.id);
+    let toAdd=items.filter(i=>{
+      if(!i.id)return false;
+      const g=list('group').find(x=>x.id===i.id)||records.find(x=>x.id===i.id);
+      if(g&&groupAlreadyIn(g)){
+        if(String(g.data.joinState||'')){
+          patchGroupLocal(g.id,{joinState:'',joinStateAt:'',joinStateError:''});
+          void persistJoinState(g.id,'');
+        }
+        return false;
+      }
+      return true;
+    });
+    if(!toAdd.length){
+      if(!opts?.resume)toast.message('Эти группы уже покрыты — вступление не нужно');
+      return;
+    }
     if(!opts?.resume){
       try{
         const enq=await api({action:'enqueue_joins',groupIds:toAdd.map(i=>i.id)});
-        if(Array.isArray(enq.items)&&enq.items.length){
+        if(Array.isArray(enq.items)){
           toAdd=enq.items.map((i:{id:string;name:string})=>({id:i.id,name:i.name||'Группа'}));
+          if(!toAdd.length){
+            toast.message('Эти группы уже покрыты — вступление не нужно');
+            return;
+          }
         }
       }catch(e){
         toast.error((e as Error).message||'Не удалось поставить в очередь');
@@ -975,9 +1061,17 @@ function WorkspaceHome(){
         saveJoinQueue(joinQueueRef.current,joinWorkRef.current);
         try{
           const cur=list('group').find(x=>x.id===g.id)||records.find(x=>x.id===g.id);
-          if(cur?.data?.membership==='joined'||cur?.data?.membership==='pending'||cur?.data?.joinedAt){
-            patchGroupLocal(g.id,{joinState:'',joinStateAt:'',joinStateError:'',membership:cur.data.membership==='pending'?'pending':'joined',status:cur.data.membership==='pending'?'pending':'active'});
-            setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:'Уже на аккаунте смеси'}:q));
+          if(cur&&groupAlreadyIn(cur)){
+            const pending=cur.data.membership==='pending'||cur.data.status==='pending';
+            patchGroupLocal(g.id,{
+              joinState:'',
+              joinStateAt:'',
+              joinStateError:'',
+              membership:pending?'pending':'joined',
+              status:pending?'pending':'active',
+              joinedAt:cur.data.joinedAt||new Date().toISOString(),
+            });
+            setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:'Уже в группе'}:q));
             void persistJoinState(g.id,'');
             onboarded++;
             continue;
@@ -1008,10 +1102,24 @@ function WorkspaceHome(){
             try{
               scan=await scanAfterJoin(g.id,g.name);
             }catch(scanErr){
+              const scanData=(scanErr as Error & {data?:any})?.data;
+              // Soft need_join после успешного join: membership сохраняем, не в авто-rejoin
+              const keepJoined=!!scanData?.soft||!!scanData?.preserved||!!scanData?.needJoin;
               void persistJoinState(g.id,'');
+              if(keepJoined){
+                patchGroupLocal(g.id,{
+                  status:'active',
+                  membership:'joined',
+                  joinedAt:new Date().toISOString(),
+                  joinState:'',
+                  joinStateAt:'',
+                  joinStateError:'',
+                  error:'',
+                });
+              }
               setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
               toast.message(`${g.name}: вступили, скан подхватит автообход`);
-              autoRescanPending.current=true;
+              // Не ставим autoRescanPending→rejoin: иначе снова в очередь
               onboarded++;
               await refresh();
               continue;
@@ -1099,8 +1207,16 @@ function WorkspaceHome(){
   useEffect(()=>{
     if(loading||joinResumeDone.current||joinRunnerLock.current)return;
     const fromDb=records
-      .filter(r=>r.kind==='group'&&JOIN_ACTIVE_STATES.has(String(r.data.joinState||'')))
+      .filter(r=>r.kind==='group'&&JOIN_ACTIVE_STATES.has(String(r.data.joinState||''))&&!groupAlreadyIn(r))
       .map(r=>({id:r.id,name:String(r.data.name||'Группа')}));
+    // Сбросить залипший joinState у уже вступивших (иначе UI крутит «В очереди»)
+    for(const r of records){
+      if(r.kind!=='group')continue;
+      if(!JOIN_ACTIVE_STATES.has(String(r.data.joinState||'')))continue;
+      if(!groupAlreadyIn(r))continue;
+      patchGroupLocal(r.id,{joinState:'',joinStateAt:'',joinStateError:''});
+      void persistJoinState(r.id,'');
+    }
     const saved=loadJoinQueue();
     const fromLs=saved.work.length
       ?saved.work
@@ -1406,6 +1522,7 @@ function WorkspaceHome(){
         const r=await api({action:'scan_group',id,force:!!opts?.force});
         if(r.skipped)continue;
         if(r.rejoinItem?.id){
+          if(r.soft||r.preserved)continue;
           rejoin.push({id:r.rejoinItem.id,name:r.rejoinItem.name||'Группа'});
           continue;
         }
@@ -1414,6 +1531,8 @@ function WorkspaceHome(){
       }catch(err){
         const data=(err as any)?.data;
         if(data?.rejoinItem?.id){
+          // Soft/preserved — не перекидываем в очередь вступлений
+          if(data?.soft||data?.preserved)continue;
           rejoin.push({id:data.rejoinItem.id,name:data.rejoinItem.name||'Группа'});
           continue;
         }
@@ -2443,7 +2562,7 @@ function WorkspaceHome(){
   const listSortTypes=useMemo(():Record<string,SortValueType>=>{
     if(currentKind==='lead')return{name:'string',temperature:'status',status:'status',source:'string',created:'date'};
     if(currentKind==='group')return{name:'string',account:'string',status:'status',sync:'date'};
-    if(currentKind==='account')return{name:'string',phone:'string',proxy:'string',status:'status'};
+    if(currentKind==='account')return{name:'string',status:'status',cooldown:'date',updated:'date',proxy:'string'};
     if(currentKind==='proxy')return{name:'string',host:'string',protocol:'string',status:'status'};
     return{};
   },[currentKind]);
@@ -2463,10 +2582,12 @@ function WorkspaceHome(){
       if(key==='sync')return r.data.lastScanned||'';
     }
     if(currentKind==='account'){
-      if(key==='name')return r.data.name||'';
+      if(key==='name')return accountDisplayName(r.data);
       if(key==='phone')return r.data.phone||'';
       if(key==='proxy')return records.find(x=>x.id===r.data.proxyId)?.data.name||'';
       if(key==='status')return accountRowStatus(r.data);
+      if(key==='cooldown')return isOnCooldown(r.data.cooldownUntil)?r.data.cooldownUntil:'';
+      if(key==='updated')return accountUpdatedAt(r.data,r.created);
     }
     if(currentKind==='proxy'){
       if(key==='name')return r.data.name||'';
@@ -2479,8 +2600,8 @@ function WorkspaceHome(){
 
   const {sorted:sortedList,sortKey,sortDir,onSort}=useTableSort(listRows,getListSortValue,{
     types:listSortTypes,
-    defaultKey:currentKind==='lead'?'created':null,
-    defaultDir:currentKind==='lead'?'desc':'asc',
+    defaultKey:currentKind==='lead'?'created':currentKind==='account'?'updated':null,
+    defaultDir:currentKind==='lead'||currentKind==='account'?'desc':'asc',
     resetKey:`${view}-${filter}-${groupFilter}-${leadGroupFilter}-${currentKind||''}`,
   });
 
@@ -2853,7 +2974,7 @@ function WorkspaceHome(){
           <div className="page-heading">
             <div>
               <div className="eyebrow">Telegram · UniLab</div>
-              <h1>{view==='Обзор'?'Обзор':view}</h1>
+              <h1>{view==='Обзор'?'Обзор':view==='Аккаунты'?'Менеджер аккаунтов':view}</h1>
               <p className="muted mt-2">{viewCopy[view]}</p>
             </div>
             <div className="flex flex-wrap gap-2 justify-end">
@@ -2867,7 +2988,7 @@ function WorkspaceHome(){
                 </>
               ):view==='Настройки'||view==='Сбор аудитории'||view==='Инвайтинг'||view==='Рассылка'||view==='Уведомления'||view==='Сотрудники'?null:(
                 <Button onClick={()=>open(currentKind||'group',currentKind==='settings'?settings:undefined)}>
-                  {currentKind==='settings'?<><Plus size={16}/>Настроить AI</>:<><Plus size={16}/>Добавить {labels[currentKind||'group']}</>}
+                  {currentKind==='settings'?<><Plus size={16}/>Настроить AI</>:currentKind==='account'?<><Plus size={16}/>Добавить аккаунты</>:<><Plus size={16}/>Добавить {labels[currentKind||'group']}</>}
                 </Button>
               )}
             </div>
@@ -3455,73 +3576,170 @@ function WorkspaceHome(){
                     </Button>
                   </div>
                 )}
-                <Table className={currentKind==='account'?'accounts-table':currentKind==='proxy'?'proxies-table':''}>
+                {currentKind==='account'?(
+                <Table className="accounts-table accounts-manager">
                   <TableHeader>
                     <TableRow>
-                      {currentKind==='account'&&(
-                        <TableHead className="w-10">
-                          <Checkbox
-                            checked={sortedList.length>0&&sortedList.every(r=>accountSelected.includes(r.id))}
-                            onCheckedChange={v=>setAccountSelected(v===true?sortedList.map(r=>r.id):[])}
-                            aria-label="Выбрать все аккаунты"
-                          />
-                        </TableHead>
-                      )}
+                      <TableHead className="w-10">
+                        <Checkbox
+                          checked={sortedList.length>0&&sortedList.every(r=>accountSelected.includes(r.id))}
+                          onCheckedChange={v=>setAccountSelected(v===true?sortedList.map(r=>r.id):[])}
+                          aria-label="Выбрать все аккаунты"
+                        />
+                      </TableHead>
+                      <SortableTableHead columnKey="name" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Аккаунт</SortableTableHead>
+                      <TableHead>
+                        <span className="acc-limits-head">
+                          Дневные лимиты
+                          <button
+                            type="button"
+                            className="acc-limits-refresh"
+                            title={`Сброс в полночь МСК (~${new Date(moscowNextMidnightIso()).toLocaleTimeString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})})`}
+                            onClick={()=>toast.message(`Дневные лимиты сбрасываются в полночь МСК (~${new Date(moscowNextMidnightIso()).toLocaleTimeString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})})`)}
+                          >
+                            <RefreshCw size={13}/>
+                          </button>
+                        </span>
+                      </TableHead>
+                      <SortableTableHead columnKey="status" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Статус</SortableTableHead>
+                      <SortableTableHead columnKey="cooldown" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Отлёжка</SortableTableHead>
+                      <SortableTableHead columnKey="proxy" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Связи</SortableTableHead>
+                      <SortableTableHead columnKey="updated" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Обновлено</SortableTableHead>
+                      <TableHead className="text-right w-[148px]">Действия</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {sortedList.map(r=>{
+                      const rowStatus=accountRowStatus(r.data);
+                      const displayName=accountDisplayName(r.data);
+                      const identity=accountIdentityLine(r.data,r.id);
+                      const avatarLetter=(displayName.replace(/^@/,'').trim()[0]||'?').toUpperCase();
+                      const proxy=records.find(x=>x.id===r.data.proxyId);
+                      const linkedGroups=records.filter(g=>g.kind==='group'&&(g.data.accountId===r.id||g.data.joinedAccountId===r.id));
+                      const coolLeft=cooldownRemainingShort(r.data.cooldownUntil);
+                      const updatedIso=accountUpdatedAt(r.data,r.created);
+                      const usage=accountLimitsUsage(r.data);
+                      return (
+                        <TableRow key={r.id} className={accountSelected.includes(r.id)?'bg-[rgba(255,169,44,0.06)]':''}>
+                          <TableCell>
+                            <Checkbox checked={accountSelected.includes(r.id)} onCheckedChange={v=>toggleAccountSelected(r.id,v===true)} aria-label={`Выбрать ${displayName}`}/>
+                          </TableCell>
+                          <TableCell className="min-w-0">
+                            <div className="acc-identity">
+                              <span className="acc-avatar" style={{background:accountAvatarColor(r.id+displayName)}} aria-hidden>{avatarLetter}</span>
+                              <div className="acc-identity-text min-w-0">
+                                <strong className="truncate" title={displayName}>{displayName}</strong>
+                                <span className="acc-id-line" title={identity}>{identity}</span>
+                                <div className="acc-meta-badges">
+                                  {r.data.format&&r.data.format!=='manual'&&<span className="badge neutral">{r.data.format}</span>}
+                                  {r.data.hasPhoto&&<span className="badge success">фото</span>}
+                                  {!r.hasSecret&&<span className="badge warning">нет сессии</span>}
+                                </div>
+                              </div>
+                            </div>
+                          </TableCell>
+                          <TableCell><AccountLimitsCell data={r.data}/></TableCell>
+                          <TableCell className="min-w-0">
+                            <AccountStatusCell status={rowStatus} error={r.data.error} cooldownUntil={r.data.cooldownUntil}/>
+                          </TableCell>
+                          <TableCell className="whitespace-nowrap">
+                            {coolLeft?(
+                              <span className="acc-cooldown is-on" title={cooldownLabel(r.data.cooldownUntil)}>{coolLeft}</span>
+                            ):(
+                              <span className="acc-cooldown is-off">Отключена</span>
+                            )}
+                          </TableCell>
+                          <TableCell className="min-w-0">
+                            <div className="acc-links">
+                              <span className={`acc-chip ${proxy?.data.status==='active'?'is-ok':proxy?'is-warn':'is-muted'}`} title={proxy?proxyDisplayLabel(proxy.data):'Прокси не назначен'}>
+                                <Network size={12}/>
+                                {proxy?proxyDisplayLabel(proxy.data).slice(0,18):'Без прокси'}
+                              </span>
+                              <span className={`acc-chip ${linkedGroups.length?'is-ok':'is-muted'}`} title={linkedGroups.length?linkedGroups.map(g=>g.data.name).join(', '):'Нет привязанных групп'}>
+                                <Folder size={12}/>
+                                {linkedGroups.length
+                                  ?(linkedGroups.length===1?String(linkedGroups[0]!.data.name||'Группа').slice(0,16):`${linkedGroups.length} групп`)
+                                  :'Нет групп'}
+                              </span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="whitespace-nowrap muted text-sm" title={updatedIso?new Date(updatedIso).toLocaleString('ru-RU'):''}>
+                            {relativeTimeRu(updatedIso)}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <div className="acc-actions">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                disabled={busy||r.data.status==='checking'}
+                                title="Проверить статус"
+                                aria-label={'Проверить '+displayName}
+                                onClick={()=>checkOneAccount(r)}
+                              >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<Plug size={15}/>}</Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title="Статистика лимитов"
+                                aria-label={'Статистика '+displayName}
+                                onClick={()=>setTaskLog({
+                                  title:`Статистика · ${displayName}`,
+                                  log:[
+                                    {at:new Date().toISOString(),level:'info',text:`Статус: ${ACCOUNT_STATUS_LABELS[rowStatus as AccountStatus]||rowStatus}`},
+                                    {at:new Date().toISOString(),level:'info',text:`Вступления сегодня: ${usage.joins}/${usage.inviteLimit||'∞'}`},
+                                    {at:new Date().toISOString(),level:'info',text:`Сообщения сегодня: ${usage.messages}/${usage.messageLimit||'∞'}`},
+                                    {at:new Date().toISOString(),level:'info',text:`Инвайты людей: ${usage.memberInvites}/${usage.memberInviteLimit||'∞'}`},
+                                    {at:new Date().toISOString(),level:coolLeft?'warn':'info',text:coolLeft?`Отлёжка ещё ${coolLeft} (${cooldownLabel(r.data.cooldownUntil)})`:'Отлёжка отключена'},
+                                    {at:new Date().toISOString(),level:'info',text:proxy?`Прокси: ${proxyDisplayLabel(proxy.data)} (${proxy.data.status||'?'})`:'Прокси не назначен'},
+                                    {at:new Date().toISOString(),level:'info',text:linkedGroups.length?`Групп: ${linkedGroups.map(g=>g.data.name||'—').join(', ')}`:'Групп не назначено'},
+                                    ...(r.data.error?[{at:new Date().toISOString(),level:'error',text:String(r.data.error)}]:[]),
+                                  ],
+                                })}
+                              ><BarChart3 size={15}/></Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title={isOnCooldown(r.data.cooldownUntil)?'Снять отлёжку':'Отлёжка 24ч'}
+                                aria-label="Отлёжка"
+                                onClick={()=>setAccountCooldown(r,isOnCooldown(r.data.cooldownUntil)?null:24)}
+                              ><Timer size={15}/></Button>
+                              <Button variant="ghost" size="icon" aria-label={'Изменить '+displayName} onClick={()=>open(r.kind,r)}><Pencil size={15}/></Button>
+                              <Button variant="ghost" size="icon" className="text-[var(--spike-danger,#fb977d)]" aria-label={'Удалить '+displayName} onClick={()=>setDeleting(r)}><Trash2 size={15}/></Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+                ):(
+                <Table className="proxies-table">
+                  <TableHeader>
+                    <TableRow>
                       <SortableTableHead columnKey="name" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Название</SortableTableHead>
-                      <SortableTableHead columnKey={currentKind==='account'?'phone':'host'} sortKey={sortKey} sortDir={sortDir} onSort={onSort}>
-                        {currentKind==='account'?'Телефон':'Адрес'}
-                      </SortableTableHead>
-                      <SortableTableHead columnKey={currentKind==='account'?'proxy':'protocol'} sortKey={sortKey} sortDir={sortDir} onSort={onSort}>
-                        {currentKind==='account'?'Прокси':'Тип'}
-                      </SortableTableHead>
+                      <SortableTableHead columnKey="host" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Адрес</SortableTableHead>
+                      <SortableTableHead columnKey="protocol" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Тип</SortableTableHead>
                       <SortableTableHead columnKey="status" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Состояние</SortableTableHead>
                       <TableHead className="text-right w-[140px]">Действия</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {sortedList.map(r=>{
-                      const rowStatus=currentKind==='account'?accountRowStatus(r.data):(r.data.status||'inactive');
+                      const rowStatus=r.data.status||'inactive';
                       return (
-                      <TableRow key={r.id} className={currentKind==='account'&&accountSelected.includes(r.id)?'bg-[rgba(255,169,44,0.06)]':''}>
-                        {currentKind==='account'&&(
-                          <TableCell>
-                            <Checkbox checked={accountSelected.includes(r.id)} onCheckedChange={v=>toggleAccountSelected(r.id,v===true)} aria-label={`Выбрать ${r.data.name}`}/>
-                          </TableCell>
-                        )}
+                      <TableRow key={r.id}>
                         <TableCell className="font-semibold min-w-0">
-                          {currentKind==='proxy'?(
-                            <span className={`proxy-ref ${r.data.status==='active'?'is-active':r.data.status==='checking'?'is-checking':''}`} title={proxyDisplayLabel(r.data)}>
-                              <span className="proxy-ref-name">{proxyDisplayLabel(r.data)}</span>
-                            </span>
-                          ):(
-                            <>
-                              <span className="block truncate" title={r.data.name}>{r.data.name}</span>
-                              {currentKind==='account'&&r.data.format&&r.data.format!=='manual'&&(
-                                <span className="badge neutral ml-0 mt-1">{r.data.format}</span>
-                              )}
-                              {currentKind==='account'&&r.data.hasPhoto&&(
-                                <span className="badge success ml-1 mt-1">фото</span>
-                              )}
-                              {currentKind==='account'&&r.data.about&&(
-                                <p className="small-note mt-1 font-normal line-clamp-1">{r.data.about}</p>
-                              )}
-                            </>
-                          )}
+                          <span className={`proxy-ref ${r.data.status==='active'?'is-active':r.data.status==='checking'?'is-checking':''}`} title={proxyDisplayLabel(r.data)}>
+                            <span className="proxy-ref-name">{proxyDisplayLabel(r.data)}</span>
+                          </span>
                         </TableCell>
                         <TableCell className="whitespace-nowrap font-variant-numeric tabular-nums">
-                          {currentKind==='account'
-                            ?(r.data.phone||'—')
-                            :(r.data.host&&r.data.port?`${r.data.host}:${r.data.port}`:'—')}
+                          {r.data.host&&r.data.port?`${r.data.host}:${r.data.port}`:'—'}
                         </TableCell>
-                        <TableCell className="min-w-0">
-                          {currentKind==='proxy'
-                            ? String(r.data.protocol||'').toUpperCase()
-                            : <ProxyRefLabel proxy={records.find(x=>x.id===r.data.proxyId)}/>}
-                        </TableCell>
-                        <TableCell className={currentKind==='proxy'?'proxy-status-cell min-w-0':'min-w-0 max-w-[280px]'}>
+                        <TableCell className="min-w-0">{String(r.data.protocol||'').toUpperCase()}</TableCell>
+                        <TableCell className="proxy-status-cell min-w-0">
                           <>
-                            {statusBadge(rowStatus,currentKind)}
-                            {currentKind==='proxy'&&(()=>{
+                            {statusBadge(rowStatus,'proxy')}
+                            {(()=>{
                               const bits:string[]=[];
                               if(r.data.status!=='checking'&&r.data.exitIp){
                                 bits.push(`IP ${r.data.exitIp}${r.data.telegramOk===false?' · TG?':r.data.telegramOk===true?' · TG ok':''}`);
@@ -3535,45 +3753,18 @@ function WorkspaceHome(){
                                 </p>
                               );
                             })()}
-                            {currentKind==='account'&&isOnCooldown(r.data.cooldownUntil)&&(
-                              <p className="small-note mt-1">{cooldownLabel(r.data.cooldownUntil)}</p>
-                            )}
-                            {currentKind==='account'&&r.data.error&&(
-                              <p className="small-note mt-1 text-[var(--spike-danger,#b91c1c)] line-clamp-2" title={r.data.error}>{r.data.error}</p>
-                            )}
                           </>
                         </TableCell>
                         <TableCell className="text-right w-[140px]">
-                          <div className={currentKind==='proxy'?'proxy-actions':'flex justify-end gap-1'}>
-                            {currentKind==='proxy'&&(
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                disabled={busy||r.data.status==='checking'}
-                                title={r.data.status==='active'?'Проверить снова':'Перезапустить проверку'}
-                                aria-label={'Проверить '+r.data.name}
-                                onClick={()=>checkOneProxy(r)}
-                              >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<RefreshCw size={15}/>}</Button>
-                            )}
-                            {currentKind==='account'&&(
-                              <>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  disabled={busy||r.data.status==='checking'}
-                                  title="Проверить статус"
-                                  aria-label={'Проверить '+r.data.name}
-                                  onClick={()=>checkOneAccount(r)}
-                                >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<Plug size={15}/>}</Button>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  title={isOnCooldown(r.data.cooldownUntil)?'Снять отлежку':'Отлежка 24ч'}
-                                  aria-label="Отлежка"
-                                  onClick={()=>setAccountCooldown(r,isOnCooldown(r.data.cooldownUntil)?null:24)}
-                                ><Check size={15}/></Button>
-                              </>
-                            )}
+                          <div className="proxy-actions">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              disabled={busy||r.data.status==='checking'}
+                              title={r.data.status==='active'?'Проверить снова':'Перезапустить проверку'}
+                              aria-label={'Проверить '+r.data.name}
+                              onClick={()=>checkOneProxy(r)}
+                            >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<RefreshCw size={15}/>}</Button>
                             <Button variant="ghost" size="icon" aria-label={'Изменить '+r.data.name} onClick={()=>open(r.kind,r)}><Pencil size={15}/></Button>
                             <Button variant="ghost" size="icon" aria-label={'Удалить '+r.data.name} onClick={()=>setDeleting(r)}><Trash2 size={15}/></Button>
                           </div>
@@ -3582,6 +3773,7 @@ function WorkspaceHome(){
                     )})}
                   </TableBody>
                 </Table>
+                )}
                 </>
               ):(
                 <Empty className="empty-state border-0">

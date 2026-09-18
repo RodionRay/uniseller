@@ -619,7 +619,8 @@ async def join_group(client, url: str) -> dict[str, Any]:
                 perms = await client.get_permissions(entity)
                 return bool(perms) and not getattr(perms, "has_left", False)
             except Exception:
-                return False
+                # Неизвестно — не форсим need_join (иначе цикл join→scan→requeue)
+                return True
 
     ref = parse_group_ref(url)
     try:

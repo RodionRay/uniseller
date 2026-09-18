@@ -1086,25 +1086,28 @@ async function healDeadGroupAccounts(owner:string){
    const joinBusy=['queued','waiting','joining','scanning'].includes(String(d.joinState||''));
    const alreadyIn=groupLooksJoined(d);
 
-   // Отлёжка / мёртвый слот: пересаживаем, иначе лиды не собрать
+   // Отлёжка / мёртвый слот: пересаживаем только непокрытые; уже вступившие на
+   // отлёжке не трогаем — иначе membership wipe → бесконечная очередь.
    if((onCooldown&&!hardDead)||hardDead){
     if(!liveIds.length){
-     if(joinBusy)enqueue(gid,String(d.name||'Группа'));
+     if(joinBusy&&!alreadyIn)enqueue(gid,String(d.name||'Группа'));
      continue;
     }
     const nextAcc=liveIds[cursor%liveIds.length];
     cursor++;
-    if(nextAcc===aid){
-     // Тот же слот (ещё «живой» в пуле) — только дожать очередь вступления
-     if(joinBusy||!alreadyIn)enqueue(gid,String(d.name||'Группа'));
-     // Уже «joined» на hard-dead: не трогаем membership здесь — скан сам поймает need_join
-     if(hardDead&&alreadyIn)continue;
-     if(onCooldown&&alreadyIn){
-      // На отлёжке нельзя сканить — всё равно пересаживаем ниже только если nextAcc!==aid
+    if(alreadyIn&&!hardDead){
+      // Аккаунт на отлёжке, группа уже покрыта — сидим, ловим лиды позже
+      if(joinBusy){
+       const cleared={...d,joinState:'',joinStateAt:'',joinStateError:''};
+       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(cleared),owner,gid,'group').run();
+      }
       continue;
-     }
+    }
+    if(nextAcc===aid){
+     if(joinBusy||!alreadyIn)enqueue(gid,String(d.name||'Группа'));
      continue;
     }
+    // hard-dead + alreadyIn или непокрытая: пересадка на живой слот
     const next={
      ...d,
      accountId:nextAcc,
@@ -1115,7 +1118,9 @@ async function healDeadGroupAccounts(owner:string){
      lastScanned:'',
      joinState:'queued',
      joinStateAt:new Date().toISOString(),
-     joinStateError:onCooldown?'Аккаунт на отлёжке — группа переназначена':'',
+     joinStateError:hardDead
+      ?'Аккаунт недоступен — группа переназначена'
+      :(onCooldown?'Аккаунт на отлёжке — группа переназначена':''),
     };
     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,gid,'group').run();
     reassigned++;
@@ -1801,10 +1806,42 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       },409);
      }
     }
-    // Скан без членства: в БД часто «joined», а в Telegram аккаунта уже нет —
-    // обязательно ставим повторное вступление, иначе лиды не появятся никогда.
+    // Скан без членства: не сбрасываем свежие/подтверждённые вступления —
+    // после join Telegram часто лажит (CheckChatInvite / GetParticipant),
+    // а wipe → heal/UI снова ставят группу в очередь по кругу.
     if(result.join==='need_join'||/вступ/i.test(String(result.error||''))){
      const errMsg=String(result.error||'Сначала вступите в группу').slice(0,500);
+     const joinedAtMs=Date.parse(String(gdata.joinedAt||''));
+     const recentlyJoined=Number.isFinite(joinedAtMs)&&Date.now()-joinedAtMs<45*60_000;
+     const looksJoined=groupLooksJoined(gdata);
+     const discussionOnly=!!result.needDiscussionJoin;
+
+     if(discussionOnly||recentlyJoined||looksJoined){
+      // Мягкий отказ: membership/joinedAt не трогаем, в очередь не кидаем.
+      const soft={
+       ...gdata,
+       joinState:'',
+       joinStateAt:'',
+       joinStateError:'',
+       error:discussionOnly
+        ?errMsg
+        :(recentlyJoined
+          ?'Скан чуть позже — Telegram ещё подтверждает членство'
+          :errMsg),
+      };
+      if(discussionOnly||recentlyJoined||gdata.membership==='joined'||gdata.membership==='pending'||gdata.joinedAt){
+       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(soft),owner,id,'group').run();
+      }
+      return reply({
+       error:soft.error||errMsg,
+       needJoin:true,
+       soft:true,
+       preserved:true,
+       needDiscussionJoin:discussionOnly,
+       group:soft,
+      },409);
+     }
+
      const healed={
       ...gdata,
       status:'setup',

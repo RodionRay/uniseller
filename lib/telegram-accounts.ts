@@ -247,6 +247,145 @@ export function normalizeJoinsToday(state: JoinPaceState): number {
   return Math.max(0, Number(state.joinsToday) || 0);
 }
 
+export function normalizeMessagesToday(data: {
+  messagesToday?: number;
+  messagesDay?: string;
+} | null | undefined): number {
+  if (!data) return 0;
+  return dayCounter(data.messagesDay, data.messagesToday);
+}
+
+export function normalizeMemberInvitesToday(data: {
+  memberInvitesToday?: number;
+  memberInviteDay?: string;
+} | null | undefined): number {
+  if (!data) return 0;
+  return dayCounter(data.memberInviteDay, data.memberInvitesToday);
+}
+
+export type AccountLimitsUsage = {
+  joins: number;
+  messages: number;
+  memberInvites: number;
+  inviteLimit: number;
+  messageLimit: number;
+  chatLimit: number;
+  memberInviteLimit: number;
+};
+
+/** Суточные счётчики и лимиты для UI менеджера аккаунтов. */
+export function accountLimitsUsage(data: {
+  limits?: {
+    invite?: unknown;
+    message?: unknown;
+    chat?: unknown;
+    memberInvite?: unknown;
+  };
+  joinsToday?: number;
+  joinsDay?: string;
+  messagesToday?: number;
+  messagesDay?: string;
+  memberInvitesToday?: number;
+  memberInviteDay?: string;
+} | null | undefined): AccountLimitsUsage {
+  const limits = data?.limits || {};
+  const inviteLimit = Number(limits.invite);
+  const messageLimit = Number(limits.message);
+  const chatLimit = Number(limits.chat);
+  const memberInviteLimit = Number(limits.memberInvite);
+  return {
+    joins: normalizeJoinsToday(data || {}),
+    messages: normalizeMessagesToday(data),
+    memberInvites: normalizeMemberInvitesToday(data),
+    inviteLimit: Number.isFinite(inviteLimit) ? inviteLimit : DEFAULT_ACCOUNT_LIMITS.invite,
+    messageLimit: Number.isFinite(messageLimit)
+      ? messageLimit
+      : DEFAULT_ACCOUNT_LIMITS.message,
+    chatLimit: Number.isFinite(chatLimit) ? chatLimit : DEFAULT_ACCOUNT_LIMITS.chat,
+    memberInviteLimit: Number.isFinite(memberInviteLimit) ? memberInviteLimit : 40,
+  };
+}
+
+/** Короткий хвост отлёжки: «5 часов», «40 мин»; пусто если нет. */
+export function cooldownRemainingShort(
+  cooldownUntil?: string | null,
+  now = Date.now(),
+): string {
+  if (!cooldownUntil) return "";
+  const t = Date.parse(cooldownUntil);
+  if (!Number.isFinite(t) || t <= now) return "";
+  const mins = Math.max(1, Math.round((t - now) / 60_000));
+  if (mins < 60) return `${mins} мин`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} ${hours === 1 ? "час" : hours < 5 ? "часа" : "часов"}`;
+  const days = Math.round(hours / 24);
+  return `${days} ${days === 1 ? "день" : days < 5 ? "дня" : "дней"}`;
+}
+
+/** Относительное «обновлено»: «39 минут назад». */
+export function relativeTimeRu(iso?: string | null, now = Date.now()): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "—";
+  const sec = Math.max(0, Math.round((now - t) / 1000));
+  if (sec < 45) return "только что";
+  const mins = Math.round(sec / 60);
+  if (mins < 60) {
+    return `${mins} ${mins === 1 ? "минуту" : mins < 5 ? "минуты" : "минут"} назад`;
+  }
+  const hours = Math.round(mins / 60);
+  if (hours < 24) {
+    return `${hours} ${hours === 1 ? "час" : hours < 5 ? "часа" : "часов"} назад`;
+  }
+  const days = Math.round(hours / 24);
+  if (days < 14) {
+    return `${days} ${days === 1 ? "день" : days < 5 ? "дня" : "дней"} назад`;
+  }
+  return new Date(t).toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Лучшая метка «обновлено» для строки аккаунта. */
+export function accountUpdatedAt(data: {
+  checkingAt?: string;
+  lastJoinAt?: string;
+  lastChecked?: string;
+} | null | undefined, created?: string): string {
+  const candidates = [
+    data?.checkingAt,
+    data?.lastChecked,
+    data?.lastJoinAt,
+    created,
+  ].filter(Boolean) as string[];
+  if (!candidates.length) return "";
+  return candidates.reduce((best, cur) =>
+    Date.parse(cur) > Date.parse(best) ? cur : best,
+  );
+}
+
+const AVATAR_PALETTE = [
+  "#eab308",
+  "#22c55e",
+  "#84cc16",
+  "#ef4444",
+  "#15803d",
+  "#3b82f6",
+  "#a855f7",
+  "#f97316",
+  "#06b6d4",
+  "#ec4899",
+];
+
+export function accountAvatarColor(seed: string): string {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return AVATAR_PALETTE[h % AVATAR_PALETTE.length]!;
+}
+
 export function bumpJoinCounters(state: JoinPaceState): JoinPaceState {
   const day = moscowDayKey();
   const prev = state.joinsDay === day ? Number(state.joinsToday) || 0 : 0;

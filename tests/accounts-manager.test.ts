@@ -3,10 +3,14 @@ import {
   accountAvatarColor,
   accountLimitsUsage,
   accountUpdatedAt,
+  applyQuotaCooldownIfExhausted,
   canPollDmInbox,
   cooldownRemainingShort,
   isAccountUsable,
   relativeTimeRu,
+  withDayLimitCooldown,
+  withFrozenStatus,
+  withSpamblockStatus,
 } from "@/lib/telegram-accounts";
 
 describe("менеджер аккаунтов · helpers", () => {
@@ -63,5 +67,46 @@ describe("менеджер аккаунтов · helpers", () => {
     expect(canPollDmInbox({ status: "cooldown" })).toBe(true);
     expect(canPollDmInbox({ status: "unauthorized" })).toBe(false);
     expect(canPollDmInbox({ status: "active" })).toBe(true);
+  });
+
+  it("отлёжка только по лимиту/спаму/заморозке — не по cooldownUntil без статуса", () => {
+    const future = new Date(Date.now() + 3600_000).toISOString();
+    // Старый фейл коннекта: active + cooldownUntil — аккаунт рабочий
+    expect(isAccountUsable({ status: "active", cooldownUntil: future })).toBe(true);
+    expect(isAccountUsable({ status: "disconnected", cooldownUntil: future })).toBe(false);
+
+    const limited = withDayLimitCooldown(
+      { status: "active", limits: { invite: 1 }, joinsToday: 1, joinsDay: "2099-01-01" },
+      "invite",
+    );
+    expect(limited.status).toBe("cooldown");
+    expect(limited.cooldownReason).toBe("day_invite");
+    expect(isAccountUsable(limited)).toBe(false);
+
+    const spam = withSpamblockStatus({ status: "active" }, "PEER_FLOOD");
+    expect(spam.status).toBe("spamblock");
+    expect(isAccountUsable(spam)).toBe(false);
+
+    const frozen = withFrozenStatus({ status: "active" });
+    expect(frozen.status).toBe("frozen");
+    expect(frozen.cooldownUntil).toBe("");
+    expect(isAccountUsable(frozen)).toBe(false);
+  });
+
+  it("applyQuotaCooldownIfExhausted ставит отлёжку при исчерпании лимита", () => {
+    const day = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Moscow",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+    const out = applyQuotaCooldownIfExhausted({
+      status: "active",
+      limits: { invite: 2, message: 40, chat: 40, memberInvite: 40 },
+      joinsToday: 2,
+      joinsDay: day,
+    });
+    expect(out.status).toBe("cooldown");
+    expect(String(out.error)).toMatch(/вступлений/);
   });
 });

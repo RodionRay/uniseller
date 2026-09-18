@@ -13,7 +13,7 @@ import {
  type LeadCoreSettings,
 } from '@/lib/lead-core';
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew} from '@/lib/ai-keywords';
-import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso} from '@/lib/telegram-accounts';
+import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
 import {canonicalizeTgUrl,duplicateReason,isDuplicateKind} from '@/lib/record-identity';
 import {
@@ -575,29 +575,29 @@ function isSessionDeadError(status:string,error:string){
  );
 }
 
-const CONNECT_FAIL_COOLDOWN_H=2;
 const CONNECT_MAX_ATTEMPTS=3;
 const CONNECT_RETRY_PAUSE_MS=400;
 const ACCOUNT_CHECK_TIMEOUT_MS=22_000;
 const ACCOUNT_CHECK_CONCURRENCY=3;
 
-async function putAccountOnConnectCooldown(owner:string,id:string,data:any,opts:{
+/** Ошибка коннекта/прокси — статус disconnected/proxy_error, БЕЗ отлёжки. */
+async function putAccountConnectFailed(owner:string,id:string,data:any,opts:{
  attempts:number;
  lastError:string;
  proxyRotated?:string;
+ status?:'disconnected'|'proxy_error';
 }){
  const db=database();
- const until=cooldownHoursFromNow(CONNECT_FAIL_COOLDOWN_H);
  const tip=
-  `Не удалось подключить за ${opts.attempts} попыток со сменой прокси. `+
-  `Рекомендации: 1) прокси с доступом к Telegram; `+
-  `2) свежий tdata/session; `+
-  `3) повторите после короткой отлёжки. `+
+  `Не удалось подключить за ${opts.attempts} попыток${opts.proxyRotated?' со сменой прокси':''}. `+
+  `Проверьте прокси и свежий tdata/session. `+
   `Последняя ошибка: ${String(opts.lastError||'').slice(0,180)}`;
+ const status=opts.status||(/proxy|socks|ECONN|прокси/i.test(String(opts.lastError||''))?'proxy_error':'disconnected');
  const next={
   ...data,
-  status:'cooldown' as const,
-  cooldownUntil:until,
+  status,
+  // Не ставим cooldownUntil — отлёжка только по лимитам / спамблоку / заморозке.
+  cooldownUntil:'',
   checkingAt:'',
   error:tip.slice(0,500),
   ...(opts.proxyRotated?{proxyId:opts.proxyRotated}:{}),
@@ -606,10 +606,9 @@ async function putAccountOnConnectCooldown(owner:string,id:string,data:any,opts:
  return {
   id,
   ok:false,
-  status:'cooldown' as const,
+  status:next.status,
   error:next.error,
   proxyRotated:opts.proxyRotated||undefined,
-  cooldownUntil:until,
  };
 }
 
@@ -747,7 +746,7 @@ async function runAccountCheck(owner:string,id:string,opts?:{
    }
 
    if(rotateProxy&&(status==='proxy_error'||status==='disconnected'||status==='unauthorized')){
-    return putAccountOnConnectCooldown(owner,id,data,{
+    return putAccountConnectFailed(owner,id,data,{
      attempts:attempt+1,
      lastError:err||status,
      proxyRotated:proxyRotated||undefined,
@@ -793,7 +792,7 @@ async function runAccountCheck(owner:string,id:string,opts?:{
     }
    }
    if(rotateProxy){
-    return putAccountOnConnectCooldown(owner,id,data,{
+    return putAccountConnectFailed(owner,id,data,{
      attempts:attempt+1,
      lastError:msg,
      proxyRotated:proxyRotated||undefined,
@@ -813,7 +812,7 @@ async function runAccountCheck(owner:string,id:string,opts?:{
   }
  }
 
- return putAccountOnConnectCooldown(owner,id,data,{
+ return putAccountConnectFailed(owner,id,data,{
   attempts:maxAttempts,
   lastError:lastError||lastStatus,
   proxyRotated:proxyRotated||undefined,
@@ -1635,12 +1634,16 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   }
   if(!hasInviteQuota(adata)){
    const inviteLimit=Number(adata.limits?.invite??DEFAULT_ACCOUNT_LIMITS.invite);
-   return reply({error:`Дневной лимит вступлений (${inviteLimit}). Завтра или смените аккаунт.`,limitReached:true,farmExhausted:true},429);
+   const cooled=applyQuotaCooldownIfExhausted(adata);
+   if(cooled!==adata){
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(cooled),owner,gdata.accountId,'account').run();
+   }
+   return reply({error:`Дневной лимит вступлений (${inviteLimit}). Завтра или смените аккаунт.`,limitReached:true,farmExhausted:true,cooldown:cooled.status==='cooldown'},429);
   }
   const wait=joinWaitSec(adata);
   if(wait>0){
    return reply({
-    error:`Отлежка между вступлениями: подождите ${Math.ceil(wait/60)} мин (${wait} с), чтобы не словить бан`,
+    error:`Пауза между вступлениями: подождите ${Math.ceil(wait/60)} мин (${wait} с), чтобы не словить бан`,
     waitSec:wait,
     nextJoinAt:new Date(Date.now()+wait*1000).toISOString(),
     pace:true,
@@ -1670,23 +1673,28 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    };
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'group').run();
    if(joinedOk){
-    const bumped={...adata,...bumpJoinCounters(adata)};
+    const bumped=applyQuotaCooldownIfExhausted({...adata,...bumpJoinCounters(adata)});
     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,gdata.accountId,'account').run();
    }
    if(flood){
     const m=/FloodWait\s+(\d+)/i.exec(String(result.error||''));
-    const sec=m?Number(m[1]):3600;
-    const hours=Math.max(1,Math.ceil(sec/3600));
-    const cooled={...adata,...bumpJoinCounters(adata),cooldownUntil:cooldownHoursFromNow(hours),status:'cooldown',error:(result.error||'').slice(0,500)};
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(cooled),owner,gdata.accountId,'account').run();
-    return reply({ok:false,result,error:result.error,waitSec:sec,flood:true},429);
+    const sec=Math.max(60,m?Number(m[1]):900);
+    // FloodWait — только пауза темпа (lastJoinAt), без статуса «Отлежка».
+    const paced={
+     ...adata,
+     lastJoinAt:new Date().toISOString(),
+     error:(result.error||'').slice(0,500),
+    };
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(paced),owner,gdata.accountId,'account').run();
+    return reply({ok:false,result,error:result.error,waitSec:sec,flood:true,pace:true},429);
    }
    if(frozen){
+    const cooled=withFrozenStatus(adata,result.error||'Аккаунт заморожен Telegram');
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(cooled),owner,gdata.accountId,'account').run();
     const rotated=await rotateGroupOffDeadAccount(owner,id,gdata,gdata.accountId,{status:'frozen',error:(result.error||'Аккаунт заморожен Telegram').slice(0,500)});
     if(rotated.ok){
      return reply({ok:false,accountFrozen:true,reassigned:true,needJoin:true,rejoinItem:rotated.rejoinItem,group:rotated.gdata,result:{...result,status:'error'},error:'Аккаунт заморожен — группа переназначена на живой аккаунт',joinGapSec:JOIN_GAP_DEFAULT_SEC});
     }
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,status:'frozen',error:(result.error||'Аккаунт заморожен Telegram').slice(0,500)}),owner,gdata.accountId,'account').run();
    }
    return reply({ok:reallyJoined||result.join==='requested',result:{...result,status,membership:next.membership,joinedAt:next.joinedAt},group:next,accountFrozen:frozen,rotatedAccount,joinGapSec:JOIN_GAP_DEFAULT_SEC});
   }catch(e){
@@ -2507,19 +2515,16 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    };
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'lead').run();
    if(finalResult.flood||finalResult.status==='flood'){
-    const sec=Number(finalResult.waitSec)||3600;
-    const accRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,sendAccountId,'account').first();
-    if(accRow){
-     const acc=JSON.parse(accRow.data);
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...acc,cooldownUntil:cooldownHoursFromNow(Math.max(1,Math.ceil(sec/3600))),status:'cooldown',error:(finalResult.error||'').slice(0,500)}),owner,sendAccountId,'account').run();
-    }
-    return reply({ok:false,error:finalResult.error||'FloodWait',waitSec:sec,lead:next,rotatedAccount},429);
+    const sec=Number(finalResult.waitSec)||900;
+    // FloodWait на ЛС — пауза ответа, аккаунт не уводим в «Отлежка».
+    return reply({ok:false,error:finalResult.error||'FloodWait',waitSec:sec,lead:next,rotatedAccount,pace:true},429);
    }
    if(!finalResult.ok)return reply({ok:false,error:finalResult.error||'Не удалось отправить',lead:next,rotatedAccount},502);
    const accRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,sendAccountId,'account').first();
    if(accRow){
     const acc=JSON.parse(accRow.data);
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...acc,...bumpMessageCounters(acc,1)}),owner,sendAccountId,'account').run();
+    const bumped=applyQuotaCooldownIfExhausted({...acc,...bumpMessageCounters(acc,1)});
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,sendAccountId,'account').run();
    }
    return reply({ok:true,lead:next,mode,link,messageId,rotatedAccount,accountId:sendAccountId});
   }catch(e){
@@ -3147,55 +3152,38 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     users:batch.map(x=>({userId:x.userId,username:x.username})),
    },180_000);
 
-   // PEER_FLOOD / spamblock / floodwait → отлёжка аккаунта
+   // PEER_FLOOD / spamblock / frozen → статус аккаунта. FloodWait — только пауза тика.
    let accountWentCooldown=false;
    let cooldownUntil='';
    if(result.status==='spamblock'||String(result.error||'').includes('PEER_FLOOD')){
     cooldownUntil=cooldownHoursFromNow(24);
     accountWentCooldown=true;
     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} получил блокировку на неопределённое время (PEER_FLOOD)`});
-    logEntries.push({level:'info',text:`Аккаунт ${bracketLabel(accountLabel)} ушёл в отлёжку до ${formatRuWhen(cooldownUntil)}`});
+    logEntries.push({level:'info',text:`Аккаунт ${bracketLabel(accountLabel)} ушёл в спамблок до ${formatRuWhen(cooldownUntil)}`});
     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
     if(arow){
      const adata=JSON.parse(arow.data);
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-      ...adata,
-      status:'spamblock',
-      cooldownUntil,
-      error:'PEER_FLOOD',
-     }),owner,accountId,'account').run();
+     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(withSpamblockStatus(adata,'PEER_FLOOD')),owner,accountId,'account').run();
     }
    }else if(result.status==='frozen'){
-    cooldownUntil=cooldownHoursFromNow(24);
     accountWentCooldown=true;
     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} заморожен`});
-    logEntries.push({level:'info',text:`Аккаунт ${bracketLabel(accountLabel)} ушёл в отлёжку до ${formatRuWhen(cooldownUntil)}`});
     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
     if(arow){
      const adata=JSON.parse(arow.data);
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-      ...adata,
-      status:'frozen',
-      cooldownUntil,
-      error:String(result.error||'').slice(0,500),
-     }),owner,accountId,'account').run();
+     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(withFrozenStatus(adata,result.error||'')),owner,accountId,'account').run();
     }
    }else if(result.status==='floodwait'||Number(result.floodWait)>0){
-    const waitSec=Math.max(60,Number(result.floodWait)||3600);
-    cooldownUntil=new Date(Date.now()+waitSec*1000).toISOString();
-    accountWentCooldown=true;
-    logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} получил FloodWait ${waitSec}с`});
-    logEntries.push({level:'info',text:`Аккаунт ${bracketLabel(accountLabel)} ушёл в отлёжку до ${formatRuWhen(cooldownUntil)}`});
-    const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
-    if(arow){
-     const adata=JSON.parse(arow.data);
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-      ...adata,
-      status:'cooldown',
-      cooldownUntil,
-      error:String(result.error||'').slice(0,500),
-     }),owner,accountId,'account').run();
-    }
+    const waitSec=Math.max(60,Number(result.floodWait)||900);
+    // FloodWait — пауза задачи, без статуса «Отлежка» на аккаунте.
+    logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} получил FloodWait ${waitSec}с — пауза тика`});
+    logEntries.push({level:'info',text:`Ожидание ${waitSec} секунд`});
+    const next=await persistInviteTask({
+     accountIndex:(accountIndex+1)%liveIds.length,
+     nextAt:new Date(Date.now()+waitSec*1000).toISOString(),
+     status:'running',
+    },logEntries);
+    return reply({ok:true,task:next,floodWait:waitSec});
    }
 
    let okN=0;
@@ -3230,7 +3218,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if(arow2&&okN&&!accountWentCooldown){
     const adata=JSON.parse(arow2.data);
     const mday=adata.memberInviteDay===day?Number(adata.memberInvitesToday)||0:0;
-    const bumped={...adata,memberInviteDay:day,memberInvitesToday:mday+okN};
+    const bumped=applyQuotaCooldownIfExhausted({...adata,memberInviteDay:day,memberInvitesToday:mday+okN});
     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,accountId,'account').run();
     accMap.set(accountId,bumped);
    }
@@ -3824,28 +3812,21 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       Number(result.waitSec)||0,
       parseMailingFloodWaitSec(errRaw,900),
      );
-     cooldownUntil=new Date(Date.now()+waitSec*1000).toISOString();
+     // FloodWait / Too many requests — пауза фермы, без статуса «Отлежка».
      accountWentCooldown=true;
-     deferredUntil[cand.key]=cooldownUntil;
-     // Текст AI вернём в пул — отправки не было
+     deferredUntil[cand.key]=new Date(Date.now()+waitSec*1000).toISOString();
+     cooldownUntil=deferredUntil[cand.key];
      if(data.contentMode==='ai'&&text){
       aiPool.unshift(text);
       aiPoolUsed=Math.max(0,aiPoolUsed-1);
      }
      logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)}: лимит Telegram · пауза ${waitSec}с`});
      logEntries.push({level:'info',text:`Получатель отложен на ${Math.ceil(waitSec/60)} мин (Too many requests)`});
-     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
-     if(arow){
-      const adata=JSON.parse(arow.data);
-      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-       ...adata,status:'cooldown',cooldownUntil,error:errRaw.slice(0,500)||'Too many requests',
-      }),owner,accountId,'account').run();
-     }
+     // Аккаунт остаётся active — только задача ждёт waitSec / смена слота.
     }
     if(peerFlood){
      cooldownUntil=cooldownHoursFromNow(24);
      accountWentCooldown=true;
-     // Текст AI вернём — сообщение не ушло
      if(data.contentMode==='ai'&&text&&!rateLimited){
       aiPool.unshift(text);
       aiPoolUsed=Math.max(0,aiPoolUsed-1);
@@ -3854,18 +3835,15 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      logEntries.push({
       level:'error',
       text:banWrite
-       ?`Аккаунт ${bracketLabel(accountLabel)}: ограничен Telegram (бан на запись) · пауза 24ч — берём другой слот`
+       ?`Аккаунт ${bracketLabel(accountLabel)}: ограничен Telegram (бан на запись) · спамблок 24ч`
        :`Аккаунт ${bracketLabel(accountLabel)}: спамблок`,
      });
      const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
      if(arow){
       const adata=JSON.parse(arow.data);
-      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-       ...adata,
-       status:'spamblock',
-       cooldownUntil,
-       error:banWrite?'WRITE_BAN_SUPERGROUPS':(errRaw.slice(0,500)||'PEER_FLOOD'),
-      }),owner,accountId,'account').run();
+      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(
+       withSpamblockStatus(adata,banWrite?'WRITE_BAN_SUPERGROUPS':(errRaw.slice(0,500)||'PEER_FLOOD')),
+      ),owner,accountId,'account').run();
      }
     }
 
@@ -3995,10 +3973,15 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     const arow2:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
     if(arow2){
      const adata=JSON.parse(arow2.data);
-     const bumped={...adata,...bumpMessageCounters(adata,okN)};
+     const counters=deliveryMode==='chat'
+      ?bumpChatCounters(adata,okN)
+      :bumpMessageCounters(adata,okN);
+     const bumped=applyQuotaCooldownIfExhausted({...adata,...counters});
      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,accountId,'account').run();
      accMap.set(accountId,bumped);
-     if(!hasMessageQuota(bumped)){
+     if(bumped.status==='cooldown'){
+      logEntries.push({level:'warn',text:`Аккаунт ${bracketLabel(accountLabel)} выработал дневной лимит — отлёжка до полуночи МСК`});
+     }else if(!hasMessageQuota(bumped)&&deliveryMode!=='chat'){
       logEntries.push({level:'warn',text:`Аккаунт ${bracketLabel(accountLabel)} выработал дневной лимит сообщений — дальше другой слот фермы`});
      }
     }

@@ -361,7 +361,13 @@ function statusBadge(status:string,kind?:Kind){
 }
 
 function accountRowStatus(data:any){
-  if(isOnCooldown(data.cooldownUntil))return 'cooldown';
+  // Отлёжка в UI — только явный статус cooldown с живым таймером, либо spamblock с таймером.
+  if(data.status==='spamblock')return 'spamblock';
+  if(data.status==='frozen')return 'frozen';
+  if(data.status==='cooldown'&&isOnCooldown(data.cooldownUntil))return 'cooldown';
+  if(data.status==='cooldown'&&!isOnCooldown(data.cooldownUntil))return 'active';
+  // Старый cooldownUntil без статуса cooldown (ошибка коннекта) — не показываем как Отлежку.
+  if(isOnCooldown(data.cooldownUntil)&&data.cooldownReason)return 'cooldown';
   return data.status||'setup';
 }
 
@@ -2112,7 +2118,8 @@ function WorkspaceHome(){
         const st=result?.status||'disconnected';
         const proxyNote=result?.proxyRotated?' · прокси сменён':'';
         if(st==='active')toast.success(`Активен · ${result?.profile?.username? '@'+result.profile.username : item.data.phone}${proxyNote}${result?.sessionRefreshed?' · сессия обновлена':''}`);
-        else if(st==='cooldown')toast.message(`Отлёжка после неудачных попыток${proxyNote}. Проверьте прокси.`);
+        else if(st==='cooldown')toast.message(`Отлёжка по лимиту / спамблоку${proxyNote}`);
+        else if(st==='disconnected'||st==='proxy_error')toast.error(`Не удалось подключить${proxyNote}. Проверьте прокси и сессию.`);
         else if(st==='unauthorized')toast.error(`Сессия недействительна — загрузите свежий tdata/session${proxyNote}`);
         else toast.error((ACCOUNT_STATUS_LABELS[st as AccountStatus]||st)+(result?.error?`: ${String(result.error).slice(0,120)}`:'')+proxyNote);
       }
@@ -3639,7 +3646,9 @@ function WorkspaceHome(){
                       const avatarLetter=(displayName.replace(/^@/,'').trim()[0]||'?').toUpperCase();
                       const proxy=records.find(x=>x.id===r.data.proxyId);
                       const linkedGroups=records.filter(g=>g.kind==='group'&&(g.data.accountId===r.id||g.data.joinedAccountId===r.id));
-                      const coolLeft=cooldownRemainingShort(r.data.cooldownUntil);
+                      const coolLeft=(rowStatus==='cooldown'||(rowStatus==='spamblock'&&isOnCooldown(r.data.cooldownUntil)))
+                        ?cooldownRemainingShort(r.data.cooldownUntil)
+                        :'';
                       const updatedIso=accountUpdatedAt(r.data,r.created);
                       const usage=accountLimitsUsage(r.data);
                       return (
@@ -5026,7 +5035,7 @@ function WorkspaceHome(){
           <DialogHeader>
             <DialogTitle>Отлежка · {accountSelected.length} акк.</DialogTitle>
             <DialogDescription>
-              После PEER_FLOOD / Too many requests поставьте паузу или снимите, если лимит уже прошёл.
+              После дневного лимита / PEER_FLOOD / заморозки — пауза или снимите, если лимит уже прошёл.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-wrap gap-2">

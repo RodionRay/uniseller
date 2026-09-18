@@ -89,10 +89,7 @@ export function isAccountUsable(data: {
   cooldownUntil?: string | null;
 } | null | undefined): boolean {
   if (!data) return false;
-  if (isOnCooldown(data.cooldownUntil)) return false;
   const st = String(data.status || "");
-  // status=cooldown без актуального until — отлёжка уже прошла, слот снова живой
-  if (st === "cooldown") return true;
   if (
     [
       "spamblock",
@@ -108,7 +105,11 @@ export function isAccountUsable(data: {
   ) {
     return false;
   }
-  // active / пустой / legacy ok|connected
+  // Отлёжка только при явном status=cooldown и живом таймере (дневной лимит).
+  if (st === "cooldown") {
+    return !isOnCooldown(data.cooldownUntil);
+  }
+  // active / пустой / legacy — cooldownUntil без статуса cooldown игнорируем (старые фейлы коннекта).
   return !st || st === "active" || st === "ok" || st === "connected";
 }
 
@@ -151,9 +152,132 @@ export function cooldownLabel(cooldownUntil?: string | null): string {
   return `до ${new Date(cooldownUntil!).toLocaleString("ru-RU", { timeZone: "Europe/Moscow" })} МСК`;
 }
 
-/** Авто-отлежка на N часов (как TGLab: лимит / PEER_FLOOD → 24ч). */
+/** Авто-отлежка на N часов (спамблок). */
 export function cooldownHoursFromNow(hours: number): string {
   return new Date(Date.now() + hours * 3600_000).toISOString();
+}
+
+export type DayLimitKind = "invite" | "message" | "chat" | "memberInvite";
+
+const DAY_LIMIT_LABELS: Record<DayLimitKind, string> = {
+  invite: "вступлений",
+  message: "сообщений (рассылка/ЛС)",
+  chat: "комментариев",
+  memberInvite: "инвайтов участников",
+};
+
+/**
+ * Отлёжка только по правилам продукта:
+ * — дневной лимит (до полуночи МСК);
+ * — spamblock / PEER_FLOOD;
+ * — заморозка Telegram.
+ * FloodWait и ошибка коннекта/прокси — НЕ отлёжка.
+ */
+export function withDayLimitCooldown<T extends Record<string, unknown>>(
+  data: T,
+  kind: DayLimitKind,
+): T & {
+  status: "cooldown";
+  cooldownUntil: string;
+  cooldownReason: string;
+  error: string;
+} {
+  return {
+    ...data,
+    status: "cooldown",
+    cooldownUntil: moscowNextMidnightIso(),
+    cooldownReason: `day_${kind}`,
+    error: `Дневной лимит ${DAY_LIMIT_LABELS[kind]} исчерпан — до полуночи МСК`,
+  };
+}
+
+export function withSpamblockStatus<T extends Record<string, unknown>>(
+  data: T,
+  error = "PEER_FLOOD",
+): T & {
+  status: "spamblock";
+  cooldownUntil: string;
+  cooldownReason: string;
+  error: string;
+} {
+  return {
+    ...data,
+    status: "spamblock",
+    cooldownUntil: cooldownHoursFromNow(24),
+    cooldownReason: "spamblock",
+    error: String(error || "PEER_FLOOD").slice(0, 500),
+  };
+}
+
+export function withFrozenStatus<T extends Record<string, unknown>>(
+  data: T,
+  error = "Аккаунт заморожен Telegram",
+): T & {
+  status: "frozen";
+  cooldownUntil: string;
+  cooldownReason: string;
+  error: string;
+} {
+  return {
+    ...data,
+    status: "frozen",
+    // Заморозка — не таймер отлёжки; статус frozen достаточно для блокировки.
+    cooldownUntil: "",
+    cooldownReason: "frozen",
+    error: String(error || "Аккаунт заморожен Telegram").slice(0, 500),
+  };
+}
+
+export function hasChatQuota(data: {
+  limits?: { chat?: unknown };
+  chatsToday?: number;
+  chatsDay?: string;
+} | null | undefined): boolean {
+  if (!data) return false;
+  return hasDayQuota(
+    dayCounter(data.chatsDay, data.chatsToday),
+    data.limits?.chat ?? DEFAULT_ACCOUNT_LIMITS.chat,
+  );
+}
+
+export function bumpChatCounters<T extends Record<string, unknown>>(
+  data: T,
+  n = 1,
+): T & { chatsDay: string; chatsToday: number } {
+  const day = moscowDayKey();
+  const prev = (data as { chatsDay?: string; chatsToday?: number }).chatsDay === day
+    ? Number((data as { chatsToday?: number }).chatsToday) || 0
+    : 0;
+  return {
+    ...data,
+    chatsDay: day,
+    chatsToday: prev + Math.max(0, n),
+  };
+}
+
+/** Если после операции дневной лимит кончился — увести в отлёжку до полуночи. */
+export function applyQuotaCooldownIfExhausted<T extends Record<string, unknown>>(
+  data: T,
+): T {
+  if (isOnCooldown(String((data as { cooldownUntil?: string }).cooldownUntil || ""))) {
+    return data;
+  }
+  const st = String((data as { status?: string }).status || "");
+  if (st === "spamblock" || st === "frozen") return data;
+
+  if (!hasInviteQuota(data as Parameters<typeof hasInviteQuota>[0])) {
+    return withDayLimitCooldown(data, "invite");
+  }
+  if (!hasMessageQuota(data as Parameters<typeof hasMessageQuota>[0])) {
+    return withDayLimitCooldown(data, "message");
+  }
+  if (!hasMemberInviteQuota(data as Parameters<typeof hasMemberInviteQuota>[0])) {
+    return withDayLimitCooldown(data, "memberInvite");
+  }
+  if (!hasChatQuota(data as Parameters<typeof hasChatQuota>[0])) {
+    return withDayLimitCooldown(data, "chat");
+  }
+  return data;
 }
 
 /** Пауза между вступлениями в группы (антибан). */

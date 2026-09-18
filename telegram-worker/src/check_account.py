@@ -1922,8 +1922,11 @@ async def poll_dm_inbox(client, *, since_ts: int = 0, limit_dialogs: int = 20) -
                 if ts and ts <= floor:
                     continue
                 text = str(getattr(m, "message", None) or getattr(m, "raw_text", None) or "").strip()
-                if not text:
+                has_media = bool(getattr(m, "media", None))
+                if not text and not has_media:
                     continue
+                if not text and has_media:
+                    text = "[медиа]"
                 messages.append(
                     {
                         "userId": user_id,
@@ -1933,6 +1936,7 @@ async def poll_dm_inbox(client, *, since_ts: int = 0, limit_dialogs: int = 20) -
                         "messageId": str(getattr(m, "id", "") or ""),
                         "at": date.isoformat() if date is not None else "",
                         "ts": ts,
+                        "hasMedia": has_media,
                     }
                 )
         messages.sort(key=lambda x: int(x.get("ts") or 0))

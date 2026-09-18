@@ -112,6 +112,40 @@ export function isAccountUsable(data: {
   return !st || st === "active" || st === "ok" || st === "connected";
 }
 
+/**
+ * Можно ли читать входящие ЛС.
+ * spamblock/cooldown — писать нельзя, но ответы клиентов всё ещё приходят в эту сессию.
+ */
+export function canPollDmInbox(data: {
+  status?: string | null;
+} | null | undefined): boolean {
+  if (!data) return false;
+  const st = String(data.status || "");
+  if (
+    [
+      "frozen",
+      "unauthorized",
+      "disconnected",
+      "proxy_error",
+      "checking",
+      "setup",
+      "inactive",
+      "error",
+    ].includes(st)
+  ) {
+    return false;
+  }
+  // active / cooldown / spamblock / пустой / legacy
+  return (
+    !st ||
+    st === "active" ||
+    st === "ok" ||
+    st === "connected" ||
+    st === "cooldown" ||
+    st === "spamblock"
+  );
+}
+
 export function cooldownLabel(cooldownUntil?: string | null): string {
   if (!isOnCooldown(cooldownUntil)) return "";
   return `до ${new Date(cooldownUntil!).toLocaleString("ru-RU", { timeZone: "Europe/Moscow" })} МСК`;

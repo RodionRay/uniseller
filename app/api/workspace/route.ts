@@ -13,7 +13,7 @@ import {
  type LeadCoreSettings,
 } from '@/lib/lead-core';
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew} from '@/lib/ai-keywords';
-import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,bumpJoinCounters,bumpMessageCounters,cooldownHoursFromNow,generateTelegramUsername,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso} from '@/lib/telegram-accounts';
+import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
 import {canonicalizeTgUrl,duplicateReason,isDuplicateKind} from '@/lib/record-identity';
 import {
@@ -1322,9 +1322,13 @@ function normTgUser(v:unknown){
 }
 
 function sameMailingPeer(lead:any,msg:any){
- const sid=String(lead?.senderId||lead?.userId||'');
- const mid=String(msg?.userId||'');
- if(sid&&mid&&sid===mid)return true;
+ const ids=new Set(
+  [lead?.senderId,lead?.userId,lead?.peerId,lead?.chatId]
+   .map((v)=>String(v||'').replace(/^-/,'').trim())
+   .filter(Boolean),
+ );
+ const mid=String(msg?.userId||msg?.chatId||'').replace(/^-/,'').trim();
+ if(mid&&ids.has(mid))return true;
  const a=normTgUser(lead?.senderUsername||lead?.username);
  const b=normTgUser(msg?.username);
  return !!(a&&b&&a===b);
@@ -3917,14 +3921,14 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      const entry:MailingDelivery={
       at:new Date().toISOString(),
       key:cand.key,
-      userId:cand.userId,
+      userId:String(cand.userId||result.chatId||''),
       username:cand.username,
       leadId:cand.leadId,
       accountId,
       ok,
       error:ok?'':String(result.error||'').slice(0,400),
       messageId,
-      chatId:String(result.chatId||'').slice(0,40),
+      chatId:String(result.chatId||cand.userId||'').slice(0,40),
       link,
       textPreview:mailingTextPreview(text,200),
       mode:deliveryMode,
@@ -4035,27 +4039,31 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   for(const r of accRows.results){
    try{
     const a=JSON.parse(String(r.data));
-    if(isAccountUsable(a))live.push({id:String(r.id),data:a});
+    if(canPollDmInbox(a))live.push({id:String(r.id),data:a});
    }catch{/* */}
   }
   if(!live.length)return reply({ok:true,opened:0,skipped:true,reason:'no_accounts'});
 
   const mailingRows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='mailing_task'").bind(owner).all();
-  type Hit={taskId:string;leadId:string;userId:string;username:string;preview:string;groupId:string};
+  type Hit={taskId:string;leadId:string;userId:string;username:string;preview:string;groupId:string;accountId:string};
   const hits:Hit[]=[];
+  const mailingAccountIds=new Set<string>();
   for(const r of mailingRows.results){
    try{
     const d=JSON.parse(String(r.data));
     for(const del of (Array.isArray(d.deliveries)?d.deliveries:[])){
      if(!del||del.ok===false)continue;
      if(String(del.mode||'dm')!=='dm')continue;
+     const aid=String(del.accountId||'');
+     if(aid)mailingAccountIds.add(aid);
      hits.push({
       taskId:String(r.id),
       leadId:String(del.leadId||''),
-      userId:String(del.userId||''),
+      userId:String(del.userId||del.chatId||''),
       username:String(del.username||''),
       preview:String(del.textPreview||'').slice(0,800),
       groupId:'',
+      accountId:aid,
      });
     }
    }catch{/* */}
@@ -4068,7 +4076,6 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const matchOutreach=(msg:any)=>{
    const byDelivery=hits.find(h=>sameMailingPeer(h,msg));
    if(byDelivery)return byDelivery;
-   // Только лиды, которым мы уже писали (рассылка / исходящее в replies / открытая переписка)
    const byLead=leads.find(L=>{
     if(!sameMailingPeer(L.data,msg))return false;
     const d=L.data||{};
@@ -4076,34 +4083,54 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     if(Array.isArray(d.replies)&&d.replies.some((x:any)=>x&&(x.from==='us'||x.mode==='dm')))return true;
     return false;
    });
-   if(byLead)return {taskId:String(byLead.data.mailingTaskId||''),leadId:byLead.id,userId:String(byLead.data.senderId||''),username:String(byLead.data.senderUsername||''),preview:String(byLead.data.message||''),groupId:String(byLead.data.groupId||'')};
+   if(byLead)return {taskId:String(byLead.data.mailingTaskId||''),leadId:byLead.id,userId:String(byLead.data.senderId||''),username:String(byLead.data.senderUsername||''),preview:String(byLead.data.message||''),groupId:String(byLead.data.groupId||''),accountId:String(byLead.data.accountId||'')};
    return null;
   };
 
-  const cursor=Math.max(0,Number(b.cursor)||0);
-  const slice=live.slice(cursor%live.length).concat(live.slice(0,cursor%live.length)).slice(0,2);
+  let settingsRow:any=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='settings' LIMIT 1").bind(owner).first();
+  let settingsData:any={};
+  let settingsId='';
+  if(settingsRow){
+   settingsId=String(settingsRow.id);
+   try{settingsData=JSON.parse(String(settingsRow.data))}catch{settingsData={}}
+  }
+  const cursor=Math.max(0,Number(settingsData.inboxPollCursor)||0);
+  const preferred=live.filter(a=>mailingAccountIds.has(a.id));
+  const rest=live.filter(a=>!mailingAccountIds.has(a.id));
+  const pool=(preferred.length?preferred.concat(rest):live);
+  const take=Math.min(4,Math.max(2,pool.length));
+  const slice=pool.slice(cursor%pool.length).concat(pool.slice(0,cursor%pool.length)).slice(0,take);
+  const nextCursor=(cursor+slice.length)%Math.max(1,pool.length);
+
   let opened=0;
   const names:string[]=[];
   for(const acc of slice){
    let result:any;
    try{
     const {payload}=await loadAccountSessionPayload(owner,acc.id);
-    result=await workerPost('/inbox-dms',{...payload,sinceTs:Number(acc.data.inboxSinceTs)||0,limitDialogs:18},90_000);
-   }catch(e){
+    result=await workerPost('/inbox-dms',{...payload,sinceTs:Number(acc.data.inboxSinceTs)||0,limitDialogs:30},90_000);
+   }catch{
     continue;
    }
    const msgs:any[]=Array.isArray(result?.messages)?result.messages:[];
-   let maxTs=Number(acc.data.inboxSinceTs)||0;
+   let maxSafeTs=Number(acc.data.inboxSinceTs)||0;
+   let unmatchedHit=false;
    for(const msg of msgs){
     const ts=Number(msg.ts)||0;
-    if(ts>maxTs)maxTs=ts;
     const outreach=matchOutreach(msg);
-    if(!outreach)continue;
+    if(!outreach){
+     if(hits.some(h=>sameMailingPeer(h,msg)))unmatchedHit=true;
+     else if(ts>maxSafeTs)maxSafeTs=ts;
+     continue;
+    }
+    if(ts>maxSafeTs)maxSafeTs=ts;
     const mid=String(msg.messageId||'');
     let leadRow=outreach.leadId?leads.find(L=>L.id===outreach.leadId):undefined;
     if(!leadRow)leadRow=leads.find(L=>sameMailingPeer(L.data,msg));
+    const text=String(msg.text||'').trim()||(msg.hasMedia?'[медиа]':'');
+    if(!text)continue;
     const incoming={
-     text:String(msg.text||'').slice(0,4000),
+     text:text.slice(0,4000),
      mode:'dm' as const,
      at:String(msg.at||new Date().toISOString()).slice(0,40),
      ok:true,
@@ -4173,17 +4200,22 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      void notifyConversationEvent(db,owner,data.name,data.senderUsername,incoming.text);
     }
    }
-   if(maxTs){
+   if(maxSafeTs&&!unmatchedHit){
     const fresh:any=await db.prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,acc.id,'account').first();
     if(fresh){
      try{
       const adata=JSON.parse(String(fresh.data));
-      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,inboxSinceTs:maxTs}),owner,acc.id,'account').run();
+      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,inboxSinceTs:maxSafeTs}),owner,acc.id,'account').run();
      }catch{/* */}
     }
    }
   }
-  return reply({ok:true,opened,names:names.slice(0,12),nextCursor:(cursor+slice.length)%Math.max(1,live.length)});
+  if(settingsId){
+   try{
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...settingsData,inboxPollCursor:nextCursor}),owner,settingsId,'settings').run();
+   }catch{/* */}
+  }
+  return reply({ok:true,opened,names:names.slice(0,12),nextCursor});
  }
 
  const kind=kindSchema.parse(b.kind);

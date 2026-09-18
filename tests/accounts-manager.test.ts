@@ -3,7 +3,9 @@ import {
   accountAvatarColor,
   accountLimitsUsage,
   accountUpdatedAt,
+  canPollDmInbox,
   cooldownRemainingShort,
+  isAccountUsable,
   relativeTimeRu,
 } from "@/lib/telegram-accounts";
 
@@ -53,5 +55,13 @@ describe("менеджер аккаунтов · helpers", () => {
     ).toBe("2026-09-18T10:00:00.000Z");
     expect(accountAvatarColor("a")).toMatch(/^#/);
     expect(accountAvatarColor("a")).toBe(accountAvatarColor("a"));
+  });
+
+  it("spamblock/cooldown: inbox можно, отправку нельзя", () => {
+    expect(isAccountUsable({ status: "spamblock" })).toBe(false);
+    expect(canPollDmInbox({ status: "spamblock" })).toBe(true);
+    expect(canPollDmInbox({ status: "cooldown" })).toBe(true);
+    expect(canPollDmInbox({ status: "unauthorized" })).toBe(false);
+    expect(canPollDmInbox({ status: "active" })).toBe(true);
   });
 });

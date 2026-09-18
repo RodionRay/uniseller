@@ -604,8 +604,9 @@ function WorkspaceHome(){
 
   async function persistJoinState(id:string,joinState:''|'queued'|'waiting'|'joining'|'scanning',joinStateError=''){
     const joinStateAt=joinState?new Date().toISOString():'';
-    patchGroupLocal(id,{joinState,joinStateAt,joinStateError});
-    try{await api({action:'set_group_join_state',id,joinState,joinStateError})}catch{/* сеть — UI уже обновлён */}
+    const err=String(joinStateError||'').slice(0,500);
+    patchGroupLocal(id,{joinState,joinStateAt,joinStateError:err});
+    try{await api({action:'set_group_join_state',id,joinState,joinStateError:err})}catch{/* сеть — UI уже обновлён */}
   }
 
   function setJoinQueueSync(updater:(prev:JoinQItem[])=>JoinQItem[]){

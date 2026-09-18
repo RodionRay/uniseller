@@ -4,6 +4,7 @@ import {useSearchParams} from 'next/navigation';
 import {Users,Radio,Shield,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {OverviewDashboard} from '@/components/product/overview-dashboard';
+import {AiAssistantWidget} from '@/components/product/ai-assistant-widget';
 import {LeadCorePanel} from '@/components/product/lead-core-panel';
 import {WorkspaceNav,parseWorkspaceView,persistWorkspaceView,readStoredWorkspaceView,WORKSPACE_VIEW_PARAM,type NavName} from '@/components/product/workspace-nav';
 import {NotificationsBell,NotificationsPanel} from '@/components/product/notifications-center';
@@ -5020,6 +5021,7 @@ function WorkspaceHome(){
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      <AiAssistantWidget surface="admin"/>
     </SidebarProvider>
   );
 }

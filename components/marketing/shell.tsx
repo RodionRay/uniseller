@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { CursorGlow } from "@/components/marketing/fx";
 import { MarketingFooter } from "@/components/marketing/footer";
 import { MarketingHeader } from "@/components/marketing/header";
+import { AiAssistantWidget } from "@/components/product/ai-assistant-widget";
 
 export function MarketingShell({ children }: { children: ReactNode }) {
   return (
@@ -16,6 +17,7 @@ export function MarketingShell({ children }: { children: ReactNode }) {
       <MarketingHeader />
       {children}
       <MarketingFooter />
+      <AiAssistantWidget surface="site" />
     </main>
   );
 }

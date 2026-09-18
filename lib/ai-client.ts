@@ -25,11 +25,10 @@ export function resolveAiConfig(_settings?: AiSettings) {
   };
 }
 
-export async function aiChatText(opts: {
+export async function aiChatMessages(opts: {
   apiKey: string;
   settings?: AiSettings;
-  system: string;
-  user: string;
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
   maxTokens?: number;
   temperature?: number;
 }): Promise<string> {
@@ -44,10 +43,7 @@ export async function aiChatText(opts: {
       model,
       temperature: opts.temperature ?? 0.3,
       max_tokens: opts.maxTokens ?? 1200,
-      messages: [
-        { role: "system", content: opts.system },
-        { role: "user", content: opts.user },
-      ],
+      messages: opts.messages,
     }),
     signal: AbortSignal.timeout(90000),
   });
@@ -63,6 +59,26 @@ export async function aiChatText(opts: {
     result.choices?.[0]?.text ||
     "";
   return String(text).trim();
+}
+
+export async function aiChatText(opts: {
+  apiKey: string;
+  settings?: AiSettings;
+  system: string;
+  user: string;
+  maxTokens?: number;
+  temperature?: number;
+}): Promise<string> {
+  return aiChatMessages({
+    apiKey: opts.apiKey,
+    settings: opts.settings,
+    maxTokens: opts.maxTokens,
+    temperature: opts.temperature,
+    messages: [
+      { role: "system", content: opts.system },
+      { role: "user", content: opts.user },
+    ],
+  });
 }
 
 export function envAiApiKey(): string {

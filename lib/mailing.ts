@@ -199,6 +199,17 @@ export function mailingFailText(username: string, userId: string, error: string)
     return `${label}: лимит Telegram (Too many requests)`;
   }
   if (
+    e.includes("banned from sending") ||
+    e.includes("chat_write_forbidden") ||
+    e.includes("user_banned_in_channel") ||
+    e.includes("ограничен telegram")
+  ) {
+    return `${label}: аккаунт ограничен Telegram (бан на запись в чаты) — смените слот фермы`;
+  }
+  if (e.includes("каналом/чатом") || e.includes("не пользователем")) {
+    return `${label}: это канал/чат, не человек — нужен @username пользователя`;
+  }
+  if (
     e.includes("could not find the input entity") ||
     e.includes("cannot find any entity") ||
     e.includes("нет access_hash") ||
@@ -218,10 +229,18 @@ export function mailingFailText(username: string, userId: string, error: string)
   return `Ошибка ${label}: ${String(error || "fail").slice(0, 100)}`;
 }
 
-/** PEER_FLOOD / spamblock — не путать с FloodWait (временный лимит). */
+/** PEER_FLOOD / spamblock / write-ban — не путать с FloodWait (временный лимит). */
 export function isPeerFloodMailingError(error: string): boolean {
   const e = String(error || "").toLowerCase();
-  return e.includes("peer_flood") || e.includes("spamblock");
+  return (
+    e.includes("peer_flood") ||
+    e.includes("spamblock") ||
+    e.includes("banned from sending") ||
+    e.includes("chat_write_forbidden") ||
+    e.includes("user_banned_in_channel") ||
+    e.includes("ограничен telegram") ||
+    e.includes("нельзя писать в чаты")
+  );
 }
 
 /** Flood / Too many requests — отлёжка аккаунта + отложить получателя. */
@@ -290,6 +309,9 @@ export function isPermanentMailingRecipientError(error: string): boolean {
     e.includes("cannot find any entity") ||
     e.includes("нет access_hash") ||
     e.includes("не удалось открыть пользователя") ||
+    e.includes("каналом/чатом") ||
+    e.includes("не пользователем") ||
+    e.includes("это бот") ||
     e.includes("no such user") ||
     e.includes("user not found")
   );

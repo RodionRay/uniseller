@@ -1634,10 +1634,16 @@ async def send_message(
     silent: bool = False,
     delete_dialog: bool = False,
 ) -> dict[str, Any]:
-    from telethon.errors import FloodWaitError, RPCError, UserPrivacyRestrictedError
+    from telethon.errors import (
+        FloodWaitError,
+        RPCError,
+        UserPrivacyRestrictedError,
+        UserBannedInChannelError,
+        ChatWriteForbiddenError,
+    )
     from telethon.tl.functions.channels import GetParticipantRequest
     from telethon.tl.functions.contacts import ResolveUsernameRequest
-    from telethon.tl.types import InputPeerUser
+    from telethon.tl.types import InputPeerUser, User, Channel, Chat
 
     body = (text or "").strip()
     if len(body) < 1:
@@ -1766,6 +1772,24 @@ async def send_message(
                     "ok": False,
                     "error": peer_err or "Не удалось найти пользователя",
                 }
+            # ЛС только пользователю — иначе Telegram отвечает «banned … in superroups/channels»
+            try:
+                resolved = await client.get_entity(entity)
+            except Exception:
+                resolved = entity
+            if isinstance(resolved, (Channel, Chat)) or (
+                not isinstance(resolved, User)
+                and not isinstance(entity, InputPeerUser)
+                and getattr(resolved, "broadcast", False)
+            ):
+                return {
+                    "ok": False,
+                    "error": "Peer оказался каналом/чатом, а не пользователем — для ЛС нужен @username человека",
+                }
+            if isinstance(resolved, User):
+                if getattr(resolved, "bot", False):
+                    return {"ok": False, "error": "Это бот — в личку по рассылке не пишем"}
+                entity = resolved
             sent = await client.send_message(entity, body, silent=bool(silent))
             msg_id = str(getattr(sent, "id", "") or "")
             uname = (
@@ -1851,6 +1875,17 @@ async def send_message(
         return {"ok": False, "error": f"Неизвестный режим: {mode}"}
     except UserPrivacyRestrictedError:
         return {"ok": False, "error": "Пользователь ограничил личные сообщения"}
+    except (UserBannedInChannelError, ChatWriteForbiddenError) as e:
+        # Часто приходит и на «ЛС», если аккаунт ограничен Telegram / peer = канал
+        return {
+            "ok": False,
+            "status": "spamblock",
+            "error": (
+                "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы "
+                "(You're banned from sending messages in superroups/channels). "
+                "Смените аккаунт фермы или подождите 24ч."
+            )[:400],
+        }
     except FloodWaitError as e:
         return {"ok": False, "status": "flood", "error": f"FloodWait {e.seconds}с", "waitSec": int(e.seconds)}
     except RPCError as e:
@@ -1858,8 +1893,17 @@ async def send_message(
             return frozen_action_error("отправка сообщения")
         msg = str(e)
         low = msg.lower()
+        if "banned from sending" in low or "chat_write_forbidden" in low or "user_banned_in_channel" in low:
+            return {
+                "ok": False,
+                "status": "spamblock",
+                "error": (
+                    "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы. "
+                    "Смените аккаунт фермы или подождите 24ч."
+                )[:400],
+            }
         # Telethon иногда отдаёт Flood как обычный RPC «Too many requests» без FloodWaitError
-        if "too many requests" in low or "flood" in low:
+        if "too many requests" in low or ("flood" in low and "peer_flood" not in low and "banned" not in low):
             wait = 900
             m = re.search(r"(\d+)\s*(?:seconds?|s\b)", msg, re.I)
             if m:
@@ -1876,7 +1920,17 @@ async def send_message(
         return {"ok": False, "error": msg[:400]}
     except Exception as e:
         msg = str(e)
-        if "too many requests" in msg.lower():
+        low = msg.lower()
+        if "banned from sending" in low:
+            return {
+                "ok": False,
+                "status": "spamblock",
+                "error": (
+                    "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы. "
+                    "Смените аккаунт фермы или подождите 24ч."
+                )[:400],
+            }
+        if "too many requests" in low:
             return {
                 "ok": False,
                 "status": "flood",

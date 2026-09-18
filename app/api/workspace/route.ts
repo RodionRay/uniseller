@@ -3810,12 +3810,26 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     if(peerFlood){
      cooldownUntil=cooldownHoursFromNow(24);
      accountWentCooldown=true;
-     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)}: спамблок`});
+     // Текст AI вернём — сообщение не ушло
+     if(data.contentMode==='ai'&&text&&!rateLimited){
+      aiPool.unshift(text);
+      aiPoolUsed=Math.max(0,aiPoolUsed-1);
+     }
+     const banWrite=/banned from sending|chat_write_forbidden|user_banned_in_channel|ограничен telegram|нельзя писать в чаты/i.test(errRaw);
+     logEntries.push({
+      level:'error',
+      text:banWrite
+       ?`Аккаунт ${bracketLabel(accountLabel)}: ограничен Telegram (бан на запись) · пауза 24ч — берём другой слот`
+       :`Аккаунт ${bracketLabel(accountLabel)}: спамблок`,
+     });
      const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
      if(arow){
       const adata=JSON.parse(arow.data);
       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-       ...adata,status:'spamblock',cooldownUntil,error:'PEER_FLOOD',
+       ...adata,
+       status:'spamblock',
+       cooldownUntil,
+       error:banWrite?'WRITE_BAN_SUPERGROUPS':(errRaw.slice(0,500)||'PEER_FLOOD'),
       }),owner,accountId,'account').run();
      }
     }
@@ -3892,8 +3906,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
        }
       }catch{/* */}
      }
-    }else if(rateLimited){
-     // Временный лимит — не считаем fail и не пишем доставку как провал
+    }else if(rateLimited||peerFlood){
+     // Лимит / write-ban аккаунта — получателя не списываем навсегда
+     if(peerFlood&&!rateLimited){
+      deferredUntil[cand.key]=cooldownUntil||cooldownHoursFromNow(1);
+     }
     }else{
      failN++;
      logEntries.push({level:'error',text:mailingFailText(cand.username,cand.userId,errRaw||'fail')});

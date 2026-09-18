@@ -52,4 +52,11 @@ describe('рассылка · flood / лог / очередь',()=>{
     expect(mailingFailText('timosha_07','342560478',raw)).toContain('access_hash');
     expect(isPermanentMailingRecipientError('Не удалось открыть пользователя (нет access_hash)')).toBe(true);
   });
+
+  it('бан на запись в супергруппы → spamblock аккаунта, не FloodWait',()=>{
+    const raw="You're banned from sending messages in superroups/channels (caused by SendMessageRequest)";
+    expect(isPeerFloodMailingError(raw)).toBe(true);
+    expect(isRateLimitMailingError(raw)).toBe(false);
+    expect(mailingFailText('x','1',raw)).toContain('ограничен Telegram');
+  });
 });

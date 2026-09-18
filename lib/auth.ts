@@ -8,12 +8,53 @@ export type SessionUser = {
   fullName: string | null;
 };
 
+export type SessionPayload = {
+  userId: string;
+  email: string;
+  displayName?: string;
+};
+
 const COOKIE_NAME = "uniseller_session";
-const ADMIN_USER_ID = "admin";
+export const ADMIN_USER_ID = "admin";
 const LOGIN_PATH = "/login";
 const LOGOUT_PATH = "/logout";
 const SESSION_TTL_SEC = 60 * 60 * 24 * 14;
 const PBKDF2_ITERATIONS = 210_000;
+
+export function readEnv(name: string): string | undefined {
+  const fromProcess = process.env[name]?.trim();
+  if (fromProcess) return fromProcess;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { env } = require("cloudflare:workers") as {
+      env: Record<string, string | undefined>;
+    };
+    return env[name]?.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+export function getAdminEmail(): string | undefined {
+  return readEnv("ADMIN_EMAIL")?.toLowerCase();
+}
+
+export function sessionSecretConfigured(): boolean {
+  const secret = readEnv("SESSION_SECRET");
+  return Boolean(secret && secret.length >= 32);
+}
+
+export function adminAuthConfigured(): boolean {
+  return Boolean(
+    getAdminEmail() &&
+      readEnv("ADMIN_PASSWORD_HASH") &&
+      sessionSecretConfigured(),
+  );
+}
+
+export function authConfigured(): boolean {
+  return sessionSecretConfigured();
+}
 
 export async function getSessionUser(): Promise<SessionUser | null> {
   const jar = await cookies();
@@ -50,10 +91,21 @@ export function sessionCookieOptions(maxAge = SESSION_TTL_SEC) {
   };
 }
 
-export async function createSessionToken(email: string): Promise<string> {
+export async function createSessionToken(
+  user: SessionPayload | string,
+): Promise<string> {
+  const payloadUser: SessionPayload =
+    typeof user === "string"
+      ? { userId: ADMIN_USER_ID, email: user, displayName: user }
+      : user;
   const exp = Math.floor(Date.now() / 1000) + SESSION_TTL_SEC;
   const payload = Buffer.from(
-    JSON.stringify({ sub: ADMIN_USER_ID, email, exp }),
+    JSON.stringify({
+      sub: payloadUser.userId,
+      email: payloadUser.email,
+      name: payloadUser.displayName || payloadUser.email || "Пользователь",
+      exp,
+    }),
     "utf8",
   ).toString("base64url");
   const sig = await sign(payload);
@@ -69,20 +121,28 @@ export async function verifySessionToken(
   if (!timingSafeEqual(sig, expected)) return null;
 
   try {
-    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+    const data = JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf8"),
+    ) as {
       sub?: string;
       email?: string;
+      name?: string;
       exp?: number;
     };
-    if (data.sub !== ADMIN_USER_ID || typeof data.email !== "string") return null;
-    if (typeof data.exp !== "number" || data.exp * 1000 < Date.now()) return null;
-    const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-    if (!adminEmail || data.email.toLowerCase() !== adminEmail) return null;
+    if (!data.sub || typeof data.sub !== "string") return null;
+    if (typeof data.exp !== "number" || data.exp * 1000 < Date.now())
+      return null;
+    const email = typeof data.email === "string" ? data.email : "";
+    if (data.sub === ADMIN_USER_ID) {
+      const adminEmail = getAdminEmail();
+      if (!adminEmail || email.toLowerCase() !== adminEmail) return null;
+    }
+    const displayName = data.name || email || "Пользователь";
     return {
-      userId: ADMIN_USER_ID,
-      email: data.email,
-      displayName: data.email,
-      fullName: null,
+      userId: data.sub,
+      email,
+      displayName,
+      fullName: data.name || null,
     };
   } catch {
     return null;
@@ -90,9 +150,8 @@ export async function verifySessionToken(
 }
 
 export async function verifyAdminPassword(password: string): Promise<boolean> {
-  const email = process.env.ADMIN_EMAIL?.trim();
-  const hash = process.env.ADMIN_PASSWORD_HASH?.trim();
-  if (!email || !hash || !password) return false;
+  const hash = readEnv("ADMIN_PASSWORD_HASH");
+  if (!hash || !password) return false;
   return verifyPasswordHash(password, hash);
 }
 
@@ -104,14 +163,17 @@ export async function hashPassword(password: string): Promise<string> {
     String(PBKDF2_ITERATIONS),
     Buffer.from(salt).toString("base64url"),
     Buffer.from(derived).toString("base64url"),
-  ].join("$");
+  ].join(":");
 }
 
 export async function verifyPasswordHash(
   password: string,
   stored: string,
 ): Promise<boolean> {
-  const [algo, iterRaw, saltB64, hashB64] = stored.split("$");
+  const normalized = stored.includes(":")
+    ? stored
+    : stored.replaceAll("$", ":");
+  const [algo, iterRaw, saltB64, hashB64] = normalized.split(":");
   if (algo !== "pbkdf2" || !iterRaw || !saltB64 || !hashB64) return false;
   const iterations = Number(iterRaw);
   if (!Number.isFinite(iterations) || iterations < 100_000) return false;
@@ -122,19 +184,20 @@ export async function verifyPasswordHash(
   return timingSafeEqualBytes(expected, actual);
 }
 
-function safeRelativeReturnPath(value: string): string {
+export function safeRelativeReturnPath(value: string): string {
   if (!value.startsWith("/") || value.startsWith("//")) return "/";
   try {
     const url = new URL(value, "https://app.local");
     if (url.origin !== "https://app.local") return "/";
     if (
       url.pathname === LOGIN_PATH ||
+      url.pathname === "/register" ||
       url.pathname === LOGOUT_PATH ||
       url.pathname === "/signin-with-chatgpt" ||
       url.pathname === "/signout-with-chatgpt" ||
       url.pathname === "/callback"
     ) {
-      return "/";
+      return "/app";
     }
     return `${url.pathname}${url.search}${url.hash}`;
   } catch {
@@ -153,7 +216,7 @@ async function sign(payload: string): Promise<string> {
 }
 
 async function sessionKey(): Promise<CryptoKey> {
-  const secret = process.env.SESSION_SECRET?.trim();
+  const secret = readEnv("SESSION_SECRET");
   if (!secret || secret.length < 32) {
     throw new Error("SESSION_SECRET не настроен (минимум 32 символа)");
   }
@@ -192,10 +255,7 @@ async function deriveKey(
 
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  return timingSafeEqualBytes(
-    Buffer.from(a, "utf8"),
-    Buffer.from(b, "utf8"),
-  );
+  return timingSafeEqualBytes(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
 }
 
 function timingSafeEqualBytes(a: Buffer, b: Buffer): boolean {
@@ -204,3 +264,5 @@ function timingSafeEqualBytes(a: Buffer, b: Buffer): boolean {
   for (let i = 0; i < a.length; i++) out |= a[i]! ^ b[i]!;
   return out === 0;
 }
+
+export { timingSafeEqualBytes };

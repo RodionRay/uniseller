@@ -1,8 +1,10 @@
 "use client"
 
 import * as React from "react"
+import { ChevronDown, ChevronUp } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import type { SortDirection } from "@/lib/table-sort"
 
 function Table({ className, ...props }: React.ComponentProps<"table">) {
   return (
@@ -78,6 +80,106 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
   )
 }
 
+function SortableTableHead({
+  columnKey,
+  sortKey,
+  sortDir,
+  onSort,
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"th"> & {
+  columnKey: string
+  sortKey: string | null
+  sortDir: SortDirection
+  onSort: (key: string) => void
+}) {
+  const active = sortKey === columnKey
+  return (
+    <TableHead className={cn("table-sort-th", className)} {...props}>
+      <button
+        type="button"
+        className={cn(
+          "table-sort-btn",
+          active && "is-active",
+          typeof className === "string" &&
+            className.includes("text-right") &&
+            "w-full justify-end"
+        )}
+        onClick={() => onSort(columnKey)}
+        aria-sort={
+          active ? (sortDir === "asc" ? "ascending" : "descending") : "none"
+        }
+      >
+        <span>{children}</span>
+        <span className="table-sort-carets" aria-hidden>
+          <ChevronUp
+            size={12}
+            className={cn(
+              "table-sort-caret",
+              active && sortDir === "asc" && "is-on"
+            )}
+          />
+          <ChevronDown
+            size={12}
+            className={cn(
+              "table-sort-caret",
+              active && sortDir === "desc" && "is-on"
+            )}
+          />
+        </span>
+      </button>
+    </TableHead>
+  )
+}
+
+/** Clickable sort control for non-`<th>` list headers (groups, leads). */
+function SortHeaderButton({
+  columnKey,
+  sortKey,
+  sortDir,
+  onSort,
+  className,
+  children,
+}: {
+  columnKey: string
+  sortKey: string | null
+  sortDir: SortDirection
+  onSort: (key: string) => void
+  className?: string
+  children: React.ReactNode
+}) {
+  const active = sortKey === columnKey
+  return (
+    <button
+      type="button"
+      className={cn("table-sort-btn table-sort-btn--plain", active && "is-active", className)}
+      onClick={() => onSort(columnKey)}
+      aria-sort={
+        active ? (sortDir === "asc" ? "ascending" : "descending") : "none"
+      }
+    >
+      <span>{children}</span>
+      <span className="table-sort-carets" aria-hidden>
+        <ChevronUp
+          size={12}
+          className={cn(
+            "table-sort-caret",
+            active && sortDir === "asc" && "is-on"
+          )}
+        />
+        <ChevronDown
+          size={12}
+          className={cn(
+            "table-sort-caret",
+            active && sortDir === "desc" && "is-on"
+          )}
+        />
+      </span>
+    </button>
+  )
+}
+
 function TableCell({ className, ...props }: React.ComponentProps<"td">) {
   return (
     <td
@@ -113,4 +215,6 @@ export {
   TableRow,
   TableCell,
   TableCaption,
+  SortableTableHead,
+  SortHeaderButton,
 }

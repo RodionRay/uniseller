@@ -1,10 +1,16 @@
 import { NextResponse } from "next/server";
 import {
+  ADMIN_USER_ID,
+  adminAuthConfigured,
+  authConfigured,
   createSessionToken,
+  getAdminEmail,
   sessionCookieName,
   sessionCookieOptions,
   verifyAdminPassword,
+  verifyPasswordHash,
 } from "@/lib/auth";
+import { findUserByEmail } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
@@ -22,27 +28,52 @@ export async function POST(req: Request) {
   }
 
   try {
+    if (!authConfigured()) {
+      return reply({ error: "Авторизация не настроена на сервере" }, 503);
+    }
+
     const body = (await req.json()) as { email?: string; password?: string };
     const email = String(body.email ?? "")
       .trim()
       .toLowerCase();
     const password = String(body.password ?? "");
-    const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-
-    if (!adminEmail || !process.env.ADMIN_PASSWORD_HASH || !process.env.SESSION_SECRET) {
-      return reply({ error: "Авторизация не настроена на сервере" }, 503);
-    }
-    if (!email || !password || email !== adminEmail) {
-      return reply({ error: "Неверный email или пароль" }, 401);
-    }
-    if (!(await verifyAdminPassword(password))) {
+    if (!email || !password) {
       return reply({ error: "Неверный email или пароль" }, 401);
     }
 
-    const token = await createSessionToken(adminEmail);
-    const response = reply({ ok: true });
-    response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-    return response;
+    const dbUser = await findUserByEmail(email);
+    if (dbUser?.passwordHash) {
+      if (!(await verifyPasswordHash(password, dbUser.passwordHash))) {
+        return reply({ error: "Неверный email или пароль" }, 401);
+      }
+      const token = await createSessionToken({
+        userId: dbUser.id,
+        email: dbUser.email || email,
+        displayName: dbUser.name,
+      });
+      const response = reply({ ok: true });
+      response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
+      return response;
+    }
+
+    const expected = getAdminEmail();
+    if (
+      adminAuthConfigured() &&
+      expected &&
+      email === expected &&
+      (await verifyAdminPassword(password))
+    ) {
+      const token = await createSessionToken({
+        userId: ADMIN_USER_ID,
+        email: expected,
+        displayName: "Администратор",
+      });
+      const response = reply({ ok: true });
+      response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
+      return response;
+    }
+
+    return reply({ error: "Неверный email или пароль" }, 401);
   } catch {
     return reply({ error: "Не удалось выполнить вход" }, 503);
   }

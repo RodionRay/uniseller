@@ -14,12 +14,8 @@ const db = new Database(path);
 db.exec("PRAGMA journal_mode = WAL;");
 db.exec("PRAGMA foreign_keys = ON;");
 
-const row = db
-  .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='records'")
-  .get();
-
-if (!row) {
-  const migrationPath = join(process.cwd(), "drizzle", "0000_even_hydra.sql");
+function apply(file) {
+  const migrationPath = join(process.cwd(), "drizzle", file);
   if (!existsSync(migrationPath)) {
     console.error(`Migration not found: ${migrationPath}`);
     process.exit(1);
@@ -30,6 +26,12 @@ if (!row) {
     .filter(Boolean);
   for (const statement of statements) db.exec(statement);
 }
+
+const records = db
+  .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='records'")
+  .get();
+if (!records) apply("0000_even_hydra.sql");
+apply("0001_users_oauth.sql");
 
 db.close();
 console.log(`SQLite ready: ${path}`);

@@ -1,5 +1,12 @@
 import { Suspense } from "react";
-import LoginForm from "./login-form";
+import type { Metadata } from "next";
+import { AuthForm } from "@/components/marketing/auth-form";
+
+export const metadata: Metadata = {
+  title: "Вход",
+  description: "Вход в кабинет UniLab по почте или через соцсеть.",
+  robots: { index: false, follow: false },
+};
 
 export default function LoginPage() {
   return (
@@ -12,7 +19,7 @@ export default function LoginPage() {
         </main>
       }
     >
-      <LoginForm />
+      <AuthForm mode="login" />
     </Suspense>
   );
 }

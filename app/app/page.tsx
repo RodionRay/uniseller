@@ -154,6 +154,21 @@ async function api(body?:unknown){
   return data;
 }
 
+/** Чистый payload группы: не тащим битый joinStateError из records в save. */
+function cleanGroupSaveData(data:Record<string,unknown>){
+  const err=data.joinStateError;
+  const joinStateError=
+    err==null||typeof err==='object'?'':String(err).slice(0,500);
+  const joinState=String(data.joinState||'');
+  const okState=['','queued','waiting','joining','scanning'].includes(joinState)?joinState:'';
+  return{
+    ...data,
+    joinState:okState,
+    joinStateAt:okState?String(data.joinStateAt||''):'',
+    joinStateError,
+  };
+}
+
 function sleep(ms:number){return new Promise(r=>setTimeout(r,ms))}
 
 function proxyPickOptions(proxies:{id:string;data:any}[]){
@@ -2463,17 +2478,43 @@ function WorkspaceHome(){
         const key=telegramEntityKey(g.url);
         const existing=key?byUrl.get(key):undefined;
         if(existing){
-          const nextData={...existing.data,accountId:accountId||existing.data.accountId||'',name:existing.data.name||g.name,url:existing.data.url||canonicalizeTgUrl(g.url)};
+          const nextData=cleanGroupSaveData({
+            ...existing.data,
+            accountId:accountId||existing.data.accountId||'',
+            name:existing.data.name||g.name,
+            url:existing.data.url||canonicalizeTgUrl(g.url),
+            joinState:'',
+            joinStateAt:'',
+            joinStateError:'',
+          });
           if(accountId&&(existing.data.accountId!==accountId||existing.data.status!=='active')){
             await api({action:'save',kind:'group',id:existing.id,data:nextData});
           }
           if(doJoin&&!(existing.data.status==='active'&&(existing.data.joinedAt||existing.data.membership==='joined'))){
-            toJoin.push({id:existing.id,name:nextData.name||g.name});
+            toJoin.push({id:existing.id,name:String(nextData.name||g.name)});
           }
           continue;
         }
         try{
-          const saved=await api({action:'save',kind:'group',data:{name:g.name,url:canonicalizeTgUrl(g.url),accountId,status:'setup',error:'',membership:'none',joinedAt:'',leadsTotal:0,leadsHot:0,leadsWarm:0,leadsCold:0,scanMatched:0,rating:0,lastScanned:''}});
+          const saved=await api({action:'save',kind:'group',data:cleanGroupSaveData({
+            name:g.name,
+            url:canonicalizeTgUrl(g.url),
+            accountId,
+            status:'setup',
+            error:'',
+            membership:'none',
+            joinedAt:'',
+            joinState:'',
+            joinStateAt:'',
+            joinStateError:'',
+            leadsTotal:0,
+            leadsHot:0,
+            leadsWarm:0,
+            leadsCold:0,
+            scanMatched:0,
+            rating:0,
+            lastScanned:'',
+          })});
           added++;
           if(saved.id){
             if(doJoin)toJoin.push({id:saved.id,name:g.name});

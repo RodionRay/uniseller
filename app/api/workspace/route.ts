@@ -2652,8 +2652,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
  if(b.action==='set_group_join_state'){
   const id=z.string().uuid().parse(b.id);
   const joinState=z.enum(['','queued','waiting','joining','scanning']).parse(b.joinState??'');
-  // Было: schema без .parse() → в JSON писался объект Zod → save падал «Проверьте поля: joinStateError».
-  const joinStateError=z.string().max(500).parse(String(b.joinStateError??'').slice(0,500));
+  // Без zod.string().parse — только строка; иначе снова «Проверьте поля: joinStateError».
+  const joinStateError=sanitizeJoinStateError(b.joinStateError);
   const grow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'group').first();
   if(!grow)return reply({error:'Группа не найдена'},404);
   const gdata=JSON.parse(grow.data);
@@ -4387,7 +4387,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if(active.has(String(prev.joinState||''))&&!data.joinState){
     data.joinState=prev.joinState;
     data.joinStateAt=prev.joinStateAt||'';
-    data.joinStateError=prev.joinStateError||'';
+    // Не возвращаем битый joinStateError из БД (объект Zod от старого бага).
+    data.joinStateError=sanitizeJoinStateError(prev.joinStateError);
    }
   }catch{/* */}
  }

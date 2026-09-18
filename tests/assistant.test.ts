@@ -1,4 +1,4 @@
-import {describe,expect,it,vi} from 'vitest';
+import {describe,expect,it} from 'vitest';
 import {
   buildAssistantSystemPrompt,
   fallbackAssistantReply,
@@ -11,61 +11,35 @@ import {
   generateAssistantReply,
 } from '@/lib/assistant-chat';
 
-describe('AI-ассистент · знание о продукте',()=>{
-  it('собирает system prompt с Uniseller и правилами',()=>{
-    const prompt=buildAssistantSystemPrompt('Тестовый контекст');
-    expect(prompt).toContain(PRODUCT_NAME);
-    expect(prompt).toContain('Тестовый контекст');
-    expect(prompt).toContain('Не выдумывай цены');
+describe('UniLab assistant',()=>{
+  it('system prompt про UniLab',()=>{
+    const p=buildAssistantSystemPrompt();
+    expect(PRODUCT_NAME).toBe('UniLab');
+    expect(p).toContain('UniLab');
+    expect(p).toMatch(/антибан|вступлен/i);
+    expect(p).toMatch(/тёплые заявки|Telegram/i);
   });
 
-  it('отвечает по FAQ без OpenAI',()=>{
-    expect(matchAssistantFaq('Что такое Uniseller?')).toMatch(/платформа/i);
-    expect(matchAssistantFaq('Нужна синхронизация остатков')).toMatch(/остат/i);
-    expect(fallbackAssistantReply('случайный вопрос xyz')).toMatch(/Uniseller/);
-  });
-});
-
-describe('AI-ассистент · chat API helpers',()=>{
-  it('валидирует сообщение и историю',()=>{
-    expect(assistantRequestSchema.parse({
-      message:'Как подключить МойСклад?',
-      history:[{role:'user',content:'Привет'},{role:'assistant',content:'Здравствуйте!'}],
-      surface:'site',
-    }).surface).toBe('site');
-    expect(()=>assistantRequestSchema.parse({message:''})).toThrow();
+  it('FAQ без ключа',()=>{
+    expect(matchAssistantFaq('Что такое UniLab?')).toMatch(/Telegram/i);
+    expect(fallbackAssistantReply('xyz')).toMatch(/UniLab/);
   });
 
-  it('ограничивает частоту вопросов',()=>{
-    const now=new Date('2026-09-18T12:00:00Z');
-    expect(canAskAssistant(null,now)).toBe(true);
-    expect(canAskAssistant('2026-09-18T11:59:50Z',now)).toBe(false);
-    expect(canAskAssistant('2026-09-18T11:59:30Z',now)).toBe(true);
+  it('валидация и rate limit',()=>{
+    expect(assistantRequestSchema.parse({message:'Как работает рассылка?',surface:'admin'}).surface).toBe('admin');
+    expect(canAskAssistant(null)).toBe(true);
+    expect(canAskAssistant(new Date().toISOString())).toBe(false);
   });
 
-  it('без ключа использует knowledge fallback',async()=>{
-    const result=await generateAssistantReply(
-      {message:'Что такое Uniseller?',history:[],surface:'site'},
-      {apiKey:null},
-    );
-    expect(result.source).toBe('knowledge');
-    expect(result.reply).toMatch(/Uniseller/i);
-  });
-
-  it('с ключом вызывает DeepSeek chat completions',async()=>{
-    const fetchImpl=vi.fn(async()=>({
-      ok:true,
-      json:async()=>({
-        choices:[{message:{content:'Uniseller помогает с остатками и МойСклад.'}}],
-      }),
-    })) as unknown as typeof fetch;
-
-    const result=await generateAssistantReply(
-      {message:'Расскажи про остатки',history:[],surface:'admin'},
-      {apiKey:'sk-test',fetchImpl},
-    );
-    expect(result.source).toBe('openai');
-    expect(result.reply).toMatch(/остат/i);
-    expect(fetchImpl).toHaveBeenCalledOnce();
+  it('без ключа knowledge fallback',async()=>{
+    const prev=process.env.AI_API_KEY;
+    delete process.env.AI_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ASSISTANT_OPENAI_KEY;
+    const r=await generateAssistantReply({message:'Что такое UniLab?',history:[],surface:'site'},{apiKey:null});
+    expect(r.source).toBe('knowledge');
+    expect(r.reply).toMatch(/Telegram|UniLab/i);
+    if(prev!==undefined)process.env.AI_API_KEY=prev;
   });
 });

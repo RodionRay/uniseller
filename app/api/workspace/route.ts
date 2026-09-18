@@ -1910,7 +1910,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       lastScanned:'',
       joinState:'queued',
       joinStateAt:new Date().toISOString(),
-      joinStateError:errMsg,
+      joinStateError:sanitizeJoinStateError(errMsg),
      };
      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(healed),owner,id,'group').run();
      return reply({

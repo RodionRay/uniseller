@@ -2243,7 +2243,7 @@ function WorkspaceHome(){
       try{
         if(!id){
           const g=list('group').find(x=>x.id===accountPicker.groupId);
-          if(g)await api({action:'save',kind:'group',id:g.id,data:{...g.data,accountId:''}});
+          if(g)await api({action:'save',kind:'group',id:g.id,data:cleanGroupSaveData({...g.data,accountId:''})});
         }else{
           await api({action:'assign_group_accounts',mode:'single',groupIds:[accountPicker.groupId],accountIds:[id]});
         }
@@ -2384,12 +2384,19 @@ function WorkspaceHome(){
         if(existing){
           skipped++;
           if(groupImportAccountId&&groupImportJoin){
-            const nextData={...existing.data,accountId:groupImportAccountId,name:existing.data.name||g.name};
+            const nextData=cleanGroupSaveData({
+              ...existing.data,
+              accountId:groupImportAccountId,
+              name:existing.data.name||g.name,
+              joinState:'',
+              joinStateAt:'',
+              joinStateError:'',
+            });
             if(existing.data.accountId!==groupImportAccountId){
               await api({action:'save',kind:'group',id:existing.id,data:nextData});
             }
             if(!(existing.data.membership==='joined'||existing.data.joinedAt)){
-              toJoin.push({id:existing.id,name:nextData.name||g.name});
+              toJoin.push({id:existing.id,name:String(nextData.name||g.name)});
             }
           }
           continue;

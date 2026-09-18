@@ -1,5 +1,5 @@
 import {getSessionUser} from '@/lib/auth';
-import {isCatalogPlaceholderUrl} from '@/lib/group-catalog';
+import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
 import {database,seal,unseal} from '@/lib/server-store';
 import {aiChatText,envAiApiKey,resolveAiConfig} from '@/lib/ai-client';
 import {buildProjectBrief,leadMessageFingerprint,normalizeLeadMessage,parseLeadTemperature,ratingFromTemperatures,strongPlusTerms,type LeadTemperature} from '@/lib/lead-filter';
@@ -15,7 +15,7 @@ import {
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew} from '@/lib/ai-keywords';
 import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
-import {canonicalizeTgUrl,duplicateReason,isDuplicateKind} from '@/lib/record-identity';
+import {canonicalizeTgUrl,duplicateReason,isDuplicateKind,telegramEntityKey} from '@/lib/record-identity';
 import {
  DEFAULT_DM_SOFT_CLOSE,
  isDeadAccountMailingError,
@@ -2573,6 +2573,56 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const healed=await healDeadGroupAccounts(owner);
   if(!healed.ok&&!healed.reassigned)return reply({error:healed.error||'Нет живых аккаунтов',reassigned:0,items:[]},400);
   return reply({ok:true,reassigned:healed.reassigned,items:healed.items,liveAccounts:healed.liveAccounts||0});
+ }
+ /** Залить весь каталог (verified t.me) в «Группы и каналы» текущего workspace. */
+ if(b.action==='import_catalog'){
+  const accountId=typeof b.accountId==='string'?b.accountId:'';
+  if(accountId){
+   const arow:any=await db.prepare('SELECT id FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
+   if(!arow)return reply({error:'Аккаунт не найден'},400);
+  }
+  const existing=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='group'").bind(owner).all();
+  const byUrl=new Map<string,string>();
+  for(const r of existing.results){
+   try{
+    const d=JSON.parse(String(r.data));
+    const k=telegramEntityKey(String(d.url||''));
+    if(k)byUrl.set(k,String(r.id));
+   }catch{/* */}
+  }
+  const ready=GROUP_CATALOG.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url));
+  let added=0;
+  let skipped=0;
+  const created:{id:string;name:string;url:string}[]=[];
+  for(const g of ready){
+   const url=canonicalizeTgUrl(g.url);
+   const key=telegramEntityKey(url);
+   if(key&&byUrl.has(key)){skipped++;continue}
+   const id=crypto.randomUUID();
+   const data={
+    name:g.name,
+    url,
+    accountId:accountId||'',
+    status:'setup',
+    error:'',
+    membership:'none',
+    joinedAt:'',
+    leadsTotal:0,
+    leadsHot:0,
+    leadsWarm:0,
+    leadsCold:0,
+    scanMatched:0,
+    rating:0,
+    lastScanned:'',
+    source:g.niches.includes('blogs')?'tgstat-blogs':'catalog',
+   };
+   await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)')
+    .bind(id,owner,'group',JSON.stringify(data),null,new Date().toISOString()).run();
+   if(key)byUrl.set(key,id);
+   added++;
+   created.push({id,name:g.name,url});
+  }
+  return reply({ok:true,added,skipped,total:ready.length,created:created.slice(0,20)});
  }
  if(b.action==='mark_auto_rescan'){
   const config:any=await db.prepare('SELECT * FROM records WHERE owner=? AND kind=? LIMIT 1').bind(owner,'settings').first();

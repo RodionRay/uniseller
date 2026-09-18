@@ -35,3 +35,21 @@ export function canDeleteConnection(
 export function accountSetupStatus(hasProxy:boolean):'setup'|'ready_for_auth'{
   return hasProxy?'ready_for_auth':'setup';
 }
+
+export const ACCOUNT_STATUS_LABELS={
+  setup:'Требует подключения',
+  active:'Активный',
+  paused:'Пауза',
+  error:'Ошибка',
+} as const;
+
+/** Не затираем выбранный статус аккаунта при каждом save (баг сохранения). */
+export function resolveAccountStatus(
+  incoming:string|undefined,
+  existing:string|undefined,
+  isCreate:boolean,
+):string{
+  if(incoming&&incoming in ACCOUNT_STATUS_LABELS)return incoming;
+  if(existing&&existing in ACCOUNT_STATUS_LABELS)return existing;
+  return isCreate?'setup':'setup';
+}

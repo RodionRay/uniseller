@@ -1,19 +1,35 @@
 import {describe,expect,it} from 'vitest';
-import {accountSchema,groupSchema,leadSchema,proxySchema,schemas} from '@/lib/workspace-schemas';
+import {accountSchema,groupSchema,leadSchema,proxySchema,schemas,WORKSPACE_BODY_LIMIT} from '@/lib/workspace-schemas';
 import {
   accountSetupStatus,
   canDeleteConnection,
   isAccountInUse,
   isProxyInUse,
   parseAccount,
+  resolveAccountStatus,
 } from '@/lib/processes/accounts';
+import {isAllowedAccountPhotoFile} from '@/lib/account-photo';
 
 describe('аккаунты',()=>{
-  it('принимает валидный телефон и опциональный proxyId',()=>{
-    expect(parseAccount({name:'Основной',phone:'+79991234567',proxyId:''})).toMatchObject({
+  it('принимает валидный телефон, статус, лимиты и фото',()=>{
+    expect(parseAccount({
       name:'Основной',
       phone:'+79991234567',
       proxyId:'',
+      status:'active',
+      limitJoins:10,
+      limitInvites:40,
+      limitMessages:10,
+      limitChats:10,
+      firstName:'Uniseller',
+      lastName:'Сервис',
+      username:'cedardesk403',
+      photo:'data:image/jpeg;base64,/9j/4AAQ',
+    })).toMatchObject({
+      name:'Основной',
+      phone:'+79991234567',
+      status:'active',
+      username:'cedardesk403',
     });
   });
 
@@ -21,6 +37,12 @@ describe('аккаунты',()=>{
     expect(()=>accountSchema.parse({name:'A',phone:'79991234567'})).toThrow();
     expect(()=>accountSchema.parse({name:'A',phone:'+123'})).toThrow();
     expect(()=>accountSchema.parse({name:'A',phone:'+0123456789'})).toThrow();
+  });
+
+  it('не затирает выбранный статус при сохранении',()=>{
+    expect(resolveAccountStatus('active','setup',false)).toBe('active');
+    expect(resolveAccountStatus(undefined,'active',false)).toBe('active');
+    expect(resolveAccountStatus(undefined,undefined,true)).toBe('setup');
   });
 
   it('блокирует удаление прокси, назначенного аккаунту',()=>{
@@ -63,6 +85,15 @@ describe('аккаунты',()=>{
 
   it('schemas.account совпадает с публичным API валидации',()=>{
     expect(schemas.account).toBe(accountSchema);
+  });
+
+  it('разрешает тело запроса с фото больше прежних 30 КБ',()=>{
+    expect(WORKSPACE_BODY_LIMIT).toBeGreaterThan(30_000);
+  });
+
+  it('принимает только подходящие файлы фото',()=>{
+    expect(isAllowedAccountPhotoFile(new File([new Uint8Array([1,2,3])],'a.jpg',{type:'image/jpeg'}))).toBe(true);
+    expect(isAllowedAccountPhotoFile(new File([new Uint8Array([1])],'a.gif',{type:'image/gif'}))).toBe(false);
   });
 });
 

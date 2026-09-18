@@ -4,6 +4,8 @@ export const kindSchema=z.enum(['account','proxy','group','lead','settings']);
 export type WorkspaceKind=z.infer<typeof kindSchema>;
 
 const short=z.string().trim().min(1).max(200);
+const optionalText=z.string().max(200).default('');
+const dayLimit=z.coerce.number().int().min(0).max(1000);
 
 export const settingsSchema=z.object({
   name:short,
@@ -12,10 +14,24 @@ export const settingsSchema=z.object({
   model:short,
 });
 
+export const accountStatusSchema=z.enum(['setup','active','paused','error']);
+
 export const accountSchema=z.object({
   name:short,
   phone:z.string().regex(/^\+[1-9]\d{7,14}$/),
   proxyId:z.string().max(100).default(''),
+  status:accountStatusSchema.default('setup'),
+  limitJoins:dayLimit.default(10),
+  limitInvites:dayLimit.default(40),
+  limitMessages:dayLimit.default(10),
+  limitChats:dayLimit.default(10),
+  firstName:optionalText,
+  lastName:optionalText,
+  username:z.string().trim().max(32).regex(/^[a-zA-Z0-9_]*$/).default(''),
+  photo:z.string().max(350_000).refine(
+    (v)=>!v||/^data:image\/(jpeg|png|webp);base64,/.test(v),
+    {message:'Некорректное фото'},
+  ).default(''),
 });
 
 export const proxySchema=z.object({
@@ -47,3 +63,6 @@ export const schemas={
   lead:leadSchema,
   settings:settingsSchema,
 } as const;
+
+/** Лимит тела POST: фото аккаунта в base64 требует больше 30 КБ. */
+export const WORKSPACE_BODY_LIMIT=400_000;

@@ -184,7 +184,15 @@ const schemas={
   /** Очередь вступления на сервере — переживает F5 */
   joinState:z.enum(['','queued','waiting','joining','scanning']).default(''),
   joinStateAt:z.string().max(40).default(''),
-  joinStateError:z.string().max(500).default(''),
+  // coerce: раньше set_group_join_state мог сохранить не-строку; длинные ошибки TG режем.
+  joinStateError:z.preprocess(
+   (v)=>{
+    if(v==null)return '';
+    if(typeof v==='object')return ''; // битый JSON от старого бага
+    return String(v).slice(0,500);
+   },
+   z.string().max(500),
+  ).default(''),
   leadsTotal:z.coerce.number().int().min(0).default(0),
   leadsHot:z.coerce.number().int().min(0).default(0),
   leadsWarm:z.coerce.number().int().min(0).default(0),
@@ -2610,7 +2618,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
  if(b.action==='set_group_join_state'){
   const id=z.string().uuid().parse(b.id);
   const joinState=z.enum(['','queued','waiting','joining','scanning']).parse(b.joinState??'');
-  const joinStateError=z.string().max(500).optional().default('');
+  // Было: schema без .parse() → в JSON писался объект Zod → save падал «Проверьте поля: joinStateError».
+  const joinStateError=z.string().max(500).parse(String(b.joinStateError??'').slice(0,500));
   const grow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'group').first();
   if(!grow)return reply({error:'Группа не найдена'},404);
   const gdata=JSON.parse(grow.data);
@@ -2618,7 +2627,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    ...gdata,
    joinState,
    joinStateAt:joinState?new Date().toISOString():'',
-   joinStateError:joinStateError||'',
+   joinStateError,
   };
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'group').run();
   return reply({ok:true,group:next});

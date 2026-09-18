@@ -15,7 +15,9 @@
     "db:migrate": "node scripts/db-migrate.mjs",
     "auth:hash": "node scripts/hash-password.mjs",
     "tg:worker": "node telegram-worker/src/server.mjs",
-    "check:lead-core": "tsx scripts/check-lead-core.ts"
+    "check:lead-core": "tsx scripts/check-lead-core.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
@@ -68,6 +70,7 @@
     "typescript": "5.9.3",
     "vinext": "1.0.0-beta.5",
     "vite": "8.0.13",
+    "vitest": "^3.2.7",
     "wrangler": "4.92.0"
   },
   "type": "module",

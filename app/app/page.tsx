@@ -60,6 +60,7 @@ import {
   MARKET_SECTIONS,
   catalogStats,
   isCatalogPlaceholderUrl,
+  marketVerifiedCount,
   nichesFromProjectText,
   searchGroupCatalog,
   type CatalogHit,
@@ -452,7 +453,7 @@ function WorkspaceHome(){
   const [catalogSelected,setCatalogSelected]=useState<string[]>([]);
   const [catalogAccountId,setCatalogAccountId]=useState('');
   const [catalogHideAdded,setCatalogHideAdded]=useState(true);
-  const [catalogMarket,setCatalogMarket]=useState<string>('mp');
+  const [catalogMarket,setCatalogMarket]=useState<string>('all');
   const [catalogTab,setCatalogTab]=useState<'links'|'topics'>('links');
   const [catalogSearching,setCatalogSearching]=useState(false);
   const [catalogHits,setCatalogHits]=useState<CatalogHit[]>([]);
@@ -2301,23 +2302,21 @@ function WorkspaceHome(){
   function openCatalog(){
     const s=list('settings')[0]?.data||defaults.settings;
     const auto=nichesFromProjectText(s.product,s.audience,s.keywords,s.leadCriteria,s.name,s.pains,s.valueProps,s.hotSignals);
-    let marketId='mp';
-    let niche:GroupNiche|null=auto[0]||null;
+    // По умолчанию — вся база; если AI подсказал ниши — узкий рынок, но «все ниши» внутри.
+    let marketId='all';
+    let niche:GroupNiche|null=null;
     if(auto.length){
-      let best={id:'mp',score:0};
+      let best={id:'all',score:0};
       for(const m of MARKET_SECTIONS){
+        if(!m.niches.length)continue;
         const score=m.niches.filter(n=>auto.includes(n)).length;
         if(score>best.score)best={id:m.id,score};
       }
-      marketId=best.id;
-      const section=MARKET_SECTIONS.find(m=>m.id===marketId)!;
-      niche=section.niches.find(n=>auto.includes(n))||section.niches[0]||null;
-    }else{
-      niche=MARKET_SECTIONS.find(m=>m.id===marketId)?.niches[0]||null;
+      if(best.score>0)marketId=best.id;
     }
     setCatalogMarket(marketId);
     setCatalogNiche(niche);
-    setCatalogHideAdded(true);
+    setCatalogHideAdded(false);
     setCatalogTab('links');
     setCatalogQuery('');
     setCatalogSelected([]);
@@ -2410,7 +2409,7 @@ function WorkspaceHome(){
     finally{setBusy(false)}
   }
 
-  function selectCatalogNiche(n:GroupNiche){
+  function selectCatalogNiche(n:GroupNiche|null){
     setCatalogNiche(n);
     setCatalogSelected([]);
     setCatalogSearching(true);
@@ -2419,49 +2418,57 @@ function WorkspaceHome(){
 
   function selectMarket(marketId:string){
     setCatalogMarket(marketId);
-    const section=MARKET_SECTIONS.find(m=>m.id===marketId);
-    const next=section?.niches[0]||null;
-    setCatalogNiche(next);
+    setCatalogNiche(null);
     setCatalogSelected([]);
     setCatalogTab('links');
     setCatalogSearching(true);
     setCatalogSearchTick(t=>t+1);
   }
 
-  async function addCatalogGroups(overrideIds?:string[]){
+  /** Сохранить чаты каталога в «Группы и каналы». join=true — сразу фоновое вступление. */
+  async function saveCatalogGroupsToDb(overrideIds?:string[],opts?:{join?:boolean}){
     const selectedIds=overrideIds?.length?overrideIds:catalogSelected;
     const picks=GROUP_CATALOG.filter(g=>selectedIds.includes(g.id));
-    if(!picks.length){toast.message('Выберите чаты со ссылкой');return}
-    if(!catalogAccountId){toast.error('Сначала выберите аккаунт слева/сверху');return}
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    const ready=picks.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url));
+    const needLink=picks.filter(g=>!g.verified||!g.url||isCatalogPlaceholderUrl(g.url));
+    if(!ready.length&&!needLink.length){toast.message('Выберите чаты со ссылкой');return}
+    const doJoin=!!opts?.join;
+    if(doJoin){
+      if(!catalogAccountId){toast.error('Сначала выберите аккаунт слева/сверху');return}
+      if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    }
+    if(!ready.length){
+      toast.message('Нет чатов со ссылкой');
+      return;
+    }
     setBusy(true);
     try{
-      const ready=picks.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url));
-      const needLink=picks.filter(g=>!g.verified||!g.url||isCatalogPlaceholderUrl(g.url));
       const byUrl=new Map(list('group').map(r=>{
         const k=telegramEntityKey(r.data.url);
         return [k,r as RecordItem] as const;
       }).filter(([k])=>k));
       const toJoin:{id:string;name:string}[]=[];
+      let added=0;
+      const accountId=catalogAccountId||'';
       for(const g of ready){
         const key=telegramEntityKey(g.url);
         const existing=key?byUrl.get(key):undefined;
         if(existing){
-          const nextData={...existing.data,accountId:catalogAccountId,name:existing.data.name||g.name,url:existing.data.url||g.url};
-          if(existing.data.accountId!==catalogAccountId||existing.data.status!=='active'){
+          const nextData={...existing.data,accountId:accountId||existing.data.accountId||'',name:existing.data.name||g.name,url:existing.data.url||canonicalizeTgUrl(g.url)};
+          if(accountId&&(existing.data.accountId!==accountId||existing.data.status!=='active')){
             await api({action:'save',kind:'group',id:existing.id,data:nextData});
           }
-          // Уже реально вступили — не гоняем повторно
-          if(!(existing.data.status==='active'&&(existing.data.joinedAt||existing.data.membership==='joined'))){
+          if(doJoin&&!(existing.data.status==='active'&&(existing.data.joinedAt||existing.data.membership==='joined'))){
             toJoin.push({id:existing.id,name:nextData.name||g.name});
           }
           continue;
         }
         try{
-          const saved=await api({action:'save',kind:'group',data:{name:g.name,url:canonicalizeTgUrl(g.url),accountId:catalogAccountId,status:'setup',error:'',membership:'none',joinedAt:'',leadsTotal:0,leadsHot:0,leadsWarm:0,leadsCold:0,scanMatched:0,rating:0,lastScanned:''}});
+          const saved=await api({action:'save',kind:'group',data:{name:g.name,url:canonicalizeTgUrl(g.url),accountId,status:'setup',error:'',membership:'none',joinedAt:'',leadsTotal:0,leadsHot:0,leadsWarm:0,leadsCold:0,scanMatched:0,rating:0,lastScanned:''}});
+          added++;
           if(saved.id){
-            toJoin.push({id:saved.id,name:g.name});
-            if(key)byUrl.set(key,{id:saved.id,kind:'group',data:{name:g.name,url:g.url,accountId:catalogAccountId,status:'setup'},hasSecret:false,created:''});
+            if(doJoin)toJoin.push({id:saved.id,name:g.name});
+            if(key)byUrl.set(key,{id:saved.id,kind:'group',data:{name:g.name,url:g.url,accountId,status:'setup'},hasSecret:false,created:''});
           }
         }catch(e){
           const err=e as Error & {status?:number};
@@ -2470,19 +2477,20 @@ function WorkspaceHome(){
         }
       }
       setCatalogSelected(prev=>prev.filter(id=>!selectedIds.includes(id)));
-      if(toJoin.length){
+      await refresh();
+      if(doJoin&&toJoin.length){
         setCatalogOpen(false);
-        await refresh();
         void startBackgroundJoins(toJoin);
         toast.message(`Сразу вступаем: ${toJoin.length} чат(ов) в фоне`);
-      }else if(ready.length&&!needLink.length){
+      }else if(doJoin&&ready.length&&!needLink.length){
         toast.message('Выбранные чаты уже подключены');
         setCatalogOpen(false);
-        await refresh();
-      }else if(!needLink.length){
-        toast.message('Нет чатов со ссылкой для вступления');
+      }else if(!doJoin){
+        toast.success(added?`В базу добавлено: ${added}`:`Уже в базе · показано ${ready.length}`);
+        navigate('Группы и каналы');
+        setCatalogOpen(false);
       }
-      if(needLink.length){
+      if(needLink.length&&doJoin){
         setJoinQueue(prev=>[
           ...prev,
           ...needLink.map((g,i)=>({id:`need-${Date.now()}-${i}-${g.id}`,name:g.name,status:'need_url' as const})),
@@ -2498,6 +2506,10 @@ function WorkspaceHome(){
       }
     }catch(e){toast.error((e as Error).message)}
     finally{setBusy(false)}
+  }
+
+  async function addCatalogGroups(overrideIds?:string[]){
+    return saveCatalogGroupsToDb(overrideIds,{join:true});
   }
 
   /** Клик по чату в каталоге = сразу вступить (без отдельной кнопки на карточке группы). */
@@ -2613,12 +2625,15 @@ function WorkspaceHome(){
     if(!catalogOpen)return;
     setCatalogSearching(true);
     const handle=window.setTimeout(()=>{
-      const niches=catalogNiche?[catalogNiche]:(MARKET_SECTIONS.find(m=>m.id===catalogMarket)?.niches||[]);
+      const section=MARKET_SECTIONS.find(m=>m.id===catalogMarket);
+      const niches=catalogNiche
+        ?[catalogNiche]
+        :(section?.niches?.length?section.niches:[]);
       const hits=searchGroupCatalog({
         query:catalogQuery,
         niches,
         mergeProject:false,
-        onlyMatched:true,
+        onlyMatched:niches.length>0,
       });
       setCatalogHits(hits);
       setCatalogSearching(false);
@@ -2984,6 +2999,14 @@ function WorkspaceHome(){
                 <>
                   <Button variant="outline" onClick={openManualGroup}><Plus size={16}/>Добавить группу</Button>
                   <Button variant="outline" onClick={openMassGroups}><Upload size={16}/>Добавить массово</Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy}
+                    onClick={()=>{
+                      const ids=GROUP_CATALOG.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url)).map(g=>g.id);
+                      void saveCatalogGroupsToDb(ids,{join:false});
+                    }}
+                  >Залить каталог ({catalogStats().uniqueUrls})</Button>
                   <Button onClick={openCatalog}><Search size={16}/>Поиск по темам</Button>
                 </>
               ):view==='Настройки'||view==='Сбор аудитории'||view==='Инвайтинг'||view==='Рассылка'||view==='Уведомления'||view==='Сотрудники'?null:(
@@ -4587,7 +4610,7 @@ function WorkspaceHome(){
           <DialogHeader className="px-6 pt-5 pb-4 border-b border-[var(--spike-border)] shrink-0">
             <DialogTitle>Найти чаты с клиентами</DialogTitle>
             <DialogDescription>
-              Выберите рынок и нишу. Нажмите «Вступить» у чата — сразу пойдёт фоновое вступление (антиспам-пауза между чатами).
+              Рынок «Все чаты» — полная база ({catalogStats().uniqueUrls} ссылок). «Залить в базу» добавит их в «Группы и каналы»; «Вступить» — фоновое вступление с паузой.
             </DialogDescription>
           </DialogHeader>
 
@@ -4602,7 +4625,7 @@ function WorkspaceHome(){
                     className={`catalog-side-item ${catalogMarket===m.id?'active':''}`}
                     onClick={()=>selectMarket(m.id)}
                   >
-                    <strong>{m.title}</strong>
+                    <strong>{m.title} <em className="opacity-70 font-normal">· {marketVerifiedCount(m.id)}</em></strong>
                     <span>{m.hint}</span>
                   </button>
                 ))}
@@ -4610,6 +4633,11 @@ function WorkspaceHome(){
 
               <p className="catalog-step-label mt-4">Ниша</p>
               <div className="catalog-side-list catalog-niche-list">
+                <button
+                  type="button"
+                  className={`catalog-niche-btn ${catalogNiche===null?'active':''}`}
+                  onClick={()=>selectCatalogNiche(null)}
+                >Все ниши</button>
                 {catalogMarketNiches.map(n=>(
                   <button
                     key={n}
@@ -4629,14 +4657,14 @@ function WorkspaceHome(){
                   const s=list('settings')[0]?.data||defaults.settings;
                   const auto=nichesFromProjectText(s.product,s.audience,s.keywords,s.leadCriteria,s.name,s.pains,s.valueProps,s.hotSignals);
                   if(!auto.length){toast.message('В AI нет явных ниш — выберите рынок вручную');return}
-                  let best={id:MARKET_SECTIONS[0].id,score:0};
+                  let best={id:MARKET_SECTIONS.find(m=>m.niches.length)?.id||'all',score:0};
                   for(const m of MARKET_SECTIONS){
+                    if(!m.niches.length)continue;
                     const score=m.niches.filter(n=>auto.includes(n)).length;
                     if(score>best.score)best={id:m.id,score};
                   }
-                  const section=MARKET_SECTIONS.find(m=>m.id===best.id)!;
                   setCatalogMarket(best.id);
-                  setCatalogNiche(section.niches.find(n=>auto.includes(n))||section.niches[0]);
+                  setCatalogNiche(null);
                   setCatalogTab('links');
                   setCatalogSearching(true);
                   setCatalogSearchTick(t=>t+1);
@@ -4665,8 +4693,8 @@ function WorkspaceHome(){
               <div className="catalog-params">
                 <span className="catalog-param">{catalogActiveMarket?.title||'—'}</span>
                 <span className="catalog-param-sep">/</span>
-                <span className="catalog-param accent">{catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Выберите нишу'}</span>
-                <span className="small-note ml-auto">{catalogSearching?'Ищем…':`${catalogVisibleHits.length} результатов`}</span>
+                <span className="catalog-param accent">{catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Все ниши'}</span>
+                <span className="small-note ml-auto">{catalogSearching?'Ищем…':`${catalogVisibleHits.length} результатов · база ${catalogStats().uniqueUrls}`}</span>
               </div>
 
               <div className="catalog-tabs">
@@ -4766,10 +4794,18 @@ function WorkspaceHome(){
 
           <div className="px-6 py-4 border-t border-[var(--spike-border)] flex flex-wrap gap-2 shrink-0">
             {catalogTab==='links'?(
-              <Button
-                disabled={busy||!catalogReadyCount||!catalogAccountId}
-                onClick={()=>addCatalogGroups(catalogLinkHits.map(g=>g.id))}
-              >{busy?'Вступаем…':`Вступить во все (${catalogReadyCount})`}</Button>
+              <>
+                <Button
+                  disabled={busy||!catalogReadyCount}
+                  variant="default"
+                  onClick={()=>saveCatalogGroupsToDb(catalogLinkHits.map(g=>g.id),{join:false})}
+                >{busy?'Сохраняем…':`Залить в базу (${catalogReadyCount})`}</Button>
+                <Button
+                  disabled={busy||!catalogReadyCount||!catalogAccountId}
+                  variant="outline"
+                  onClick={()=>addCatalogGroups(catalogLinkHits.map(g=>g.id))}
+                >{busy?'Вступаем…':`Вступить во все (${catalogReadyCount})`}</Button>
+              </>
             ):(
               <Button
                 variant="outline"

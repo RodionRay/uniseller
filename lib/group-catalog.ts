@@ -537,16 +537,30 @@ export const GROUP_CATALOG: CatalogGroup[] = [
   g("tgstat-marketing-latrends", "Ля Тренд!", "https://t.me/latrends", ["blogs", "marketing", "leadgen", "smm"], "Канал из TGStat «Маркетинг» (396 556 subscribers).", "Маркетинг"),
 ];
 
-/** Рынки: где искать клиентов (группы ниш для UI). */
+/** Рынки: где искать клиентов (группы ниш для UI). niches=[] = показать весь каталог. */
 export const MARKET_SECTIONS: {id: string; title: string; hint: string; niches: GroupNiche[]}[] = [
+  {id: "all", title: "Все чаты", hint: "Полная база каталога со ссылками", niches: []},
+  {id: "blogs", title: "Блоги TGStat", hint: "Каналы из категории «Блоги» и бизнес-медиа", niches: ["blogs", "business", "marketing", "content", "startup"]},
   {id: "mp", title: "Маркетплейсы", hint: "Селлеры WB/Ozon/ЯМ ищут сервисы", niches: ["marketplaces", "wildberries", "ozon", "yandex_market", "megamarket", "ecommerce", "analytics", "pricing", "inventory", "reviews", "fulfillment", "certificates"]},
   {id: "saas", title: "SaaS / CRM / B2B", hint: "Внедрение, подписки, продажи B2B", niches: ["saas", "crm", "b2b", "business", "bots", "1c", "fintech"]},
   {id: "services", title: "Услуги и фриланс", hint: "Подряд, агентства, заказчики", niches: ["freelance", "marketing", "smm", "design", "content", "leadgen", "bots"]},
   {id: "local", title: "Локальный бизнес", hint: "Городские услуги и Авито", niches: ["avito", "beauty", "food", "auto", "realestate", "healthcare", "education"]},
   {id: "trade", title: "Торговля и логистика", hint: "Импорт, дроп, склады", niches: ["china", "dropshipping", "logistics", "fulfillment", "aliexpress", "vk_market"]},
   {id: "growth", title: "Стартапы и рост", hint: "Пилоты, нетворкинг, PR", niches: ["startup", "networking", "marketing", "leadgen", "saas"]},
-  {id: "blogs", title: "Блоги TGStat", hint: "Каналы из категории «Блоги» и бизнес-медиа", niches: ["blogs", "business", "marketing", "content", "startup"]},
 ];
+
+/** Число verified-ссылок в рынке (для UI). */
+export function marketVerifiedCount(marketId: string): number {
+  const section = MARKET_SECTIONS.find((m) => m.id === marketId);
+  if (!section) return 0;
+  if (!section.niches.length) {
+    return GROUP_CATALOG.filter((g) => g.verified && g.url).length;
+  }
+  const set = new Set(section.niches);
+  return GROUP_CATALOG.filter(
+    (g) => g.verified && g.url && g.niches.some((n) => set.has(n)),
+  ).length;
+}
 
 
 const NICHE_ALIASES: Record<string, GroupNiche[]> = {

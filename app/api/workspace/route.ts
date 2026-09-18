@@ -19,10 +19,13 @@ import {canonicalizeTgUrl,duplicateReason,isDuplicateKind} from '@/lib/record-id
 import {
  DEFAULT_DM_SOFT_CLOSE,
  isDeadAccountMailingError,
+ isPeerFloodMailingError,
  isPermanentMailingRecipientError,
  isRateLimitMailingError,
+ mailingEmptyBatchDecision,
  mailingFailText,
  mailingOkText,
+ mailingTextPreview,
  normalizeMailText,
  parseMailingFloodWaitSec,
  pushMailingDelivery,
@@ -3365,6 +3368,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const refill=await refillMailingAiPool(owner,next);
    next={...next,aiPool:refill.pool,log:pushTaskLog(next.log,refill.added? 'ok':'warn',refill.added?`AI-пул: +${refill.added} вариантов`:(refill.error||'Не удалось пополнить AI-пул'),500)};
   }
+  if(next.status==='running'&&next.deliveryMode==='dm'&&next.deleteDialogAfter){
+   next={
+    ...next,
+    log:pushTaskLog(
+     next.log,
+     'warn',
+     'Включено «удалить диалог после отправки»: ответы клиента в «Переписки» могут не подтянуться',
+     500,
+    ),
+   };
+  }
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'mailing_task').run();
   if(next.status==='running'){
    void notifyMailingEvent(db,owner,String(next.name||'Рассылка'),`Запущена · к отправке ~${pending}`);
@@ -3611,6 +3625,29 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
 
   const batch=candidates.slice(0,batchSize);
   if(!batch.length){
+   const decision=mailingEmptyBatchDecision(deferredUntil);
+   if(decision.action==='wait'){
+    const next={
+     ...data,
+     status:'scheduled' as const,
+     nextAt:decision.nextAt,
+     tickLockUntil:'',
+     deferredUntil:Object.fromEntries(
+      Object.entries(deferredUntil||{}).filter(([,v])=>{
+       const t=Date.parse(String(v||''));
+       return Number.isFinite(t)&&t>Date.now();
+      }),
+     ),
+     log:pushTaskLog(
+      data.log,
+      'info',
+      `Ждём снятия лимита Telegram · пауза ${decision.waitSec}с (очередь ещё не пуста)`,
+      500,
+     ),
+    };
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'mailing_task').run();
+    return reply({ok:true,waiting:true,waitSec:decision.waitSec,task:next});
+   }
    const next={...data,status:'completed',tickLockUntil:'',log:pushTaskLog(data.log,'ok',`Готово · ${data.sentTotal||0} доставлено`,500)};
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'mailing_task').run();
    return reply({ok:true,completed:true,task:next});
@@ -3682,11 +3719,16 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     },120_000);
 
     const errRaw=String(result.error||'');
+    const peerFlood=
+     result.status==='spamblock'||
+     isPeerFloodMailingError(errRaw)||
+     errRaw.includes('PEER_FLOOD');
     const rateLimited=
-     result.status==='flood'||
-     !!result.flood||
-     Number(result.waitSec)>0||
-     isRateLimitMailingError(errRaw);
+     !peerFlood&&
+     (result.status==='flood'||
+      !!result.flood||
+      Number(result.waitSec)>0||
+      isRateLimitMailingError(errRaw));
 
     if(rateLimited){
      const waitSec=Math.max(
@@ -3697,6 +3739,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      cooldownUntil=new Date(Date.now()+waitSec*1000).toISOString();
      accountWentCooldown=true;
      deferredUntil[cand.key]=cooldownUntil;
+     // Текст AI вернём в пул — отправки не было
+     if(data.contentMode==='ai'&&text){
+      aiPool.unshift(text);
+      aiPoolUsed=Math.max(0,aiPoolUsed-1);
+     }
      logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)}: лимит Telegram · пауза ${waitSec}с`});
      logEntries.push({level:'info',text:`Получатель отложен на ${Math.ceil(waitSec/60)} мин (Too many requests)`});
      const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
@@ -3707,7 +3754,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       }),owner,accountId,'account').run();
      }
     }
-    if(result.status==='spamblock'||errRaw.includes('PEER_FLOOD')){
+    if(peerFlood){
      cooldownUntil=cooldownHoursFromNow(24);
      accountWentCooldown=true;
      logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)}: спамблок`});
@@ -3725,21 +3772,49 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     const ok=!!result.ok;
     if(ok){
      okN++;
-     logEntries.push({level:'ok',text:mailingOkText(cand.username,cand.userId,link)});
+     logEntries.push({level:'ok',text:mailingOkText(cand.username,cand.userId,link,text)});
      newKeys.push(cand.key);
      delete deferredUntil[cand.key];
+     // Помечаем лид как outreach рассылки + пишем исходящее в историю (Переписки откроются по ответу)
+     if(cand.leadId&&deliveryMode==='dm'){
+      try{
+       const leadRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,cand.leadId,'lead').first();
+       if(leadRow){
+        const L=JSON.parse(leadRow.data);
+        const outbound={
+         text:text.slice(0,4000),
+         mode:'dm' as const,
+         at:new Date().toISOString(),
+         ok:true,
+         error:'',
+         messageId,
+         link,
+         chatId:String(result.chatId||cand.userId||'').slice(0,40),
+         from:'us' as const,
+        };
+        const replies=[...(Array.isArray(L.replies)?L.replies:[]),outbound].slice(-40);
+        await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
+         ...L,
+         replies,
+         mailingTaskId:L.mailingTaskId||id,
+         accountId:L.accountId||accountId,
+         senderId:L.senderId||cand.userId,
+         senderUsername:L.senderUsername||cand.username,
+        }),owner,cand.leadId,'lead').run();
+       }
+      }catch{/* */}
+     }
+    }else if(rateLimited){
+     // Временный лимит — не считаем fail и не пишем доставку как провал
     }else{
      failN++;
-     if(!rateLimited){
-      logEntries.push({level:'error',text:mailingFailText(cand.username,cand.userId,errRaw||'fail')});
-     }
-     // Мёртвый username / privacy — сразу снимаем с очереди (раньше @bogema7 крутился бесконечно).
+     logEntries.push({level:'error',text:mailingFailText(cand.username,cand.userId,errRaw||'fail')});
+     // Мёртвый username / privacy — сразу снимаем с очереди
      if(isPermanentMailingRecipientError(errRaw)){
       newKeys.push(cand.key);
       delete deferredUntil[cand.key];
      }
-     // TDesktopUnauthorized и т.п. — снимаем аккаунт, не получателя
-     if(isDeadAccountMailingError(errRaw)&&!rateLimited){
+     if(isDeadAccountMailingError(errRaw)){
       accountWentCooldown=true;
       logEntries.push({level:'warn',text:`Аккаунт ${bracketLabel(accountLabel)} недоступен: ${errRaw.slice(0,120)}`});
       const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
@@ -3754,22 +3829,24 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       }
      }
     }
-    const entry:MailingDelivery={
-     at:new Date().toISOString(),
-     key:cand.key,
-     userId:cand.userId,
-     username:cand.username,
-     leadId:cand.leadId,
-     accountId,
-     ok,
-     error:ok?'':String(result.error||'').slice(0,400),
-     messageId,
-     chatId:String(result.chatId||'').slice(0,40),
-     link,
-     textPreview:text.slice(0,200),
-     mode:deliveryMode,
-    };
-    deliveries=pushMailingDelivery(deliveries,entry);
+    if(ok||(!rateLimited&&!peerFlood)){
+     const entry:MailingDelivery={
+      at:new Date().toISOString(),
+      key:cand.key,
+      userId:cand.userId,
+      username:cand.username,
+      leadId:cand.leadId,
+      accountId,
+      ok,
+      error:ok?'':String(result.error||'').slice(0,400),
+      messageId,
+      chatId:String(result.chatId||'').slice(0,40),
+      link,
+      textPreview:mailingTextPreview(text,200),
+      mode:deliveryMode,
+     };
+     deliveries=pushMailingDelivery(deliveries,entry);
+    }
 
     if(accountWentCooldown)break;
    }
@@ -3796,10 +3873,13 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if(data.pauseBetweenAccounts&&prevAccountId&&prevAccountId!==accountId){
     pause=Math.max(pause,randomPauseSec(data.pauseFromSec,data.pauseToSec));
    }
-   // После Too many requests — не долбить следующего через 10с
+   // После FloodWait: если ферма жива — обычная пауза смены аккаунта; иначе ждём полный cooldown
    if(accountWentCooldown&&cooldownUntil){
     const left=Math.ceil((Date.parse(cooldownUntil)-Date.now())/1000);
-    if(Number.isFinite(left)&&left>0)pause=Math.max(pause,Math.min(300,left));
+    if(Number.isFinite(left)&&left>0){
+     if(stillLive.length)pause=Math.max(pause,Math.min(90,left));
+     else pause=Math.max(pause,left);
+    }
    }
    logEntries.push({level:'info',text:`Ожидание ${pause} секунд`});
 
@@ -3904,14 +3984,13 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const matchOutreach=(msg:any)=>{
    const byDelivery=hits.find(h=>sameMailingPeer(h,msg));
    if(byDelivery)return byDelivery;
-   // Уже открытая переписка / мы писали / известный sender лида
+   // Только лиды, которым мы уже писали (рассылка / исходящее в replies / открытая переписка)
    const byLead=leads.find(L=>{
     if(!sameMailingPeer(L.data,msg))return false;
     const d=L.data||{};
     if(d.conversationOpen||d.mailingTaskId)return true;
     if(Array.isArray(d.replies)&&d.replies.some((x:any)=>x&&(x.from==='us'||x.mode==='dm')))return true;
-    if(d.draft&&(d.senderId||d.senderUsername))return true;
-    return !!(d.senderId||d.senderUsername);
+    return false;
    });
    if(byLead)return {taskId:String(byLead.data.mailingTaskId||''),leadId:byLead.id,userId:String(byLead.data.senderId||''),username:String(byLead.data.senderUsername||''),preview:String(byLead.data.message||''),groupId:String(byLead.data.groupId||'')};
    return null;

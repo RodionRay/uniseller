@@ -43,7 +43,8 @@ export type GroupNiche =
   | "leadgen"
   | "certificates"
   | "china"
-  | "networking";
+  | "networking"
+  | "blogs";
 
 export const GROUP_NICHE_LABELS: Record<GroupNiche, string> = {
   marketplaces: "Маркетплейсы",
@@ -89,6 +90,7 @@ export const GROUP_NICHE_LABELS: Record<GroupNiche, string> = {
   certificates: "Сертификация",
   china: "Китай / поставки",
   networking: "Нетворкинг",
+  blogs: "Блоги (TGStat)",
 };
 
 export type CatalogGroup = {
@@ -199,34 +201,75 @@ export const GROUP_CATALOG: CatalogGroup[] = [
 
   // ——— Бизнес / нетворкинг / стартапы ———
   g("biznes-chat-1", "Бизнес-чат №1", "https://t.me/biznes_chat", ["business", "networking", "b2b", "leadgen"], "Идеи, партнёры, поставщики, нетворкинг.", "Предприниматели"),
-  g("biz-predprinimateli", "Подслушано Бизнес | Предприниматели", "https://t.me/predprinimateli_biznes", ["business", "networking", "freelance", "leadgen"], "Бизнес, фриланс, заказчики.", "Бизнес"),
+  g("biz-predprinimateli", "Подслушано Бизнес | Предприниматели", "https://t.me/predprinimateli_biznes", ["business", "networking", "freelance", "leadgen", "blogs"], "Бизнес, фриланс, заказчики.", "Бизнес"),
   g("biz-bezproblem", "Бизнес и фриланс", "https://t.me/bizbezproblem", ["business", "freelance", "leadgen", "networking"], "Поиск клиентов бизнесу и фрилансу.", "Бизнес / фриланс"),
   g("startup-founder", "IT Founder / проекты", "https://t.me/startup_founder", ["startup", "saas", "networking", "freelance"], "Идеи, команда, проекты.", "Стартапы"),
+  g("moscow-biz-chat", "Предприниматели | Чат о бизнесе", "https://t.me/moscow_biz", ["business", "networking", "b2b", "leadgen"], "Чат предпринимателей: запросы услуг и партнёров.", "Предприниматели"),
 
   // ——— Фриланс ———
   g("freelance-tg", "Фриланс чат Telegram", "https://t.me/freelance_in_telegram", ["freelance", "design", "marketing", "content", "business"], "Заказчики и исполнители.", "Фриланс"),
   g("freelance-work", "Работа онлайн | чат", "https://t.me/work_online_today", ["freelance", "business", "design", "content", "hr"], "Удалёнка и заказы.", "Фриланс"),
   g("free-chat-fl", "Фриланс | FREE CHAT", "https://t.me/free_chat_for_freelance", ["freelance", "design", "marketing", "bots"], "Поиск проектов и подрядчиков.", "Фриланс"),
+  g("habr-freelance", "Хабр Фриланс", "https://t.me/freelansim_ru", ["freelance", "saas", "b2b", "design"], "IT/digital заказы и подряд.", "IT / фриланс"),
 
   // ——— Вертикали ———
   g("beauty-biz", "Beauty Business Chat", "https://t.me/beauty_business_chat", ["beauty", "business", "crm", "marketing"], "Beauty-бизнес и услуги.", "Beauty"),
   g("vk-ads-chat", "VK реклама", "https://t.me/vk_ads_chat", ["vk_market", "marketing", "smm", "leadgen"], "Реклама ВКонтакте.", "SMM / Ads"),
+  g("vk-ads-official", "VK Реклама (канал)", "https://t.me/vk_ads", ["vk_market", "marketing", "smm", "leadgen"], "Официальный канал VK Реклама.", "SMM / Ads"),
+
+  // ——— TGStat: Блоги + бизнес/маркетинг (публичные, проверены t.me) ———
+  // Категория «Блоги» на tgstat.ru/ratings/channels/blogs — плюс смежные business/marketing для лидгена.
+  g("tgstat-blog-lebedev", "Артемий Лебедев", "https://t.me/temalebedev", ["blogs", "design", "business", "content"], "Блог предпринимателя/дизайна (TGStat Блоги).", "Блоги / дизайн"),
+  g("tgstat-biz-mosbusy", "Москоубизнес", "https://t.me/mosbusy", ["blogs", "business", "networking", "leadgen"], "Крупный бизнес-блог Москвы (TGStat).", "Бизнес-блоги"),
+  g("tgstat-biz-whatbiz", "Чё по бизнесу?", "https://t.me/whatbiz", ["blogs", "business", "startup", "leadgen"], "Бизнес-блог: кейсы и обсуждения.", "Бизнес-блоги"),
+  g("tgstat-biz-lifeonline", "Life Онлайн", "https://t.me/lifeonline", ["blogs", "business", "marketing"], "Онлайн-бизнес и медиа (TGStat).", "Бизнес-блоги"),
+  g("tgstat-biz-rb-ru", "Russian Business", "https://t.me/rb_ru", ["blogs", "business", "b2b", "startup"], "Russian Business — новости и кейсы.", "Бизнес-блоги"),
+  g("tgstat-biz-retailrus", "Русский ритейл и бизнес", "https://t.me/retailrus", ["blogs", "business", "ecommerce", "marketplaces"], "Ритейл и e-com в РФ.", "Ритейл / e-com"),
+  g("tgstat-biz-hour25", "25-й час | Бизнес и Финансы", "https://t.me/hour25business", ["blogs", "business", "fintech"], "Бизнес и финансы.", "Бизнес-блоги"),
+  g("tgstat-startup-day", "Стартап дня. Александр Горный", "https://t.me/startupoftheday", ["blogs", "startup", "saas", "networking"], "Стартапы и продукт.", "Стартапы"),
+  g("tgstat-forbes-ru", "Forbes Russia", "https://t.me/forbesrussia", ["blogs", "business", "b2b"], "Forbes Russia — бизнес-аудитория.", "Бизнес-медиа"),
+  g("tgstat-sostav", "Sostav", "https://t.me/sostav", ["blogs", "marketing", "smm", "leadgen"], "Маркетинг и реклама (Sostav).", "Маркетинг"),
+  g("tgstat-setters", "SETTERS Media", "https://t.me/setters", ["blogs", "marketing", "smm", "content"], "Digital/агентства, контент.", "Маркетинг"),
+  g("tgstat-yandex-biz", "Яндекс для предпринимателей", "https://t.me/yandexbusiness", ["blogs", "business", "marketing", "saas"], "Яндекс: сервисы для бизнеса.", "Бизнес / ads"),
+  g("tgstat-sber-biz", "СберБизнес", "https://t.me/sberbusiness", ["blogs", "business", "fintech", "b2b"], "СберБизнес — предприниматели.", "Финтех / SMB"),
+  g("tgstat-modulbank", "Модульбанк", "https://t.me/modulbank", ["blogs", "business", "fintech", "accounting"], "Банк для бизнеса.", "Финтех"),
+  g("tgstat-kontur", "Контур", "https://t.me/kontur", ["blogs", "business", "accounting", "legal", "saas"], "Контур: учёт, ЭДО, сервисы.", "SaaS / учёт"),
+  g("tgstat-rbc-trends", "РБК Тренды", "https://t.me/rbc_trends", ["blogs", "business", "startup", "marketing"], "Тренды бизнеса и технологий.", "Бизнес-медиа"),
+  g("tgstat-telegain", "Telega.in | реклама в Telegram", "https://t.me/telegain", ["blogs", "marketing", "bots", "leadgen", "smm"], "Нативная реклама в Telegram.", "Telegram ads"),
+  g("tgstat-tgstat", "TGStat.ru", "https://t.me/tgstat", ["blogs", "bots", "analytics", "marketing"], "Аналитика Telegram-каналов и чатов.", "Telegram / аналитика"),
+  g("tgstat-gopractice", "GoPractice!", "https://t.me/gopractice", ["blogs", "saas", "startup", "education"], "Продукт и growth.", "Product"),
+  g("tgstat-pmclub", "pmclub — учим управлять", "https://t.me/pmclub", ["blogs", "saas", "startup", "education"], "Product management.", "Product"),
+  g("tgstat-skillfactory", "IT-школа Skillfactory", "https://t.me/skillfactory", ["blogs", "education", "saas", "marketing"], "EdTech / IT-обучение.", "EdTech"),
+  g("tgstat-netology", "Нетология", "https://t.me/netology_ru", ["blogs", "education", "marketing", "saas"], "Онлайн-образование.", "EdTech"),
+  g("tgstat-geekbrains", "GeekBrains", "https://t.me/geekbrains_ru", ["blogs", "education", "saas"], "IT-обучение.", "EdTech"),
+  g("tgstat-htmlacademy", "HTML Academy", "https://t.me/htmlacademy", ["blogs", "education", "freelance", "design"], "Веб-разработка / обучение.", "EdTech"),
+  g("tgstat-hexlet", "Хекслет", "https://t.me/hexlet_ru", ["blogs", "education", "saas", "freelance"], "Программирование.", "EdTech"),
+  g("tgstat-unisender", "Unisender", "https://t.me/unisender", ["blogs", "marketing", "saas", "leadgen"], "Email-маркетинг и рассылки.", "Маркетинг / SaaS"),
+  g("tgstat-retailcrm", "RetailCRM", "https://t.me/retailcrm", ["blogs", "crm", "ecommerce", "saas", "marketing"], "CRM для e-com.", "CRM / e-com"),
+  g("tgstat-carrotquest", "Carrot quest", "https://t.me/carrotquest", ["blogs", "saas", "marketing", "bots", "crm"], "Conversational marketing.", "SaaS / чаты"),
+  g("tgstat-usedesk", "Юздеск", "https://t.me/usedesk", ["blogs", "saas", "crm", "bots"], "Helpdesk / поддержка.", "SaaS"),
+  g("tgstat-helpdeskeddy", "HelpDeskEddy блог", "https://t.me/helpdeskeddy", ["blogs", "saas", "crm", "bots"], "Helpdesk-блог.", "SaaS"),
+  g("tgstat-n8n-ru", "n8n russian", "https://t.me/n8n_ru", ["blogs", "saas", "bots", "business"], "Автоматизация n8n (чат).", "No-code / ops"),
+  g("tgstat-copywriting-club", "Copywriting Club", "https://t.me/copywritingclub", ["blogs", "content", "marketing", "freelance"], "Копирайтинг и тексты.", "Контент"),
+  g("tgstat-avito", "Авито", "https://t.me/avito", ["blogs", "avito", "business", "ecommerce", "leadgen"], "Официальный канал Авито.", "Авито / услуги"),
+  g("tgstat-ozon-official", "OZON", "https://t.me/ozonru", ["blogs", "ozon", "marketplaces", "ecommerce"], "Официальный OZON.", "Маркетплейсы"),
+  g("tgstat-tjournal", "TJ", "https://t.me/tjournal", ["blogs", "content", "marketing", "startup"], "Медиа / digital-аудитория.", "Медиа"),
 
   // ——— Темы / базы для ручного поиска (без обязательной ссылки) ———
   g("topic-crm-amocrm", "AmoCRM / CRM внедрение", "", ["crm", "saas", "b2b", "business"], "Ищут CRM, внедрение, интеграции.", "B2B / интеграторы", false),
   g("topic-bitrix", "Битрикс24 чаты", "", ["crm", "saas", "b2b", "business"], "Битрикс24, порталы, автоматизация.", "B2B", false),
   g("topic-megaplan", "Мегаплан / CRM", "", ["crm", "saas", "b2b"], "CRM и задачи для SMB.", "B2B", false),
-  g("topic-retailcrm", "RetailCRM / e-com CRM", "", ["crm", "ecommerce", "saas"], "CRM для интернет-магазинов.", "E-com", false),
+  g("topic-retailcrm", "RetailCRM / e-com CRM", "https://t.me/retailcrm", ["crm", "ecommerce", "saas", "blogs"], "CRM для интернет-магазинов.", "E-com"),
   g("topic-saas-ru", "SaaS Russia / продукты", "", ["saas", "startup", "business", "b2b"], "Обсуждение SaaS и подписок.", "Основатели / продажи", false),
-  g("topic-product-hunt-ru", "Product / indie hackers RU", "", ["saas", "startup"], "Продуктовые обсуждения, запуск.", "Основатели", false),
-  g("topic-freelance-dev", "Фриланс разработка", "", ["freelance", "saas", "business"], "Подрядчики, заказы на разработку.", "Агентства / фриланс", false),
+  g("topic-product-hunt-ru", "Product / indie hackers RU", "https://t.me/gopractice", ["saas", "startup", "blogs"], "Продуктовые обсуждения, запуск.", "Основатели"),
+  g("topic-freelance-dev", "Фриланс разработка", "https://t.me/freelansim_ru", ["freelance", "saas", "business"], "Подрядчики, заказы на разработку.", "Агентства / фриланс"),
   g("topic-freelance-design", "Фриланс дизайн / SMM", "", ["freelance", "marketing", "design", "smm"], "Дизайн, SMM, контент.", "Агентства", false),
-  g("topic-freelance-copy", "Копирайтинг / тексты", "", ["freelance", "content", "marketing"], "Тексты, лендинги, карточки.", "Контент", false),
-  g("topic-marketing-perf", "Performance / контекст", "", ["marketing", "business", "leadgen"], "Реклама, трафик, агентства.", "Маркетинг", false),
+  g("topic-freelance-copy", "Копирайтинг / тексты", "https://t.me/copywritingclub", ["freelance", "content", "marketing", "blogs"], "Тексты, лендинги, карточки.", "Контент"),
+  g("topic-marketing-perf", "Performance / контекст", "https://t.me/sostav", ["marketing", "business", "leadgen", "blogs"], "Реклама, трафик, агентства.", "Маркетинг"),
   g("topic-marketing-seo", "SEO / продвижение", "", ["marketing", "ecommerce", "content"], "SEO, контент-маркетинг.", "Маркетинг", false),
-  g("topic-smm", "SMM / соцсети", "", ["smm", "marketing", "content"], "Ведение соцсетей, таргет.", "SMM", false),
-  g("topic-startup-ru", "Стартапы RU", "", ["startup", "saas", "business", "networking"], "Пилоты, B2B-продажи, продукт.", "Стартапы", false),
-  g("topic-b2b-sales", "B2B продажи", "", ["b2b", "business", "crm", "saas", "leadgen"], "Лиды, отделы продаж, CRM.", "Отделы продаж", false),
+  g("topic-smm", "SMM / соцсети", "https://t.me/setters", ["smm", "marketing", "content", "blogs"], "Ведение соцсетей, таргет.", "SMM"),
+  g("topic-startup-ru", "Стартапы RU", "https://t.me/startupoftheday", ["startup", "saas", "business", "networking", "blogs"], "Пилоты, B2B-продажи, продукт.", "Стартапы"),
+  g("topic-b2b-sales", "B2B продажи", "https://t.me/whatbiz", ["b2b", "business", "crm", "saas", "leadgen", "blogs"], "Лиды, отделы продаж, CRM.", "Отделы продаж"),
   g("topic-ecommerce-ops", "Операции e-commerce", "", ["ecommerce", "inventory", "logistics", "fulfillment"], "Склады, фулфилмент, процессы.", "Операторы", false),
   g("topic-unit-econ", "Юнит-экономика МП", "", ["analytics", "pricing", "marketplaces"], "Маржа, ДРР, юнит-экономика.", "Аналитики / селлеры", false),
   g("topic-reviews-bot", "Отзывы и репутация", "", ["reviews", "marketplaces", "saas"], "Автоответы, рейтинг, сервисы отзывов.", "Поддержка / SaaS", false),
@@ -235,20 +278,20 @@ export const GROUP_CATALOG: CatalogGroup[] = [
   g("topic-proxy-farm", "Прокси и антидетект (осторожно)", "", ["business"], "Инфра для аккаунтов — шум, фильтровать стоп-словами.", "Операторы", false),
   g("topic-hr-exclude", "Вакансии / HR (стоп)", "", ["hr", "business"], "Вакансии — обычно не целевые лиды.", "HR", false),
   g("topic-megamarket", "Мегамаркет селлеры", "", ["megamarket", "marketplaces", "ecommerce"], "Продавцы Мегамаркета / СберМегаМаркет.", "Селлеры ММ", false),
-  g("topic-avito", "Авито бизнес / услуги", "", ["avito", "business", "ecommerce", "freelance", "leadgen"], "Услуги, подряд, локальный B2B.", "Услуги", false),
-  g("topic-vk-market", "VK Маркет / VK Ads", "", ["vk_market", "marketplaces", "marketing", "smm"], "Продажи и реклама ВКонтакте.", "Селлеры / SMM", false),
+  g("topic-avito", "Авито бизнес / услуги", "https://t.me/avito", ["avito", "business", "ecommerce", "freelance", "leadgen", "blogs"], "Услуги, подряд, локальный B2B.", "Услуги"),
+  g("topic-vk-market", "VK Маркет / VK Ads", "https://t.me/vk_ads", ["vk_market", "marketplaces", "marketing", "smm", "blogs"], "Продажи и реклама ВКонтакте.", "Селлеры / SMM"),
   g("topic-aliexpress", "AliExpress / глобал", "", ["aliexpress", "marketplaces", "china", "ecommerce"], "Поставки и продажи Ali.", "Импорт / селлеры", false),
   g("topic-china-supply", "Поставщики Китай / 1688", "", ["china", "ecommerce", "logistics", "dropshipping"], "Поиск фабрик, выкуп, логистика.", "Импортёры", false),
   g("topic-dropshipping", "Дропшиппинг RU", "", ["dropshipping", "ecommerce", "marketplaces", "china"], "Дроп, витрины, поставщики.", "Дропшипперы", false),
   g("topic-fulfillment", "Фулфилмент / 3PL", "", ["fulfillment", "logistics", "inventory", "ecommerce"], "Склады под ключ, FBS/FBO.", "Операторы", false),
-  g("topic-no-code", "No-code / автоматизация", "", ["saas", "crm", "business", "bots"], "Make, n8n, Albato, интеграции.", "Интеграторы", false),
-  g("topic-support-outsource", "Аутсорс поддержки", "", ["freelance", "saas", "business", "bots"], "Ищут операторов, чат-боты, helpdesk.", "Аутсорс", false),
+  g("topic-no-code", "No-code / автоматизация", "https://t.me/n8n_ru", ["saas", "crm", "business", "bots", "blogs"], "Make, n8n, Albato, интеграции.", "Интеграторы"),
+  g("topic-support-outsource", "Аутсорс поддержки", "https://t.me/usedesk", ["freelance", "saas", "business", "bots", "blogs"], "Ищут операторов, чат-боты, helpdesk.", "Аутсорс"),
   g("topic-legal-ip", "ИП / юрсопровождение", "", ["legal", "business", "certificates"], "Регистрация, договоры, налоги.", "Юристы", false),
-  g("topic-accounting", "Бухгалтерия для бизнеса", "", ["accounting", "business", "1c"], "Учёт, отчётность, аутсорс бухгалтерии.", "Бухгалтерия", false),
-  g("topic-telegram-bots", "Telegram-боты / чат-боты", "", ["bots", "saas", "marketing", "business", "leadgen"], "Боты, воронки, автоматизация диалогов.", "Разработка / SaaS", false),
-  g("topic-leadgen", "Лидогенерация / тёплые лиды", "", ["leadgen", "marketing", "business", "saas", "b2b"], "Заявки, прогрев, лидген-сервисы.", "Маркетинг", false),
-  g("topic-fintech", "Финтех / эквайринг / рассрочка", "", ["fintech", "ecommerce", "saas", "business"], "Оплаты, BNPL, кассы.", "Финтех", false),
-  g("topic-education", "Онлайн-школы / EdTech", "", ["education", "marketing", "saas", "business"], "Курсы, LMS, трафик на обучение.", "EdTech", false),
+  g("topic-accounting", "Бухгалтерия для бизнеса", "https://t.me/kontur", ["accounting", "business", "1c", "blogs"], "Учёт, отчётность, аутсорс бухгалтерии.", "Бухгалтерия"),
+  g("topic-telegram-bots", "Telegram-боты / чат-боты", "https://t.me/telegain", ["bots", "saas", "marketing", "business", "leadgen", "blogs"], "Боты, воронки, автоматизация диалогов.", "Разработка / SaaS"),
+  g("topic-leadgen", "Лидогенерация / тёплые лиды", "https://t.me/carrotquest", ["leadgen", "marketing", "business", "saas", "b2b", "blogs"], "Заявки, прогрев, лидген-сервисы.", "Маркетинг"),
+  g("topic-fintech", "Финтех / эквайринг / рассрочка", "https://t.me/modulbank", ["fintech", "ecommerce", "saas", "business", "blogs"], "Оплаты, BNPL, кассы.", "Финтех"),
+  g("topic-education", "Онлайн-школы / EdTech", "https://t.me/netology_ru", ["education", "marketing", "saas", "business", "blogs"], "Курсы, LMS, трафик на обучение.", "EdTech"),
   g("topic-healthcare", "MedTech / клиники", "", ["healthcare", "saas", "business", "crm"], "Запись, CRM клиник, telemed.", "Med", false),
   g("topic-beauty", "Beauty / салоны", "", ["beauty", "business", "crm", "marketing"], "Салоны, мастера, запись.", "Beauty", false),
   g("topic-fashion", "Fashion / одежда МП", "", ["fashion", "marketplaces", "ecommerce", "wildberries", "ozon"], "Одежда, бренд, карточки.", "Fashion-селлеры", false),
@@ -264,8 +307,8 @@ export const GROUP_CATALOG: CatalogGroup[] = [
   g("topic-networking-biz", "Бизнес-клубы / нетворкинг", "", ["networking", "business", "b2b", "startup"], "Знакомства, питчи, партнёрства.", "Основатели", false),
   g("topic-agency", "Digital-агентства", "", ["marketing", "freelance", "smm", "business", "leadgen"], "Агентства ищут подряд / клиентов.", "Агентства", false),
   g("topic-it-outsource", "IT-аутсорс / заказчики", "", ["freelance", "saas", "b2b", "business"], "Заказы на разработку и поддержку.", "IT", false),
-  g("topic-helpdesk", "Helpdesk / омниканал", "", ["saas", "crm", "bots", "business"], "Поддержка, чаты, тикеты.", "SaaS", false),
-  g("topic-email-crm", "Email / рассылки / CDP", "", ["marketing", "saas", "crm", "leadgen"], "Рассылки, сегменты, CRM-маркетинг.", "Маркетинг", false),
+  g("topic-helpdesk", "Helpdesk / омниканал", "https://t.me/usedesk", ["saas", "crm", "bots", "business", "blogs"], "Поддержка, чаты, тикеты.", "SaaS"),
+  g("topic-email-crm", "Email / рассылки / CDP", "https://t.me/unisender", ["marketing", "saas", "crm", "leadgen", "blogs"], "Рассылки, сегменты, CRM-маркетинг.", "Маркетинг"),
   g("topic-call-center", "Колл-центр / телефония", "", ["business", "crm", "saas", "b2b"], "Ищут телефонию, скрипты, операторов.", "Продажи", false),
   g("topic-wholesale", "Опт / дистрибуция", "", ["business", "ecommerce", "china", "b2b"], "Оптовые поставки, дистрибьюторы.", "B2B", false),
   g("topic-brand", "Бренд / DTC", "", ["ecommerce", "marketing", "fashion", "beauty", "business"], "Свой бренд, DTC, маркетплейсы.", "Бренды", false),
@@ -300,10 +343,10 @@ export const GROUP_CATALOG: CatalogGroup[] = [
   g("topic-clients-ads", "Реклама / трафик / лиды «куплю»", "", ["marketing", "leadgen", "smm", "business"], "Покупают трафик и заявки.", "Маркетинг", false),
   g("topic-fl-ru", "FL.ru / биржа фриланса (чат)", "", ["freelance", "design", "content", "business"], "Биржи и чаты заказчиков.", "Фриланс", false),
   g("topic-kwork", "Kwork / заказы", "", ["freelance", "design", "marketing", "bots"], "Заказы на услуги.", "Фриланс", false),
-  g("topic-habr-freelance", "Хабр Фриланс / IT-заказы", "", ["freelance", "saas", "b2b"], "IT-подряд и заказчики.", "IT", false),
-  g("topic-vc-ru", "VC.ru / предприниматели", "", ["startup", "business", "saas", "networking", "b2b"], "Стартапы и малый бизнес ищут сервисы.", "Стартапы", false),
-  g("topic-entrepreneurs", "Предприниматели RU чаты", "", ["business", "networking", "b2b", "leadgen"], "Общение предпринимателей, запросы услуг.", "Бизнес", false),
-  g("topic-moscow-biz", "Бизнес Москва / регионы", "", ["business", "networking", "leadgen", "avito"], "Городские бизнес-чаты.", "Локальный B2B", false),
+  g("topic-habr-freelance", "Хабр Фриланс / IT-заказы", "https://t.me/freelansim_ru", ["freelance", "saas", "b2b"], "IT-подряд и заказчики.", "IT"),
+  g("topic-vc-ru", "VC.ru / предприниматели", "https://t.me/startupoftheday", ["startup", "business", "saas", "networking", "b2b", "blogs"], "Стартапы и малый бизнес ищут сервисы.", "Стартапы"),
+  g("topic-entrepreneurs", "Предприниматели RU чаты", "https://t.me/moscow_biz", ["business", "networking", "b2b", "leadgen"], "Общение предпринимателей, запросы услуг.", "Бизнес"),
+  g("topic-moscow-biz", "Бизнес Москва / регионы", "https://t.me/mosbusy", ["business", "networking", "leadgen", "avito", "blogs"], "Городские бизнес-чаты.", "Локальный B2B"),
   g("topic-women-biz", "Женский бизнес / community", "", ["business", "networking", "marketing", "beauty"], "Комьюнити и запросы услуг.", "Community", false),
   g("topic-export", "Экспорт / ВЭД", "", ["china", "logistics", "business", "legal", "b2b"], "ВЭД, таможня, экспортёры.", "ВЭД", false),
   g("topic-farmers", "Фермеры / агро", "", ["food", "business", "logistics", "ecommerce"], "Агробизнес и сбыт.", "Агро", false),
@@ -321,6 +364,7 @@ export const MARKET_SECTIONS: {id: string; title: string; hint: string; niches: 
   {id: "local", title: "Локальный бизнес", hint: "Городские услуги и Авито", niches: ["avito", "beauty", "food", "auto", "realestate", "healthcare", "education"]},
   {id: "trade", title: "Торговля и логистика", hint: "Импорт, дроп, склады", niches: ["china", "dropshipping", "logistics", "fulfillment", "aliexpress", "vk_market"]},
   {id: "growth", title: "Стартапы и рост", hint: "Пилоты, нетворкинг, PR", niches: ["startup", "networking", "marketing", "leadgen", "saas"]},
+  {id: "blogs", title: "Блоги TGStat", hint: "Каналы из категории «Блоги» и бизнес-медиа", niches: ["blogs", "business", "marketing", "content", "startup"]},
 ];
 
 
@@ -426,6 +470,10 @@ const NICHE_ALIASES: Record<string, GroupNiche[]> = {
   омниканал: ["saas", "crm", "bots"],
   телефони: ["crm", "saas", "b2b"],
   колл: ["crm", "b2b", "business"],
+  блог: ["blogs", "content", "business"],
+  блоги: ["blogs", "content", "business", "marketing"],
+  tgstat: ["blogs", "bots", "analytics", "marketing"],
+  медиа: ["blogs", "content", "marketing"],
 };
 
 /** Id тем без verified-ссылки + старые фейки. */

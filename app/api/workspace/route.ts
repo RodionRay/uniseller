@@ -2408,8 +2408,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   let arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,sendAccountId,'account').first();
   let adata=arow?JSON.parse(arow.data):null;
   let rotatedAccount=false;
+  // Для уже открытой переписки держим тот же аккаунт (чужой peer → invalid Peer)
+  const keepConversationAccount=!!lead.conversationOpen||(Array.isArray(lead.replies)&&lead.replies.some((x:any)=>x&&x.from==='us'&&x.ok));
   const currentOk=adata&&isAccountUsable(adata)&&!isOnCooldown(adata.cooldownUntil)&&hasMessageQuota(adata);
-  if(!currentOk&&mode==='dm'){
+  const currentAlive=adata&&canPollDmInbox(adata);
+  if(!currentOk&&mode==='dm'&&!(keepConversationAccount&&currentAlive)){
    const farm=await listMessageFarmCandidates(owner);
    const pick=farm.find(x=>x.id!==sendAccountId)||farm[0];
    if(pick){
@@ -2420,8 +2423,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    }
   }
   if(!adata)return reply({error:'Аккаунт не найден'},404);
-  if(isOnCooldown(adata.cooldownUntil))return reply({error:'Аккаунт на отлежке — отправка недоступна',cooldown:true},429);
-  if(!hasMessageQuota(adata)){
+  if(isOnCooldown(adata.cooldownUntil)&&!(keepConversationAccount&&currentAlive)){
+   return reply({error:'Аккаунт на отлежке — отправка недоступна',cooldown:true},429);
+  }
+  if(!hasMessageQuota(adata)&&!(keepConversationAccount&&currentAlive)){
    return reply({
     error:mode==='dm'
      ?'Дневной лимит сообщений на всех рабочих аккаунтах фермы'
@@ -2432,6 +2437,16 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   }
   try{
    const {payload}=await loadAccountSessionPayload(owner,sendAccountId);
+   // Берём лучший peer из истории переписки (chatId после успешной отправки)
+   const replyPeers=(Array.isArray(lead.replies)?lead.replies:[])
+    .filter((x:any)=>x&&x.ok!==false&&(x.chatId||x.from==='client'))
+    .map((x:any)=>String(x.chatId||'').replace(/^-/,'').trim())
+    .filter(Boolean);
+   let senderId=String(lead.senderId||'').replace(/^-/,'').trim();
+   if((!senderId||senderId.startsWith('100'))&&replyPeers[0])senderId=replyPeers[0];
+   // access_hash чужого аккаунта ломает SendMessage → invalid Peer
+   const sameAccount=String(lead.accountId||'')===String(sendAccountId);
+   let accessHash=sameAccount?String(lead.senderAccessHash||''):'';
    const result=await workerPost('/send-message',{
     ...payload,
     mode,
@@ -2439,23 +2454,40 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     url:gdata.url,
     replyTo:mode==='chat'?(lead.tgMsgId||''):'',
     tgMsgId:lead.tgMsgId||'',
-    senderId:lead.senderId||'',
+    senderId:senderId||lead.senderId||'',
     senderUsername:lead.senderUsername||'',
-    senderAccessHash:lead.senderAccessHash||'',
+    senderAccessHash:accessHash,
     silent,
-    deleteDialog:mode==='dm'?deleteDialog:false,
+    deleteDialog:false,
    });
-   const link=String(result.link||'').slice(0,300);
-   const messageId=String(result.messageId||'').slice(0,40);
+   // Повтор без access_hash, если peer битый
+   let finalResult=result;
+   if(!result.ok&&/invalid peer/i.test(String(result.error||''))&&accessHash){
+    finalResult=await workerPost('/send-message',{
+     ...payload,
+     mode,
+     text,
+     url:gdata.url,
+     replyTo:mode==='chat'?(lead.tgMsgId||''):'',
+     tgMsgId:lead.tgMsgId||'',
+     senderId:senderId||lead.senderId||'',
+     senderUsername:lead.senderUsername||'',
+     senderAccessHash:'',
+     silent,
+     deleteDialog:false,
+    });
+   }
+   const link=String(finalResult.link||'').slice(0,300);
+   const messageId=String(finalResult.messageId||'').slice(0,40);
    const entry={
     text,
     mode,
     at:new Date().toISOString(),
-    ok:!!result.ok,
-    error:(result.error||'').slice(0,400),
+    ok:!!finalResult.ok,
+    error:(finalResult.error||'').slice(0,400),
     messageId,
     link,
-    chatId:String(result.chatId||'').slice(0,40),
+    chatId:String(finalResult.chatId||senderId||'').slice(0,40),
     from:'us' as const,
    };
    const replies=[...(Array.isArray(lead.replies)?lead.replies:[]),entry].slice(-40);
@@ -2469,18 +2501,21 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     conversationOpen:true,
     accountId:sendAccountId||lead.accountId||'',
     needsManager:false,
+    senderId:String(finalResult.chatId||senderId||lead.senderId||'').replace(/^-/,'').slice(0,40),
+    senderUsername:String(finalResult.chatUsername||lead.senderUsername||'').slice(0,64),
+    senderAccessHash:String(finalResult.senderAccessHash||(finalResult.ok?accessHash:lead.senderAccessHash)||'').slice(0,40),
    };
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'lead').run();
-   if(result.flood||result.status==='flood'){
-    const sec=Number(result.waitSec)||3600;
+   if(finalResult.flood||finalResult.status==='flood'){
+    const sec=Number(finalResult.waitSec)||3600;
     const accRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,sendAccountId,'account').first();
     if(accRow){
      const acc=JSON.parse(accRow.data);
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...acc,cooldownUntil:cooldownHoursFromNow(Math.max(1,Math.ceil(sec/3600))),status:'cooldown',error:(result.error||'').slice(0,500)}),owner,sendAccountId,'account').run();
+     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...acc,cooldownUntil:cooldownHoursFromNow(Math.max(1,Math.ceil(sec/3600))),status:'cooldown',error:(finalResult.error||'').slice(0,500)}),owner,sendAccountId,'account').run();
     }
-    return reply({ok:false,error:result.error||'FloodWait',waitSec:sec,lead:next,rotatedAccount},429);
+    return reply({ok:false,error:finalResult.error||'FloodWait',waitSec:sec,lead:next,rotatedAccount},429);
    }
-   if(!result.ok)return reply({ok:false,error:result.error||'Не удалось отправить',lead:next,rotatedAccount},502);
+   if(!finalResult.ok)return reply({ok:false,error:finalResult.error||'Не удалось отправить',lead:next,rotatedAccount},502);
    const accRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,sendAccountId,'account').first();
    if(accRow){
     const acc=JSON.parse(accRow.data);

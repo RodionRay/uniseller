@@ -1672,25 +1672,22 @@ async def send_message(
                 pass
 
     async def resolve_dm_peer(uid: str, uname: str, source_url: str, access_hash: str, msg_id: str):
-        """access_hash → username → кэш → сообщение в группе → GetParticipant."""
+        """Username → кэш/диалоги → группа → access_hash (только если get_entity ок)."""
         errors: list[str] = []
         clean = (uname or "").strip().lstrip("@")
+        uid_clean = str(uid or "").replace("-", "").strip()
+        # peer id вида -100… / bot mark — не user id для ЛС
+        if uid and (str(uid).startswith("-") or not str(uid).lstrip("-").isdigit()):
+            errors.append("bad uid shape")
+            uid_clean = ""
+        else:
+            uid_clean = str(uid).strip()
 
-        if uid and str(uid).isdigit() and access_hash and str(access_hash).lstrip("-").isdigit():
-            try:
-                peer = InputPeerUser(int(uid), int(access_hash))
-                await client.get_entity(peer)
-                return peer, ""
-            except Exception as e:
-                errors.append(("access_hash: " + str(e))[:160])
-                try:
-                    return InputPeerUser(int(uid), int(access_hash)), ""
-                except Exception as e2:
-                    errors.append(("access_hash/raw: " + str(e2))[:160])
-
+        # 1) @username — работает между аккаунтами фермы
         if clean:
             try:
-                return await client.get_input_entity(clean), ""
+                ent = await client.get_input_entity(clean)
+                return ent, ""
             except Exception as e:
                 errors.append(("username/input: " + str(e))[:160])
             try:
@@ -1701,56 +1698,87 @@ async def send_message(
             except Exception as e:
                 errors.append(("username/resolve: " + str(e))[:160])
             try:
-                return await client.get_entity(clean), ""
+                ent = await client.get_entity(clean)
+                if isinstance(ent, User):
+                    return await client.get_input_entity(ent), ""
+                errors.append("username points to channel/chat")
             except Exception as e:
                 errors.append(("username/entity: " + str(e))[:160])
 
-        if uid and str(uid).isdigit():
+        # 2) Уже есть диалог в этой сессии
+        if uid_clean.isdigit():
             try:
-                return await client.get_input_entity(int(uid)), ""
+                async for dialog in client.iter_dialogs(limit=40):
+                    if not getattr(dialog, "is_user", False):
+                        continue
+                    ent = dialog.entity
+                    if str(getattr(ent, "id", "")) == uid_clean:
+                        return await client.get_input_entity(ent), ""
+            except Exception as e:
+                errors.append(("dialogs: " + str(e))[:160])
+            try:
+                return await client.get_input_entity(int(uid_clean)), ""
             except Exception as e:
                 errors.append(("id/cache: " + str(e))[:160])
-            if source_url:
-                try:
-                    source_entity, err = await _resolve_entity(client, source_url)
-                    if source_entity is not None and not err:
-                        if msg_id and str(msg_id).isdigit():
-                            try:
-                                m = await client.get_messages(source_entity, ids=int(msg_id))
-                                if m:
-                                    sender = await m.get_sender()
-                                    if sender is not None:
-                                        return await client.get_input_entity(sender), ""
-                            except Exception as e:
-                                errors.append(("id/msg: " + str(e))[:160])
-                        try:
-                            part = await client(GetParticipantRequest(source_entity, int(uid)))
-                            users = getattr(part, "users", None) or []
-                            if users:
-                                return await client.get_input_entity(users[0]), ""
-                        except Exception as e:
-                            errors.append(("id/participant: " + str(e))[:160])
-                        try:
-                            return await client.get_input_entity(int(uid)), ""
-                        except Exception as e:
-                            errors.append(("id/after-part: " + str(e))[:160])
-                except Exception as e:
-                    errors.append(("id/source: " + str(e))[:160])
+
+        # 3) Через исходную группу / сообщение лида
+        if uid_clean.isdigit() and source_url:
             try:
-                return await client.get_entity(int(uid)), ""
+                source_entity, err = await _resolve_entity(client, source_url)
+                if source_entity is not None and not err:
+                    if msg_id and str(msg_id).isdigit():
+                        try:
+                            m = await client.get_messages(source_entity, ids=int(msg_id))
+                            if m:
+                                sender = await m.get_sender()
+                                if sender is not None and isinstance(sender, User):
+                                    return await client.get_input_entity(sender), ""
+                        except Exception as e:
+                            errors.append(("id/msg: " + str(e))[:160])
+                    try:
+                        part = await client(GetParticipantRequest(source_entity, int(uid_clean)))
+                        users = getattr(part, "users", None) or []
+                        if users:
+                            return await client.get_input_entity(users[0]), ""
+                    except Exception as e:
+                        errors.append(("id/participant: " + str(e))[:160])
+                    try:
+                        return await client.get_input_entity(int(uid_clean)), ""
+                    except Exception as e:
+                        errors.append(("id/after-part: " + str(e))[:160])
             except Exception as e:
-                errors.append(("id/entity: " + str(e))[:160])
+                errors.append(("id/source: " + str(e))[:160])
+
+        # 4) access_hash только если сессия его принимает (чужой hash = invalid Peer)
+        if (
+            uid_clean.isdigit()
+            and access_hash
+            and str(access_hash).lstrip("-").isdigit()
+        ):
+            try:
+                peer = InputPeerUser(int(uid_clean), int(access_hash))
+                ent = await client.get_entity(peer)
+                if isinstance(ent, User):
+                    return await client.get_input_entity(ent), ""
+            except Exception as e:
+                errors.append(("access_hash: " + str(e))[:160])
 
         detail = errors[-1] if errors else "peer not found"
         low = detail.lower()
+        if "invalid peer" in low:
+            hint = (
+                "Неверный peer для этого аккаунта. "
+                "Ответьте тем же аккаунтом, что писал ранее, или укажите @username клиента."
+            )
+            return None, hint
         if "could not find the input entity" in low or "cannot find any entity" in low or "access_hash" in low:
             hint = (
-                "Не удалось открыть пользователя (нет access_hash). "
-                "Пересканируйте группу тем же аккаунтом фермы или укажите актуальный @username."
+                "Не удалось открыть пользователя. "
+                "Нужен @username или тот же аккаунт фермы, что сканировал группу."
             )
             return None, hint
         if "username" in low and ("not occupied" in low or "invalid" in low or "no user" in low):
-            return None, f"Username @{clean or uid} не существует"
+            return None, f"Username @{clean or uid_clean} не существует"
         return None, (detail or "Не удалось найти пользователя")[:400]
 
     try:
@@ -1798,12 +1826,24 @@ async def send_message(
                 else (getattr(entity, "username", None) or "")
             ).strip()
             chat_id = ""
+            fresh_hash = ""
             try:
                 from telethon.utils import get_peer_id
 
                 chat_id = str(get_peer_id(entity))
             except Exception:
                 chat_id = str(getattr(entity, "id", "") or sender_id or "")
+            try:
+                if isinstance(entity, User):
+                    fresh_hash = str(getattr(entity, "access_hash", "") or "")
+                else:
+                    ent2 = await client.get_entity(entity)
+                    if isinstance(ent2, User):
+                        fresh_hash = str(getattr(ent2, "access_hash", "") or "")
+                        if not uname:
+                            uname = str(getattr(ent2, "username", "") or "")
+            except Exception:
+                pass
             link = ""
             if uname and msg_id:
                 link = f"https://t.me/{uname}"
@@ -1817,6 +1857,7 @@ async def send_message(
                 "messageId": msg_id,
                 "chatId": chat_id,
                 "chatUsername": uname,
+                "senderAccessHash": fresh_hash,
                 "link": link,
                 "silent": bool(silent),
                 "deletedDialog": bool(delete_dialog),
@@ -1900,6 +1941,14 @@ async def send_message(
                 "error": (
                     "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы. "
                     "Смените аккаунт фермы или подождите 24ч."
+                )[:400],
+            }
+        if "invalid peer" in low:
+            return {
+                "ok": False,
+                "error": (
+                    "Неверный peer для этого аккаунта (часто чужой access_hash). "
+                    "Ответьте тем же аккаунтом или укажите @username клиента."
                 )[:400],
             }
         # Telethon иногда отдаёт Flood как обычный RPC «Too many requests» без FloodWaitError

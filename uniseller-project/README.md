@@ -8,6 +8,8 @@ Private administration workspace for Telegram sources and sales leads.
 - Proxy import, account/proxy assignment, dependency validation on removal.
 - AES-GCM encrypted proxy passwords and OpenAI API keys.
 - OpenAI Responses API draft generation and manual editing/copying.
+- Floating AI assistant (bottom-right) for product Q&A on admin and `/site` selling page.
+- Public `POST /api/assistant` with rate limit and knowledge-base fallback when no API key.
 - Russian responsive UI inspired by Air on Refero Styles.
 
 ## Not implemented yet
@@ -19,6 +21,6 @@ Run npm install, npm run db:generate and npm run build. Apply generated migratio
 Set ENCRYPTION_KEY to a stable, random 32-byte hex secret in local .env and hosted runtime settings. Do not rotate without migrating encrypted values. Never commit .env or Telegram sessions.
 
 ## Validation
-Build and TypeScript pass. Run automated checks with `npm test` (accounts, invites readiness, lead search/qualification, mailing drafts, proxy import, auth paths, secret crypto). Local HTTP checks still cover authentication, origin rejection and live CRUD against D1. Live Telegram and OpenAI calls have not been tested.
+Build and TypeScript pass. Run automated checks with `npm test` (accounts, invites, lead search, mailings, assistant chat, proxy import, auth paths, secrets). Local HTTP checks still cover authentication, origin rejection and live CRUD against D1. Set `OPENAI_API_KEY` or `ASSISTANT_OPENAI_KEY` for live assistant replies; without a key the widget answers from the product knowledge base. Live Telegram calls have not been tested.
 
 Motion references: Fade Slide Tabs by Ruixen UI and Animate Digits by unlumen on 21st.dev. Original lightweight CSS implementations preserve existing Radix controls; all nonessential animation respects prefers-reduced-motion.

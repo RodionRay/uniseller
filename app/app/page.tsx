@@ -999,6 +999,7 @@ function WorkspaceHome(){
   /** Фоновая очередь: вступление → холд → скан. Состояние в БД (переживает F5). */
   async function startBackgroundJoins(items:{id:string;name:string}[],opts?:{resume?:boolean}){
     if(!items.length)return;
+    try{await api({action:'heal_group_join_state'})}catch{/* */}
     if(!telegramConnected){
       toast.error('Запустите: npm run tg:worker');
       return;

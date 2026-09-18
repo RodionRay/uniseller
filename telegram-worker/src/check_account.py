@@ -1633,6 +1633,8 @@ async def send_message(
     delete_dialog: bool = False,
 ) -> dict[str, Any]:
     from telethon.errors import FloodWaitError, RPCError, UserPrivacyRestrictedError
+    from telethon.tl.functions.channels import GetParticipantRequest
+    from telethon.tl.functions.contacts import ResolveUsernameRequest
 
     body = (text or "").strip()
     if len(body) < 1:
@@ -1660,21 +1662,71 @@ async def send_message(
             except Exception:
                 pass
 
+    async def resolve_dm_peer(uid: str, uname: str, source_url: str):
+        """Username → кэш userId → участник исходной группы (access_hash)."""
+        errors: list[str] = []
+        clean = (uname or "").strip().lstrip("@")
+        if clean:
+            try:
+                return await client.get_input_entity(clean), ""
+            except Exception as e:
+                errors.append(("username/input: " + str(e))[:160])
+            try:
+                resolved = await client(ResolveUsernameRequest(clean))
+                users = getattr(resolved, "users", None) or []
+                if users:
+                    return await client.get_input_entity(users[0]), ""
+            except Exception as e:
+                errors.append(("username/resolve: " + str(e))[:160])
+            try:
+                return await client.get_entity(clean), ""
+            except Exception as e:
+                errors.append(("username/entity: " + str(e))[:160])
+
+        if uid and str(uid).isdigit():
+            try:
+                return await client.get_input_entity(int(uid)), ""
+            except Exception as e:
+                errors.append(("id/cache: " + str(e))[:160])
+            # Через группу, где лид был найден — так появляется access_hash
+            if source_url:
+                try:
+                    source_entity, err = await _resolve_entity(client, source_url)
+                    if source_entity is not None and not err:
+                        try:
+                            part = await client(GetParticipantRequest(source_entity, int(uid)))
+                            users = getattr(part, "users", None) or []
+                            if users:
+                                return await client.get_input_entity(users[0]), ""
+                        except Exception as e:
+                            errors.append(("id/participant: " + str(e))[:160])
+                        # Иногда peer уже попал в кэш после GetParticipant
+                        try:
+                            return await client.get_input_entity(int(uid)), ""
+                        except Exception as e:
+                            errors.append(("id/after-part: " + str(e))[:160])
+                except Exception as e:
+                    errors.append(("id/source: " + str(e))[:160])
+            try:
+                return await client.get_entity(int(uid)), ""
+            except Exception as e:
+                errors.append(("id/entity: " + str(e))[:160])
+
+        detail = errors[-1] if errors else "peer not found"
+        low = detail.lower()
+        if "could not find the input entity" in low or "cannot find any entity" in low:
+            hint = (
+                "Не удалось открыть пользователя (нет access_hash). "
+                "Нужен актуальный @username или аккаунт, который видел его в группе."
+            )
+            return None, hint
+        if "username" in low and ("not occupied" in low or "invalid" in low or "no user" in low):
+            return None, f"Username @{clean or uid} не существует"
+        return None, (detail or "Не удалось найти пользователя")[:400]
+
     try:
         if mode == "dm":
-            peer_errors: list[str] = []
-            entity = None
-            # Сначала username (кросс-аккаунт), при промахе — userId (если сессия видела peer).
-            if sender_username:
-                try:
-                    entity = await client.get_entity(str(sender_username).lstrip("@"))
-                except Exception as e:
-                    peer_errors.append(str(e)[:180])
-            if entity is None and sender_id:
-                try:
-                    entity = await client.get_entity(int(str(sender_id)))
-                except Exception as e:
-                    peer_errors.append(str(e)[:180])
+            entity, peer_err = await resolve_dm_peer(sender_id, sender_username, url)
             if entity is None:
                 if not sender_username and not sender_id:
                     return {
@@ -1683,7 +1735,7 @@ async def send_message(
                     }
                 return {
                     "ok": False,
-                    "error": (peer_errors[-1] if peer_errors else "Не удалось найти пользователя")[:400],
+                    "error": peer_err or "Не удалось найти пользователя",
                 }
             sent = await client.send_message(entity, body, silent=bool(silent))
             msg_id = str(getattr(sent, "id", "") or "")

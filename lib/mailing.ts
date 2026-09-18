@@ -199,10 +199,19 @@ export function mailingFailText(username: string, userId: string, error: string)
     return `${label}: лимит Telegram (Too many requests)`;
   }
   if (
+    e.includes("could not find the input entity") ||
+    e.includes("cannot find any entity") ||
+    e.includes("нет access_hash") ||
+    e.includes("не удалось открыть пользователя")
+  ) {
+    return `${label}: Telegram не видит пользователя (нет access_hash). Нужен @username или аккаунт из той же группы`;
+  }
+  if (
     e.includes("no user has") ||
     e.includes("username_not_occupied") ||
     e.includes("username_invalid") ||
-    e.includes("nobody is using this username")
+    e.includes("nobody is using this username") ||
+    (e.includes("username @") && e.includes("не существует"))
   ) {
     return `${label}: username не существует`;
   }
@@ -279,6 +288,8 @@ export function isPermanentMailingRecipientError(error: string): boolean {
     e.includes("peer_id_invalid") ||
     e.includes("could not find the input entity") ||
     e.includes("cannot find any entity") ||
+    e.includes("нет access_hash") ||
+    e.includes("не удалось открыть пользователя") ||
     e.includes("no such user") ||
     e.includes("user not found")
   );

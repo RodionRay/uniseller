@@ -1,8 +1,10 @@
 import {describe,expect,it} from 'vitest';
 import {
   isPeerFloodMailingError,
+  isPermanentMailingRecipientError,
   isRateLimitMailingError,
   mailingEmptyBatchDecision,
+  mailingFailText,
   mailingOkText,
   mailingTextPreview,
   parseMailingFloodWaitSec,
@@ -42,5 +44,12 @@ describe('рассылка · flood / лог / очередь',()=>{
     expect(mailingTextPreview('  Привет   мир  ',80)).toBe('Привет мир');
     expect(mailingOkText('dana','','https://t.me/dana','Здравствуйте! Это тестовая рассылка UniLab')).toContain('«Здравствуйте! Это тестовая рассылка UniLab»');
     expect(mailingOkText('dana','1','','')).toBe('Доставлено @dana');
+  });
+
+  it('понятно объясняет ошибку input entity / access_hash',()=>{
+    const raw='Could not find the input entity for PeerUser(user_id=342560478)';
+    expect(isPermanentMailingRecipientError(raw)).toBe(true);
+    expect(mailingFailText('timosha_07','342560478',raw)).toContain('access_hash');
+    expect(isPermanentMailingRecipientError('Не удалось открыть пользователя (нет access_hash)')).toBe(true);
   });
 });

@@ -918,6 +918,7 @@ async def scan_group(
                 "date": m.date.isoformat() if getattr(m, "date", None) else "",
                 "senderId": str(getattr(sender, "id", "") or ""),
                 "senderUsername": (getattr(sender, "username", None) or "") or "",
+                "senderAccessHash": str(getattr(sender, "access_hash", "") or ""),
                 "messageKind": kind,
                 "peerId": peer_id,
                 "replyToMsgId": str(
@@ -1629,12 +1630,14 @@ async def send_message(
     reply_to: str = "",
     sender_id: str = "",
     sender_username: str = "",
+    sender_access_hash: str = "",
     silent: bool = False,
     delete_dialog: bool = False,
 ) -> dict[str, Any]:
     from telethon.errors import FloodWaitError, RPCError, UserPrivacyRestrictedError
     from telethon.tl.functions.channels import GetParticipantRequest
     from telethon.tl.functions.contacts import ResolveUsernameRequest
+    from telethon.tl.types import InputPeerUser
 
     body = (text or "").strip()
     if len(body) < 1:
@@ -1662,10 +1665,23 @@ async def send_message(
             except Exception:
                 pass
 
-    async def resolve_dm_peer(uid: str, uname: str, source_url: str):
-        """Username → кэш userId → участник исходной группы (access_hash)."""
+    async def resolve_dm_peer(uid: str, uname: str, source_url: str, access_hash: str, msg_id: str):
+        """access_hash → username → кэш → сообщение в группе → GetParticipant."""
         errors: list[str] = []
         clean = (uname or "").strip().lstrip("@")
+
+        if uid and str(uid).isdigit() and access_hash and str(access_hash).lstrip("-").isdigit():
+            try:
+                peer = InputPeerUser(int(uid), int(access_hash))
+                await client.get_entity(peer)
+                return peer, ""
+            except Exception as e:
+                errors.append(("access_hash: " + str(e))[:160])
+                try:
+                    return InputPeerUser(int(uid), int(access_hash)), ""
+                except Exception as e2:
+                    errors.append(("access_hash/raw: " + str(e2))[:160])
+
         if clean:
             try:
                 return await client.get_input_entity(clean), ""
@@ -1688,11 +1704,19 @@ async def send_message(
                 return await client.get_input_entity(int(uid)), ""
             except Exception as e:
                 errors.append(("id/cache: " + str(e))[:160])
-            # Через группу, где лид был найден — так появляется access_hash
             if source_url:
                 try:
                     source_entity, err = await _resolve_entity(client, source_url)
                     if source_entity is not None and not err:
+                        if msg_id and str(msg_id).isdigit():
+                            try:
+                                m = await client.get_messages(source_entity, ids=int(msg_id))
+                                if m:
+                                    sender = await m.get_sender()
+                                    if sender is not None:
+                                        return await client.get_input_entity(sender), ""
+                            except Exception as e:
+                                errors.append(("id/msg: " + str(e))[:160])
                         try:
                             part = await client(GetParticipantRequest(source_entity, int(uid)))
                             users = getattr(part, "users", None) or []
@@ -1700,7 +1724,6 @@ async def send_message(
                                 return await client.get_input_entity(users[0]), ""
                         except Exception as e:
                             errors.append(("id/participant: " + str(e))[:160])
-                        # Иногда peer уже попал в кэш после GetParticipant
                         try:
                             return await client.get_input_entity(int(uid)), ""
                         except Exception as e:
@@ -1714,10 +1737,10 @@ async def send_message(
 
         detail = errors[-1] if errors else "peer not found"
         low = detail.lower()
-        if "could not find the input entity" in low or "cannot find any entity" in low:
+        if "could not find the input entity" in low or "cannot find any entity" in low or "access_hash" in low:
             hint = (
                 "Не удалось открыть пользователя (нет access_hash). "
-                "Нужен актуальный @username или аккаунт, который видел его в группе."
+                "Пересканируйте группу тем же аккаунтом фермы или укажите актуальный @username."
             )
             return None, hint
         if "username" in low and ("not occupied" in low or "invalid" in low or "no user" in low):
@@ -1726,7 +1749,13 @@ async def send_message(
 
     try:
         if mode == "dm":
-            entity, peer_err = await resolve_dm_peer(sender_id, sender_username, url)
+            entity, peer_err = await resolve_dm_peer(
+                sender_id,
+                sender_username,
+                url,
+                sender_access_hash,
+                reply_to,
+            )
             if entity is None:
                 if not sender_username and not sender_id:
                     return {
@@ -1750,10 +1779,9 @@ async def send_message(
 
                 chat_id = str(get_peer_id(entity))
             except Exception:
-                chat_id = str(getattr(entity, "id", "") or "")
+                chat_id = str(getattr(entity, "id", "") or sender_id or "")
             link = ""
             if uname and msg_id:
-                # ЛС: ссылка на профиль; id сообщения в peer недоступен публично
                 link = f"https://t.me/{uname}"
             elif chat_id and msg_id:
                 link = f"tg://openmessage?user_id={str(chat_id).lstrip('-')}&message_id={msg_id}"
@@ -2217,6 +2245,11 @@ async def run_action(payload: dict[str, Any]) -> dict[str, Any]:
                     reply_to=str(payload.get("replyTo") or payload.get("tgMsgId") or ""),
                     sender_id=str(payload.get("senderId") or ""),
                     sender_username=str(payload.get("senderUsername") or ""),
+                    sender_access_hash=str(
+                        payload.get("senderAccessHash")
+                        or payload.get("accessHash")
+                        or ""
+                    ),
                     silent=bool(payload.get("silent") or False),
                     delete_dialog=bool(
                         payload.get("deleteDialog")

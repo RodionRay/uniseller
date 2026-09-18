@@ -97,7 +97,7 @@ const defaults:any={
   account:{name:'',phone:'',proxyId:'',status:'setup',format:'manual',sessionMode:'keep',limits:{...DEFAULT_ACCOUNT_LIMITS,memberInvite:40},cooldownUntil:'',firstName:'',lastName:'',username:'',about:'',hasPhoto:false,error:''},
   proxy:{name:'',host:'',port:'1080',protocol:'socks5',username:'',status:'inactive',exitIp:'',lastChecked:'',checkError:''},
   group:{name:'',url:'',accountId:'',status:'setup',error:'',membership:'none',joinedAt:'',joinState:'',joinStateAt:'',joinStateError:'',leadsTotal:0,leadsHot:0,leadsWarm:0,leadsCold:0,scanMatched:0,rating:0,lastScanned:'',scanLog:[]},
-  lead:{name:'',message:'',source:'Вручную',status:'new',temperature:'warm',draft:'',tgMsgId:'',groupId:'',reason:'',viewed:false,viewedAt:'',excludeFromTraining:false,senderId:'',senderUsername:'',messageKind:'',peerId:'',replyToMsgId:'',replies:[],conversationOpen:false,conversationAt:'',incomingLastText:'',needsManager:false,mailingTaskId:'',accountId:''},
+  lead:{name:'',message:'',source:'Вручную',status:'new',temperature:'warm',draft:'',tgMsgId:'',groupId:'',reason:'',viewed:false,viewedAt:'',excludeFromTraining:false,senderId:'',senderUsername:'',senderAccessHash:'',messageKind:'',peerId:'',replyToMsgId:'',replies:[],conversationOpen:false,conversationAt:'',incomingLastText:'',needsManager:false,mailingTaskId:'',accountId:''},
   settings:{
     name:'Мой бизнес',
     model:'deepseek-chat',
@@ -795,7 +795,7 @@ function WorkspaceHome(){
         }
         }
         try{
-          if(Date.now()-lastInboxPollAt.current>40_000){
+          if(Date.now()-lastInboxPollAt.current>15_000){
             lastInboxPollAt.current=Date.now();
             const inbox=await api({action:'poll_dm_replies'});
             if(inbox?.opened>0){

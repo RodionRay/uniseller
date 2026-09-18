@@ -213,6 +213,8 @@ const schemas={
   excludeFromTraining:z.boolean().default(false),
   senderId:z.string().max(40).default(''),
   senderUsername:z.string().max(64).default(''),
+  /** Telethon access_hash — нужен для ЛС без кэша сессии */
+  senderAccessHash:z.string().max(40).default(''),
   /** group | discussion | comment — откуда взято сообщение */
   messageKind:z.enum(['group','discussion','comment','']).default(''),
   peerId:z.string().max(40).default(''),
@@ -1991,11 +1993,13 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      excludeFromTraining:false,
      senderId:String(msg.senderId||''),
      senderUsername:String(msg.senderUsername||''),
+     senderAccessHash:String(msg.senderAccessHash||'').slice(0,40),
      messageKind:['group','discussion','comment'].includes(String(msg.messageKind||''))?String(msg.messageKind):'',
      peerId:String(msg.peerId||'').slice(0,40),
      replyToMsgId:String(msg.replyToMsgId||'').slice(0,40),
      replies:[],
      coreScore:Number(msg._core?.score)||0,
+     accountId:String(gdata.joinedAccountId||gdata.accountId||''),
     };
     await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)').bind(crypto.randomUUID(),owner,'lead',JSON.stringify(lead),null,new Date().toISOString()).run();
     added++;
@@ -2429,9 +2433,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     mode,
     text,
     url:gdata.url,
-    replyTo:lead.tgMsgId||'',
+    replyTo:mode==='chat'?(lead.tgMsgId||''):'',
+    tgMsgId:lead.tgMsgId||'',
     senderId:lead.senderId||'',
     senderUsername:lead.senderUsername||'',
+    senderAccessHash:lead.senderAccessHash||'',
     silent,
     deleteDialog:mode==='dm'?deleteDialog:false,
    });
@@ -3408,10 +3414,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   if(next.status==='running'&&next.deliveryMode==='dm'&&next.deleteDialogAfter){
    next={
     ...next,
+    deleteDialogAfter:false,
     log:pushTaskLog(
      next.log,
      'warn',
-     'Включено «удалить диалог после отправки»: ответы клиента в «Переписки» могут не подтянуться',
+     '«Удалить диалог» отключено: иначе ответы клиента не попадут в «Переписки»',
      500,
     ),
    };
@@ -3601,7 +3608,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    return Number.isFinite(t)&&t>nowMs;
   };
   const batchSize=Math.max(1,Math.min(10,Number(data.batchPerTick)||1));
-  type Cand={key:string;userId:string;username:string;leadId:string;groupUrl:string;tgMsgId:string;recordId:string};
+  type Cand={key:string;userId:string;username:string;leadId:string;groupUrl:string;tgMsgId:string;accessHash:string;recordId:string};
   const candidates:Cand[]=[];
   const sourceKind=(data.sourceKind||'audience') as MailingSourceKind;
   const deliveryMode=(data.deliveryMode||'dm') as MailingDeliveryMode;
@@ -3633,6 +3640,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       leadId:String(r.id),
       groupUrl:String(g?.url||''),
       tgMsgId:String(L.tgMsgId||''),
+      accessHash:String(L.senderAccessHash||''),
       recordId:String(r.id),
      });
     }catch{/* */}
@@ -3653,6 +3661,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       leadId:'',
       groupUrl:'',
       tgMsgId:'',
+      accessHash:String(u.accessHash||u.senderAccessHash||''),
       recordId:String(r.id),
      });
     }catch{/* */}
@@ -3749,10 +3758,13 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      text,
      url:cand.groupUrl||'',
      replyTo:deliveryMode==='chat'?cand.tgMsgId:'',
+     tgMsgId:cand.tgMsgId||'',
      senderId:cand.userId||'',
      senderUsername:cand.username||'',
+     senderAccessHash:cand.accessHash||'',
      silent:!!data.silent,
-     deleteDialog:deliveryMode==='dm'&&!!data.deleteDialogAfter,
+     // Удаление диалога ломает входящие ответы → «Переписки»
+     deleteDialog:false,
     },120_000);
 
     const errRaw=String(result.error||'');
@@ -3813,31 +3825,66 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      newKeys.push(cand.key);
      delete deferredUntil[cand.key];
      // Помечаем лид как outreach рассылки + пишем исходящее в историю (Переписки откроются по ответу)
-     if(cand.leadId&&deliveryMode==='dm'){
+     if(deliveryMode==='dm'){
       try{
-       const leadRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,cand.leadId,'lead').first();
-       if(leadRow){
-        const L=JSON.parse(leadRow.data);
-        const outbound={
-         text:text.slice(0,4000),
-         mode:'dm' as const,
-         at:new Date().toISOString(),
-         ok:true,
-         error:'',
-         messageId,
-         link,
-         chatId:String(result.chatId||cand.userId||'').slice(0,40),
-         from:'us' as const,
+       const outbound={
+        text:text.slice(0,4000),
+        mode:'dm' as const,
+        at:new Date().toISOString(),
+        ok:true,
+        error:'',
+        messageId,
+        link,
+        chatId:String(result.chatId||cand.userId||'').slice(0,40),
+        from:'us' as const,
+       };
+       if(cand.leadId){
+        const leadRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,cand.leadId,'lead').first();
+        if(leadRow){
+         const L=JSON.parse(leadRow.data);
+         const replies=[...(Array.isArray(L.replies)?L.replies:[]),outbound].slice(-40);
+         await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
+          ...L,
+          replies,
+          mailingTaskId:L.mailingTaskId||id,
+          accountId:L.accountId||accountId,
+          senderId:L.senderId||cand.userId,
+          senderUsername:L.senderUsername||cand.username,
+          senderAccessHash:L.senderAccessHash||cand.accessHash||'',
+         }),owner,cand.leadId,'lead').run();
+        }
+       }else{
+        // Рассылка по аудитории — создаём карточку, чтобы ответ попал в «Переписки»
+        const newId=crypto.randomUUID();
+        const leadData={
+         name:(cand.username?`@${cand.username}`:(cand.userId?`id${cand.userId}`:'Клиент')).slice(0,80),
+         message:text.slice(0,8000)||'Исходящая рассылка',
+         source:'Рассылка',
+         status:'working',
+         temperature:'warm',
+         draft:'',
+         tgMsgId:'',
+         groupId:'',
+         reason:'Исходящее из рассылки — ждём ответ',
+         viewed:false,
+         viewedAt:'',
+         excludeFromTraining:false,
+         senderId:String(cand.userId||'').slice(0,40),
+         senderUsername:String(cand.username||'').slice(0,64),
+         senderAccessHash:String(cand.accessHash||'').slice(0,40),
+         messageKind:'',
+         peerId:String(cand.userId||'').slice(0,40),
+         replyToMsgId:'',
+         replies:[outbound],
+         conversationOpen:false,
+         conversationAt:'',
+         incomingLastText:'',
+         needsManager:false,
+         mailingTaskId:id,
+         accountId,
         };
-        const replies=[...(Array.isArray(L.replies)?L.replies:[]),outbound].slice(-40);
-        await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-         ...L,
-         replies,
-         mailingTaskId:L.mailingTaskId||id,
-         accountId:L.accountId||accountId,
-         senderId:L.senderId||cand.userId,
-         senderUsername:L.senderUsername||cand.username,
-        }),owner,cand.leadId,'lead').run();
+        await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)').bind(newId,owner,'lead',JSON.stringify(leadData),null,new Date().toISOString()).run();
+        cand.leadId=newId;
        }
       }catch{/* */}
      }

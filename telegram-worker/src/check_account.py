@@ -1100,6 +1100,8 @@ def _serialize_audience_user(user, *, is_admin: bool = False) -> dict[str, Any] 
         "premium": bool(getattr(user, "premium", False)),
         "isAdmin": bool(is_admin),
         "status": _user_status_bucket(user),
+        # access_hash этой сессии — нужен для ЛС тем же аккаунтом фермы
+        "accessHash": str(getattr(user, "access_hash", "") or ""),
     }
 
 

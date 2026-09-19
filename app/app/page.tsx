@@ -140,7 +140,7 @@ AI будет использовать этот текст для отбора �
   invite_task:{...DEFAULT_INVITE_TASK},
   mailing_task:{...DEFAULT_MAILING_TASK},
 };
-const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов и черновики: менеджер подключается здесь. Уведомление уходит в Telegram-бота.','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
+const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов: откройте диалог — он уйдёт в «Просмотренные». Новый ответ клиента снова в «Новые».','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
 
 async function api(body?:unknown){
   const r=await fetch('/api/workspace',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});
@@ -705,6 +705,9 @@ function WorkspaceHome(){
   const freshLeads=list('lead').filter(r=>!r.data.viewed&&!r.data.excludeFromTraining);
   const viewedLeads=list('lead').filter(r=>!!r.data.viewed&&!r.data.excludeFromTraining);
   const excludedLeads=list('lead').filter(r=>!!r.data.excludeFromTraining);
+  const chatLeads=list('lead').filter(r=>(!!r.data.draft||!!r.data.conversationOpen)&&!r.data.excludeFromTraining);
+  const freshChats=chatLeads.filter(r=>!r.data.viewed);
+  const viewedChats=chatLeads.filter(r=>!!r.data.viewed);
 
   const allowedNav=useMemo(()=>{
     if(!workspaceMeta||workspaceMeta.isOwner)return null;
@@ -726,7 +729,8 @@ function WorkspaceHome(){
 
   const navBadges=useMemo(()=>{
     const needManager=list('lead').filter(r=>!!r.data.needsManager&&!r.data.excludeFromTraining).length;
-    const drafts=needManager||list('lead').filter(r=>(!!r.data.conversationOpen||!!r.data.draft)&&!r.data.excludeFromTraining).length;
+    const unreadChats=list('lead').filter(r=>(!!r.data.conversationOpen||!!r.data.draft)&&!r.data.viewed&&!r.data.excludeFromTraining).length;
+    const drafts=needManager||unreadChats;
     const groups=list('group').filter(r=>{
       const d=r.data||{};
       return d.status==='error'||d.membership==='pending'||JOIN_BUSY.has(String(d.joinState||''));
@@ -1488,10 +1492,12 @@ function WorkspaceHome(){
     setDetail(item);
     setChatMode('dm');
     setChatText(item.data.draft||'');
-    if(item.data.viewed)return;
-    const viewedAt=new Date().toISOString();
-    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,viewed:true,viewedAt}}:r));
-    setDetail(d=>d&&d.id===item.id?{...d,data:{...d.data,viewed:true,viewedAt}}:d);
+    const alreadyViewed=!!item.data.viewed;
+    const needsManager=!!item.data.needsManager;
+    if(alreadyViewed&&!needsManager)return;
+    const viewedAt=item.data.viewedAt||new Date().toISOString();
+    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,viewed:true,viewedAt,needsManager:false}}:r));
+    setDetail(d=>d&&d.id===item.id?{...d,data:{...d.data,viewed:true,viewedAt,needsManager:false}}:d);
     try{
       await api({action:'mark_lead_viewed',id:item.id});
     }catch{/* не блокируем просмотр */}
@@ -2587,7 +2593,7 @@ function WorkspaceHome(){
   const displayed=records.filter(r=>{
     if(r.kind!==(currentKind||'lead'))return false;
     if(view==='Переписки'&&!r.data.draft&&!r.data.conversationOpen)return false;
-    if(currentKind==='lead'&&view==='Лиды'){
+    if(currentKind==='lead'&&(view==='Лиды'||view==='Переписки')){
       if(filter==='ignored'){
         if(!r.data.excludeFromTraining)return false;
       }else if(r.data.excludeFromTraining){
@@ -2597,7 +2603,7 @@ function WorkspaceHome(){
       }else if(r.data.viewed){
         return false;
       }
-      if(leadGroupFilter!=='all'&&r.data.groupId!==leadGroupFilter)return false;
+      if(view==='Лиды'&&leadGroupFilter!=='all'&&r.data.groupId!==leadGroupFilter)return false;
     }
     if(filter!=='all'&&filter!=='viewed'&&filter!=='ignored'){
       if(currentKind==='lead'){
@@ -2761,10 +2767,22 @@ function WorkspaceHome(){
     <Empty className="empty-state border-0">
       <EmptyHeader>
         <div className="icon-box mx-auto mb-3"><Search size={22}/></div>
-        <EmptyTitle>Пока нет подходящих запросов</EmptyTitle>
-        <EmptyDescription>Добавьте тематические группы или внесите первый лид вручную.</EmptyDescription>
+        <EmptyTitle>
+          {view==='Переписки'
+            ?(filter==='viewed'?'Пока нет просмотренных диалогов':'Нет новых диалогов')
+            :'Пока нет подходящих запросов'}
+        </EmptyTitle>
+        <EmptyDescription>
+          {view==='Переписки'
+            ?(filter==='viewed'
+              ?'Откройте диалог во вкладке «Новые» — он появится здесь.'
+              :'Когда клиент ответит или появится черновик — диалог будет здесь. Открытие переносит в «Просмотренные».')
+            :'Добавьте тематические группы или внесите первый лид вручную.'}
+        </EmptyDescription>
       </EmptyHeader>
-      <Button variant="outline" onClick={()=>open('lead')}><Plus size={16}/>Добавить лид</Button>
+      {view!=='Переписки'&&(
+        <Button variant="outline" onClick={()=>open('lead')}><Plus size={16}/>Добавить лид</Button>
+      )}
     </Empty>
   );
 
@@ -3316,7 +3334,17 @@ function WorkspaceHome(){
                 <Search className="absolute left-3 top-2.5 text-[var(--spike-muted)]" size={16}/>
                 <Input className="pl-9" placeholder="Поиск по списку…" aria-label="Поиск по списку" value={query} onChange={e=>setQuery(e.target.value)}/>
               </div>
-              {currentKind==='lead'?(
+              {view==='Переписки'?(
+                <div className="flex flex-wrap items-center gap-3">
+                  <Tabs value={filter==='viewed'?'viewed':'all'} onValueChange={(v)=>{setFilter(v);setLeadSelected([])}}>
+                    <TabsList>
+                      <TabsTrigger value="all">Новые{freshChats.length?` (${freshChats.length})`:''}</TabsTrigger>
+                      <TabsTrigger value="viewed">Просмотренные{viewedChats.length?` (${viewedChats.length})`:''}</TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                  <span className="badge neutral">{chatLeads.length} диалогов</span>
+                </div>
+              ):currentKind==='lead'?(
                 <div className="flex flex-wrap items-center gap-3">
                   <Button
                     disabled={busy||!telegramConnected||autoRescanRunning}

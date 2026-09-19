@@ -2151,10 +2151,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();
   if(!row)return reply({error:'Лид не найден'},404);
   const data=JSON.parse(row.data);
-  if(data.viewed)return reply({ok:true,already:true});
-  const next={...data,viewed:true,viewedAt:new Date().toISOString()};
+  const alreadyViewed=!!data.viewed;
+  const needsManager=!!data.needsManager;
+  if(alreadyViewed&&!needsManager)return reply({ok:true,already:true});
+  const next={
+   ...data,
+   viewed:true,
+   viewedAt:data.viewedAt||new Date().toISOString(),
+   needsManager:false,
+  };
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'lead').run();
-  return reply({ok:true});
+  return reply({ok:true,lead:next});
  }
  if(b.action==='set_lead_training_exclude'){
   const id=z.string().uuid().parse(b.id);

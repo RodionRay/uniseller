@@ -926,6 +926,39 @@ function isHardDeadAccountStatus(status:string){
  return ['disconnected','unauthorized','frozen','spamblock','proxy_error'].includes(st);
 }
 
+/** Нормализация joinStateError (битый JSON / слишком длинная строка). */
+function sanitizeJoinStateError(v:unknown):string{
+ if(v==null)return '';
+ if(typeof v==='object')return '';
+ return String(v).slice(0,500);
+}
+
+/** Починить группы после бага set_group_join_state (Zod-объект в JSON). */
+async function healCorruptGroupJoinFields(owner:string){
+ const db=database();
+ const groups=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='group'").bind(owner).all();
+ let fixed=0;
+ for(const row of groups.results){
+  try{
+   const gdata=JSON.parse(String(row.data));
+   const rawErr=gdata.joinStateError;
+   const nextErr=sanitizeJoinStateError(rawErr);
+   const badErr=rawErr!=null&&(typeof rawErr==='object'||String(rawErr)!==nextErr&&String(rawErr).length>500);
+   const badState=gdata.joinState!=null&&gdata.joinState!==''&&!['queued','waiting','joining','scanning'].includes(String(gdata.joinState));
+   if(!badErr&&!badState)continue;
+   const next={
+    ...gdata,
+    joinState:badState?'':(gdata.joinState||''),
+    joinStateAt:badState?'':(gdata.joinStateAt||''),
+    joinStateError:nextErr,
+   };
+   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,String(row.id),'group').run();
+   fixed++;
+  }catch{/* */}
+ }
+ return fixed;
+}
+
 /** Нельзя использовать прямо сейчас (hard-dead или отлёжка). */
 function isDeadAccountStatus(status:string,cooldownUntil?:string|null){
  return !isAccountUsable({status,cooldownUntil});
@@ -1355,6 +1388,7 @@ export async function GET(){const session=await getSessionUser();if(!session?.us
  // Снять залипшие «Проверяется», чтобы UI не блокировался
  try{await healStuckAccountChecks(owner,180_000)}catch{/* */}
  try{await healStuckProxyChecks(owner,45_000)}catch{/* */}
+ try{await healCorruptGroupJoinFields(owner)}catch{/* */}
  // audience_user не отдаём в список кабинета (тысячи строк) — только задачи и остальное
  const result=await database().prepare("SELECT id,kind,data,created,secret IS NOT NULL AS hasSecret FROM records WHERE owner=? AND kind!='ai_guard' AND kind!='audience_user' ORDER BY created DESC").bind(owner).all();
  let telegramConnected=false;
@@ -1876,7 +1910,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       lastScanned:'',
       joinState:'queued',
       joinStateAt:new Date().toISOString(),
-      joinStateError:errMsg,
+      joinStateError:sanitizeJoinStateError(errMsg),
      };
      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(healed),owner,id,'group').run();
      return reply({
@@ -2618,8 +2652,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
  if(b.action==='set_group_join_state'){
   const id=z.string().uuid().parse(b.id);
   const joinState=z.enum(['','queued','waiting','joining','scanning']).parse(b.joinState??'');
-  // Было: schema без .parse() → в JSON писался объект Zod → save падал «Проверьте поля: joinStateError».
-  const joinStateError=z.string().max(500).parse(String(b.joinStateError??'').slice(0,500));
+  // Без zod.string().parse — только строка; иначе снова «Проверьте поля: joinStateError».
+  const joinStateError=sanitizeJoinStateError(b.joinStateError);
   const grow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'group').first();
   if(!grow)return reply({error:'Группа не найдена'},404);
   const gdata=JSON.parse(grow.data);
@@ -2682,8 +2716,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   return reply({ok:true,updated,skipped,mode,assignments});
  }
  if(b.action==='heal_group_join_state'){
+  let fixed=await healCorruptGroupJoinFields(owner);
   const groups=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='group'").bind(owner).all();
-  let fixed=0;
   for(const row of groups.results){
    try{
     const gdata=JSON.parse(row.data as string);
@@ -4301,6 +4335,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   return reply({ok:true});
  }
  if(b.action!=='save')return reply({error:'Неизвестное действие'},400);
+ // До zod: вычистить битый joinStateError (иначе локальные записи после старого бага валят save).
+ if(b.kind==='group'&&b.data&&typeof b.data==='object'){
+  b.data={...b.data,joinStateError:sanitizeJoinStateError(b.data.joinStateError)};
+ }
  const data:any=schemas[kind].parse(b.data);let id=b.id?z.string().uuid().parse(b.id):crypto.randomUUID();let existing:any=null;
  if(kind==='settings'){existing=await db.prepare('SELECT * FROM records WHERE owner=? AND kind=? LIMIT 1').bind(owner,kind).first();if(existing)id=existing.id}else if(b.id){existing=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,kind).first();if(!existing)return reply({error:'Запись не найдена'},404)}
  if(kind==='settings'){
@@ -4349,7 +4387,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if(active.has(String(prev.joinState||''))&&!data.joinState){
     data.joinState=prev.joinState;
     data.joinStateAt=prev.joinStateAt||'';
-    data.joinStateError=prev.joinStateError||'';
+    // Не возвращаем битый joinStateError из БД (объект Zod от старого бага).
+    data.joinStateError=sanitizeJoinStateError(prev.joinStateError);
    }
   }catch{/* */}
  }

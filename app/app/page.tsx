@@ -2323,30 +2323,37 @@ function WorkspaceHome(){
     }finally{setBusy(false)}
   }
 
-  function openCatalog(){
-    const s=list('settings')[0]?.data||defaults.settings;
-    const auto=nichesFromProjectText(s.product,s.audience,s.keywords,s.leadCriteria,s.name,s.pains,s.valueProps,s.hotSignals);
-    // По умолчанию — вся база; если AI подсказал ниши — узкий рынок, но «все ниши» внутри.
-    let marketId='all';
-    let niche:GroupNiche|null=null;
-    if(auto.length){
-      let best={id:'all',score:0};
-      for(const m of MARKET_SECTIONS){
-        if(!m.niches.length)continue;
-        const score=m.niches.filter(n=>auto.includes(n)).length;
-        if(score>best.score)best={id:m.id,score};
-      }
-      if(best.score>0)marketId=best.id;
-    }
+  function openCatalog(preferredMarket?:string){
+    // Полная база / «В базе» — без сужения AI в «Маркетплейсы».
+    const hasDb=list('group').length>0;
+    const marketId=preferredMarket||(hasDb?'db':'all');
     setCatalogMarket(marketId);
-    setCatalogNiche(niche);
+    setCatalogNiche(null);
     setCatalogHideAdded(false);
     setCatalogTab('links');
     setCatalogQuery('');
     setCatalogSelected([]);
     setCatalogAccountId(list('account').filter(a=>isAccountWorkable(a.data))[0]?.id||'');
     setCatalogOpen(true);
+    setCatalogSearching(true);
     setCatalogSearchTick(t=>t+1);
+  }
+
+  /** Одним запросом залить весь каталог в «Группы и каналы» текущего кабинета. */
+  async function importFullCatalogToDb(){
+    setBusy(true);
+    try{
+      const accountId=catalogAccountId||list('account').filter(a=>isAccountWorkable(a.data))[0]?.id||'';
+      const r=await api({action:'import_catalog',accountId:accountId||undefined});
+      await refresh();
+      const added=Number(r.added)||0;
+      const skipped=Number(r.skipped)||0;
+      toast.success(added?`В базу добавлено ${added} чатов`:`Уже в базе · ${skipped} чатов`);
+      setCatalogOpen(false);
+      navigate('Группы и каналы');
+      setGroupFilter('all');
+    }catch(e){toast.error((e as Error).message)}
+    finally{setBusy(false)}
   }
 
   function openManualGroup(){
@@ -2688,6 +2695,37 @@ function WorkspaceHome(){
     if(!catalogOpen)return;
     setCatalogSearching(true);
     const handle=window.setTimeout(()=>{
+      if(catalogMarket==='db'){
+        const q=catalogQuery.trim().toLowerCase();
+        const groups=list('group');
+        const hits=groups
+          .map(r=>{
+            const url=String(r.data.url||'');
+            const name=String(r.data.name||'Без названия');
+            const hay=`${name} ${url}`.toLowerCase();
+            const matched=!q||hay.includes(q);
+            const joined=r.data.membership==='joined'||!!r.data.joinedAt;
+            return {
+              id:`db:${r.id}`,
+              name,
+              url,
+              verified:!!url&&!isCatalogPlaceholderUrl(url),
+              description:joined?'В кабинете · можно сканировать лиды':'В кабинете · нужно вступить',
+              audience:String(r.data.source||'workspace'),
+              niches:[] as GroupNiche[],
+              searchHint:url||'Нет ссылки',
+              score:joined?20:10,
+              matched,
+              overlap:0,
+              recordId:r.id,
+            };
+          })
+          .filter(h=>h.matched)
+          .sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name,'ru'));
+        setCatalogHits(hits as any);
+        setCatalogSearching(false);
+        return;
+      }
       const section=MARKET_SECTIONS.find(m=>m.id===catalogMarket);
       const niches=catalogNiche
         ?[catalogNiche]
@@ -2702,11 +2740,12 @@ function WorkspaceHome(){
       setCatalogSearching(false);
     },220);
     return()=>window.clearTimeout(handle);
-  },[catalogOpen,catalogQuery,catalogNiche,catalogMarket,catalogSearchTick]);
+  },[catalogOpen,catalogQuery,catalogNiche,catalogMarket,catalogSearchTick,records]);
 
   const existingGroupUrlSet=new Set(list('group').map(r=>telegramEntityKey(r.data.url)).filter(Boolean));
   const catalogMarketNiches=MARKET_SECTIONS.find(m=>m.id===catalogMarket)?.niches||[];
   const catalogBaseHits=catalogHits.filter(h=>{
+    if(catalogMarket==='db')return true;
     if(!catalogHideAdded)return true;
     if(!h.url)return true;
     return !existingGroupUrlSet.has(telegramEntityKey(h.url));
@@ -2811,13 +2850,17 @@ function WorkspaceHome(){
       return (
         <Empty className="border-0 py-10">
           <EmptyHeader>
-            <EmptyTitle>Пока пусто</EmptyTitle>
-            <EmptyDescription>Найдите чаты по темам или добавьте ссылку — затем нажмите «Вступить».</EmptyDescription>
+            <EmptyTitle>В кабинете пока нет групп</EmptyTitle>
+            <EmptyDescription>
+              Залейте полный каталог ({catalogStats().uniqueUrls} чатов со ссылкой) — затем вступайте и собирайте лиды.
+            </EmptyDescription>
           </EmptyHeader>
           <div className="flex flex-wrap gap-2 justify-center">
-            <Button onClick={openCatalog}><Search size={16}/>Найти темы</Button>
+            <Button disabled={busy} onClick={()=>void importFullCatalogToDb()}>
+              <Database size={16}/>Залить все в базу ({catalogStats().uniqueUrls})
+            </Button>
+            <Button variant="outline" onClick={()=>openCatalog('all')}><Search size={16}/>Открыть каталог</Button>
             <Button variant="outline" onClick={openManualGroup}><Plus size={16}/>Ссылка</Button>
-            <Button variant="outline" onClick={openMassGroups}><Upload size={16}/>Массово</Button>
           </div>
         </Empty>
       );
@@ -3065,10 +3108,7 @@ function WorkspaceHome(){
                   <Button
                     variant="outline"
                     disabled={busy}
-                    onClick={()=>{
-                      const ids=GROUP_CATALOG.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url)).map(g=>g.id);
-                      void saveCatalogGroupsToDb(ids,{join:false});
-                    }}
+                    onClick={()=>void importFullCatalogToDb()}
                   >Залить каталог ({catalogStats().uniqueUrls})</Button>
                   <Button onClick={openCatalog}><Search size={16}/>Поиск по темам</Button>
                 </>
@@ -4675,7 +4715,7 @@ function WorkspaceHome(){
           <DialogHeader className="px-6 pt-5 pb-4 border-b border-[var(--spike-border)] shrink-0">
             <DialogTitle>Найти чаты с клиентами</DialogTitle>
             <DialogDescription>
-              Рынок «Все чаты» — полная база ({catalogStats().uniqueUrls} ссылок). «Залить в базу» добавит их в «Группы и каналы»; «Вступить» — фоновое вступление с паузой.
+              «В базе» — ваши группы для сбора лидов. «Все чаты» — полный каталог ({catalogStats().uniqueUrls} ссылок). «Залить в базу» добавит их в «Группы и каналы».
             </DialogDescription>
           </DialogHeader>
 
@@ -4690,12 +4730,14 @@ function WorkspaceHome(){
                     className={`catalog-side-item ${catalogMarket===m.id?'active':''}`}
                     onClick={()=>selectMarket(m.id)}
                   >
-                    <strong>{m.title} <em className="opacity-70 font-normal">· {marketVerifiedCount(m.id)}</em></strong>
+                    <strong>{m.title} <em className="opacity-70 font-normal">· {m.id==='db'?list('group').length:marketVerifiedCount(m.id)}</em></strong>
                     <span>{m.hint}</span>
                   </button>
                 ))}
               </div>
 
+              {catalogMarket!=='db'&&(
+              <>
               <p className="catalog-step-label mt-4">Ниша</p>
               <div className="catalog-side-list catalog-niche-list">
                 <button
@@ -4735,6 +4777,17 @@ function WorkspaceHome(){
                   setCatalogSearchTick(t=>t+1);
                 }}
               ><Sparkles size={14}/>Подобрать по AI</Button>
+              </>
+              )}
+              {catalogMarket==='db'&&(
+                <Button
+                  type="button"
+                  size="sm"
+                  className="mt-3 w-full"
+                  disabled={busy}
+                  onClick={()=>void importFullCatalogToDb()}
+                ><Database size={14}/>Дозалить каталог ({catalogStats().uniqueUrls})</Button>
+              )}
             </aside>
 
             <div className="catalog-main">
@@ -4750,7 +4803,11 @@ function WorkspaceHome(){
                   {catalogSearching&&<Loader2 className="absolute right-3 top-2.5 animate-spin text-[var(--spike-primary)]" size={16}/>}
                 </div>
                 <label className="catalog-toggle">
-                  <Checkbox checked={catalogHideAdded} onCheckedChange={v=>setCatalogHideAdded(v===true)}/>
+                  <Checkbox
+                    checked={catalogHideAdded}
+                    disabled={catalogMarket==='db'}
+                    onCheckedChange={v=>setCatalogHideAdded(v===true)}
+                  />
                   Скрыть добавленные
                 </label>
               </div>
@@ -4758,17 +4815,19 @@ function WorkspaceHome(){
               <div className="catalog-params">
                 <span className="catalog-param">{catalogActiveMarket?.title||'—'}</span>
                 <span className="catalog-param-sep">/</span>
-                <span className="catalog-param accent">{catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Все ниши'}</span>
+                <span className="catalog-param accent">{catalogMarket==='db'?'Ваш кабинет':(catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Все ниши')}</span>
                 <span className="small-note ml-auto">{catalogSearching?'Ищем…':`${catalogVisibleHits.length} результатов · база ${catalogStats().uniqueUrls}`}</span>
               </div>
 
               <div className="catalog-tabs">
                 <button type="button" className={catalogTab==='links'?'active':''} onClick={()=>{setCatalogTab('links');setCatalogSelected([])}}>
-                  Со ссылкой <em>{catalogLinkHits.length}</em>
+                  {catalogMarket==='db'?'Группы':'Со ссылкой'} <em>{catalogLinkHits.length}</em>
                 </button>
+                {catalogMarket!=='db'&&(
                 <button type="button" className={catalogTab==='topics'?'active':''} onClick={()=>{setCatalogTab('topics');setCatalogSelected([])}}>
                   Темы без ссылки <em>{catalogTopicHits.length}</em>
                 </button>
+                )}
               </div>
 
               {catalogTab==='topics'&&catalogVisibleHits.length>0&&(
@@ -4803,6 +4862,9 @@ function WorkspaceHome(){
                 ):catalogVisibleHits.length?catalogVisibleHits.map(g=>{
                   const canJoin=g.verified&&!!g.url&&!isCatalogPlaceholderUrl(g.url);
                   const checked=catalogSelected.includes(g.id);
+                  const dbId=catalogMarket==='db'&&String(g.id).startsWith('db:')?String(g.id).slice(3):'';
+                  const dbRec=dbId?list('group').find(x=>x.id===dbId):undefined;
+                  const dbJoined=!!(dbRec&&(dbRec.data.membership==='joined'||dbRec.data.joinedAt));
                   return (
                     <div key={g.id} className={`catalog-card ${checked?'is-checked':''} ${canJoin?'has-link':''}`}>
                       {catalogTab==='topics'?(
@@ -4817,12 +4879,27 @@ function WorkspaceHome(){
                         <span className="catalog-card-title">
                           {g.name}
                           {canJoin?<span className="badge success">t.me</span>:<span className="badge neutral">нужен инвайт</span>}
+                          {dbJoined&&<span className="badge success">вступили</span>}
                         </span>
                         <span className="text-sm muted block mt-1">{g.description}</span>
                         <span className="small-note block mt-1">{g.audience}</span>
                         <span className="small-note block mt-1 font-medium text-[var(--spike-primary)]">{canJoin?g.url:g.searchHint}</span>
                       </span>
-                      {canJoin?(
+                      {catalogMarket==='db'&&dbRec?(
+                        dbJoined?(
+                          <Button
+                            size="sm"
+                            disabled={busy||!telegramConnected}
+                            onClick={()=>{setCatalogOpen(false);void scanGroup(dbRec)}}
+                          >Скан лидов</Button>
+                        ):(
+                          <Button
+                            size="sm"
+                            disabled={busy||!telegramConnected||!dbRec.data.accountId}
+                            onClick={()=>{setCatalogOpen(false);void joinGroup(dbRec)}}
+                          >Вступить</Button>
+                        )
+                      ):canJoin?(
                         <Button
                           size="sm"
                           disabled={busy||!catalogAccountId}
@@ -4846,7 +4923,9 @@ function WorkspaceHome(){
                   );
                 }):(
                   <p className="muted text-sm py-6">
-                    {catalogTab==='links'&&catalogTopicHits.length
+                    {catalogMarket==='db'
+                      ? 'В кабинете пока нет групп — нажмите «Дозалить каталог» или откройте «Все чаты».'
+                      : catalogTab==='links'&&catalogTopicHits.length
                       ? 'Нет готовых ссылок в этой нише — откройте «Темы без ссылки» или смените нишу.'
                       : catalogHiddenAdded&&catalogHideAdded
                         ? 'В этой нише всё уже добавлено. Снимите «Скрыть добавленные» или выберите другую нишу.'
@@ -4858,13 +4937,36 @@ function WorkspaceHome(){
           </div>
 
           <div className="px-6 py-4 border-t border-[var(--spike-border)] flex flex-wrap gap-2 shrink-0">
-            {catalogTab==='links'?(
+            {catalogMarket==='db'?(
+              <>
+                <Button
+                  disabled={busy||!telegramConnected||!list('group').filter(g=>g.data.membership==='joined'||g.data.joinedAt).length}
+                  onClick={()=>{
+                    setCatalogOpen(false);
+                    navigate('Группы и каналы');
+                    void (async()=>{
+                      setBusy(true);
+                      try{
+                        const r=await api({action:'rescan_groups',force:true});
+                        toast.message(`Переобход: ${r.queued||0} групп`);
+                        await refresh();
+                      }catch(e){toast.error((e as Error).message)}
+                      finally{setBusy(false)}
+                    })();
+                  }}
+                >Собрать лиды со вступивших</Button>
+                <Button variant="outline" disabled={busy} onClick={()=>void importFullCatalogToDb()}>
+                  Дозалить каталог ({catalogStats().uniqueUrls})
+                </Button>
+                <Button variant="ghost" onClick={()=>selectMarket('all')}>Все чаты каталога</Button>
+              </>
+            ):catalogTab==='links'?(
               <>
                 <Button
                   disabled={busy||!catalogReadyCount}
                   variant="default"
-                  onClick={()=>saveCatalogGroupsToDb(catalogLinkHits.map(g=>g.id),{join:false})}
-                >{busy?'Сохраняем…':`Залить в базу (${catalogReadyCount})`}</Button>
+                  onClick={()=>catalogMarket==='all'?void importFullCatalogToDb():saveCatalogGroupsToDb(catalogLinkHits.map(g=>g.id),{join:false})}
+                >{busy?'Сохраняем…':catalogMarket==='all'?`Залить весь каталог (${catalogStats().uniqueUrls})`:`Залить в базу (${catalogReadyCount})`}</Button>
                 <Button
                   disabled={busy||!catalogReadyCount||!catalogAccountId}
                   variant="outline"

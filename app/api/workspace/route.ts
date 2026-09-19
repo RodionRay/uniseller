@@ -278,6 +278,9 @@ const schemas={
   isAdmin:z.boolean().default(false),
   status:z.string().max(40).default(''),
   invited:z.boolean().default(false),
+  /** Telethon access_hash слота-сборщика — чужой аккаунт фермы его не примет */
+  accessHash:z.string().max(40).default(''),
+  accountId:z.string().max(100).default(''),
  }),
   invite_task:z.object({
   name:z.string().max(200).default(''),
@@ -1845,7 +1848,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   try{
    const {payload}=await loadAccountSessionPayload(owner,gdata.accountId);
    const result=await workerPost('/scan-group',{...payload,url:gdata.url,keywords,minusKeywords,limit:scanLimit,days:scanDepthDays});
-   if(!result.ok){
+    if(!result.ok){
     if(workerLooksDeadAccount(result)){
      const frozen=workerLooksFrozen(result);
      const rotated=await rotateGroupOffDeadAccount(owner,id,gdata,gdata.accountId,{
@@ -1864,6 +1867,55 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
        error:frozen?'Аккаунт заморожен — группа переназначена':'Аккаунт недоступен — группа переназначена',
       },409);
      }
+    }
+    // Слот не резолвит публичный @ — пробуем другой живой аккаунт (ферма часто врёт)
+    const usernameMissing=!!result.usernameMissing||result.join==='missing'||/не видит @|no user has|nobody is using|username_not_occupied/i.test(String(result.error||''));
+    if(usernameMissing){
+     const live=await listLiveAccountIds(owner);
+     const nextAcc=live.find(aid=>aid!==gdata.accountId);
+     if(nextAcc){
+      const rotated={
+       ...gdata,
+       accountId:nextAcc,
+       membership:'none',
+       status:'setup',
+       error:String(result.error||'').slice(0,500),
+       joinState:'queued',
+       joinStateAt:new Date().toISOString(),
+       joinStateError:sanitizeJoinStateError(String(result.error||'')),
+       lastScanned:new Date().toISOString(),
+      };
+      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(rotated),owner,id,'group').run();
+      try{await appendGlobalRescanLog(owner,'warn',`${gdata.name||'Группа'}: слот не видит ссылку → другой аккаунт`)}catch{/* */}
+      return reply({
+       ok:false,
+       needJoin:true,
+       reassigned:true,
+       usernameMissing:true,
+       soft:true,
+       group:rotated,
+       rejoinItem:{id,name:rotated.name||'Группа'},
+       error:'Слот не видит группу — переназначили, нужно вступить другим аккаунтом',
+      },409);
+     }
+     const deadUrl={
+      ...gdata,
+      status:'error',
+      usernameMissing:true,
+      error:String(result.error||'Ссылка группы не открывается').slice(0,500),
+      lastScanned:new Date().toISOString(),
+      joinState:'',
+      joinStateError:sanitizeJoinStateError(String(result.error||'')),
+     };
+     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(deadUrl),owner,id,'group').run();
+     try{await appendGlobalRescanLog(owner,'error',`${gdata.name||'Группа'}: ${String(result.error||'ссылка не открывается').slice(0,160)}`)}catch{/* */}
+     return reply({
+      ok:false,
+      skipped:true,
+      usernameMissing:true,
+      error:deadUrl.error,
+      group:deadUrl,
+     },422);
     }
     // Скан без членства: не сбрасываем свежие/подтверждённые вступления —
     // после join Telegram часто лажит (CheckChatInvite / GetParticipant),
@@ -2592,6 +2644,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     const d=JSON.parse(String(r.data));
     if(!d.accountId||isCatalogPlaceholderUrl(d.url||''))continue;
     if(!liveIds.has(String(d.accountId)))continue;
+    // Битая/невидимая ссылка — не крутить в каждом обходе (force всё ещё берёт)
+    if(!force&&(String(d.status||'')==='error'||d.usernameMissing))continue;
     const joined=d.membership==='joined'||!!d.joinedAt;
     if(!joined)continue;
     const last=d.lastScanned?Date.parse(d.lastScanned):0;
@@ -2909,6 +2963,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      isAdmin:!!u.isAdmin,
      status:String(u.status||'').slice(0,40),
      invited:false,
+     accessHash:String(u.accessHash||u.senderAccessHash||'').slice(0,40),
+     accountId,
     };
     await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)').bind(crypto.randomUUID(),owner,'audience_user',JSON.stringify(userData),null,new Date().toISOString()).run();
     added++;
@@ -3663,8 +3719,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
 
   let accountIndex=Number(data.accountIndex)||0;
   if(accountIndex>=liveIds.length)accountIndex=0;
-  const accountId=liveIds[accountIndex%liveIds.length];
-  const accountLabel=accName(accountId);
+  let accountId=liveIds[accountIndex%liveIds.length];
+  let accountLabel=accName(accountId);
   const prevAccountId=String(data.lastAccountId||'');
   const deliveredKeys=new Set<string>(Array.isArray(data.deliveredKeys)?data.deliveredKeys:[]);
   const deferredUntil:Record<string,string>={
@@ -3678,7 +3734,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    return Number.isFinite(t)&&t>nowMs;
   };
   const batchSize=Math.max(1,Math.min(10,Number(data.batchPerTick)||1));
-  type Cand={key:string;userId:string;username:string;leadId:string;groupUrl:string;tgMsgId:string;accessHash:string;recordId:string};
+  type Cand={key:string;userId:string;username:string;leadId:string;groupUrl:string;tgMsgId:string;accessHash:string;accountId:string;recordId:string};
   const candidates:Cand[]=[];
   const sourceKind=(data.sourceKind||'audience') as MailingSourceKind;
   const deliveryMode=(data.deliveryMode||'dm') as MailingDeliveryMode;
@@ -3711,11 +3767,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       groupUrl:String(g?.url||''),
       tgMsgId:String(L.tgMsgId||''),
       accessHash:String(L.senderAccessHash||''),
+      accountId:String(L.accountId||''),
       recordId:String(r.id),
      });
     }catch{/* */}
    }
   }else{
+   let audienceSourceUrl='';
+   try{
+    const arow:any=await db.prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,data.audienceTaskId,'audience_task').first();
+    if(arow)audienceSourceUrl=String(JSON.parse(arow.data).url||'');
+   }catch{/* */}
    const allUsers=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='audience_user'").bind(owner).all();
    for(const r of allUsers.results){
     try{
@@ -3729,9 +3791,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       userId:String(u.userId||''),
       username:String(u.username||'').replace(/^@/,''),
       leadId:'',
-      groupUrl:'',
+      // Как в инвайте: без URL источника GetParticipant/access_hash неоткуда взять
+      groupUrl:audienceSourceUrl,
       tgMsgId:'',
       accessHash:String(u.accessHash||u.senderAccessHash||''),
+      accountId:String(u.accountId||''),
       recordId:String(r.id),
      });
     }catch{/* */}
@@ -3769,6 +3833,19 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    return reply({ok:true,completed:true,task:next});
   }
 
+  // Без @username Telegram отдаёт peer только слоту, который уже «видел» юзера
+  if(deliveryMode==='dm'){
+   const pinned=batch.find(c=>!c.username&&c.accountId&&liveIds.includes(c.accountId));
+   if(pinned&&pinned.accountId!==accountId){
+    const idx=liveIds.indexOf(pinned.accountId);
+    if(idx>=0){
+     accountIndex=idx;
+     accountId=liveIds[idx];
+     accountLabel=accName(accountId);
+    }
+   }
+  }
+
   const logEntries:{level:'info'|'ok'|'warn'|'error';text:string}[]=[
    {level:'info',text:`Работает аккаунт ${bracketLabel(accountLabel)}`},
   ];
@@ -3796,6 +3873,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
 
   try{
    const {payload}=await loadAccountSessionPayload(owner,accountId);
+   // Как в инвайте: слот должен быть в источнике, иначе GetParticipant не даст access_hash
+   const sourceUrls=Array.from(new Set(
+    batch.map(c=>String(c.groupUrl||'').trim()).filter(Boolean),
+   ));
+   if(deliveryMode==='dm'&&sourceUrls.length){
+    for(const src of sourceUrls.slice(0,2)){
+     try{
+      await workerPost('/join-group',{...payload,url:src},90_000);
+     }catch{/* источник опционален */}
+    }
+   }
    let okN=0;
    let failN=0;
    let accountWentCooldown=false;
@@ -3822,6 +3910,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      }
     }
 
+    // access_hash чужого слота → invalid Peer; чужой hash не передаём
+    const sameSlot=!cand.accountId||cand.accountId===accountId;
+    const accessHash=sameSlot?String(cand.accessHash||''):'';
+
     const result=await workerPost('/send-message',{
      ...payload,
      mode:deliveryMode,
@@ -3831,7 +3923,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      tgMsgId:cand.tgMsgId||'',
      senderId:cand.userId||'',
      senderUsername:cand.username||'',
-     senderAccessHash:cand.accessHash||'',
+     senderAccessHash:accessHash,
      silent:!!data.silent,
      // Удаление диалога ломает входящие ответы → «Переписки»
      deleteDialog:false,
@@ -3924,7 +4016,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
           accountId:L.accountId||accountId,
           senderId:L.senderId||cand.userId,
           senderUsername:L.senderUsername||cand.username,
-          senderAccessHash:L.senderAccessHash||cand.accessHash||'',
+          senderAccessHash:String(result.senderAccessHash||L.senderAccessHash||cand.accessHash||'').slice(0,40),
          }),owner,cand.leadId,'lead').run();
         }
        }else{
@@ -3945,7 +4037,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
          excludeFromTraining:false,
          senderId:String(cand.userId||'').slice(0,40),
          senderUsername:String(cand.username||'').slice(0,64),
-         senderAccessHash:String(cand.accessHash||'').slice(0,40),
+         senderAccessHash:String(result.senderAccessHash||cand.accessHash||'').slice(0,40),
          messageKind:'',
          peerId:String(cand.userId||'').slice(0,40),
          replyToMsgId:'',

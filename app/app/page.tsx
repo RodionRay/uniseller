@@ -1540,6 +1540,7 @@ function WorkspaceHome(){
     }
     let added=0,scanned=0;
     const rejoin: {id:string;name:string}[]=[];
+    const scanErrors:string[]=[];
     for(const id of ids){
       if(!opts?.force&&(busyRef.current||joinRunnerLock.current))break;
       try{
@@ -1556,14 +1557,30 @@ function WorkspaceHome(){
         const data=(err as any)?.data;
         if(data?.rejoinItem?.id){
           // Soft/preserved — не перекидываем в очередь вступлений
-          if(data?.soft||data?.preserved)continue;
+          if(data?.soft||data?.preserved){
+            if(data?.usernameMissing&&!quiet){
+              const msg=String(data?.error||(err as Error).message||'').slice(0,120);
+              if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
+            }
+            continue;
+          }
           rejoin.push({id:data.rejoinItem.id,name:data.rejoinItem.name||'Группа'});
           continue;
         }
-        if(!quiet)toast.error(`Скан: ${(err as Error).message}`);
+        if(data?.usernameMissing||data?.skipped){
+          const msg=String(data?.error||(err as Error).message||'').slice(0,120);
+          if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
+          continue;
+        }
+        const msg=String((err as Error).message||'ошибка').slice(0,140);
+        if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
       }
     }
     if(rejoin.length)void startBackgroundJoins(rejoin);
+    if(!quiet&&scanErrors.length){
+      const head=scanErrors[0];
+      toast.error(scanErrors.length>1?`Скан: ${head} · ещё ${scanErrors.length-1}`:`Скан: ${head}`);
+    }
     if(scanned>0||added>0)await refresh();
     return {scanned,added,due:Number(pack.total)||ids.length,reassigned:Number(pack.reassigned)||0};
   }

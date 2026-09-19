@@ -942,7 +942,27 @@ async def scan_group(
                 }
             entity = invite.chat
         else:
-            entity = await client.get_entity(ref["value"])
+            try:
+                from telethon.errors import UsernameNotOccupiedError, UsernameInvalidError
+
+                entity = await client.get_entity(ref["value"])
+            except (UsernameNotOccupiedError, UsernameInvalidError, ValueError) as e:
+                uname = str(ref["value"] or "").lstrip("@")
+                detail = str(e)
+                # Ферма часто врёт «No user has …» на живых публичных чатах
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "join": "missing",
+                    "error": (
+                        f"Слот не видит @{uname} (ResolveUsername). "
+                        "Часто ложь фермы или ник сменился — смените аккаунт группы или обновите ссылку."
+                    )[:400],
+                    "messages": [],
+                    "member": False,
+                    "usernameMissing": True,
+                    "detail": detail[:200],
+                }
             if not await member_of(entity):
                 return {
                     "ok": False,
@@ -1100,6 +1120,8 @@ def _serialize_audience_user(user, *, is_admin: bool = False) -> dict[str, Any] 
         "premium": bool(getattr(user, "premium", False)),
         "isAdmin": bool(is_admin),
         "status": _user_status_bucket(user),
+        # Привязан к сессии сборщика — чужой слот фермы его не примет
+        "accessHash": str(getattr(user, "access_hash", "") or ""),
     }
 
 
@@ -1705,10 +1727,10 @@ async def send_message(
             except Exception as e:
                 errors.append(("username/entity: " + str(e))[:160])
 
-        # 2) Уже есть диалог в этой сессии
+        # 2) Уже есть диалог / entity в кэше этой сессии
         if uid_clean.isdigit():
             try:
-                async for dialog in client.iter_dialogs(limit=40):
+                async for dialog in client.iter_dialogs(limit=200):
                     if not getattr(dialog, "is_user", False):
                         continue
                     ent = dialog.entity
@@ -1721,27 +1743,50 @@ async def send_message(
             except Exception as e:
                 errors.append(("id/cache: " + str(e))[:160])
 
-        # 3) Через исходную группу / сообщение лида
+        # 3) Через исходную группу / сообщение лида (свежий access_hash для ЭТОЙ сессии)
         if uid_clean.isdigit() and source_url:
             try:
                 source_entity, err = await _resolve_entity(client, source_url)
                 if source_entity is not None and not err:
-                    if msg_id and str(msg_id).isdigit():
-                        try:
-                            m = await client.get_messages(source_entity, ids=int(msg_id))
-                            if m:
-                                sender = await m.get_sender()
-                                if sender is not None and isinstance(sender, User):
-                                    return await client.get_input_entity(sender), ""
-                        except Exception as e:
-                            errors.append(("id/msg: " + str(e))[:160])
+                    # Канал-витрина: участники/комментаторы часто в linked discussion
+                    peer_targets = [source_entity]
                     try:
-                        part = await client(GetParticipantRequest(source_entity, int(uid_clean)))
-                        users = getattr(part, "users", None) or []
-                        if users:
-                            return await client.get_input_entity(users[0]), ""
+                        if (
+                            isinstance(source_entity, Channel)
+                            and bool(getattr(source_entity, "broadcast", False))
+                            and not bool(getattr(source_entity, "megagroup", False))
+                        ):
+                            from telethon.tl.functions.channels import GetFullChannelRequest
+
+                            full_ch = await client(GetFullChannelRequest(source_entity))
+                            linked_id = getattr(full_ch.full_chat, "linked_chat_id", None)
+                            if linked_id:
+                                linked = await client.get_entity(int(linked_id))
+                                if linked is not None:
+                                    peer_targets.append(linked)
                     except Exception as e:
-                        errors.append(("id/participant: " + str(e))[:160])
+                        errors.append(("id/linked: " + str(e))[:160])
+
+                    if msg_id and str(msg_id).isdigit():
+                        for peer_ent in peer_targets:
+                            try:
+                                m = await client.get_messages(peer_ent, ids=int(msg_id))
+                                if m:
+                                    sender = await m.get_sender()
+                                    if sender is not None and isinstance(sender, User):
+                                        return await client.get_input_entity(sender), ""
+                            except Exception as e:
+                                errors.append(("id/msg: " + str(e))[:160])
+                    for peer_ent in peer_targets:
+                        try:
+                            part = await client(
+                                GetParticipantRequest(peer_ent, int(uid_clean))
+                            )
+                            users = getattr(part, "users", None) or []
+                            if users:
+                                return await client.get_input_entity(users[0]), ""
+                        except Exception as e:
+                            errors.append(("id/participant: " + str(e))[:160])
                     try:
                         return await client.get_input_entity(int(uid_clean)), ""
                     except Exception as e:
@@ -1771,10 +1816,15 @@ async def send_message(
                 "Ответьте тем же аккаунтом, что писал ранее, или укажите @username клиента."
             )
             return None, hint
-        if "could not find the input entity" in low or "cannot find any entity" in low or "access_hash" in low:
+        if (
+            "could not find the input entity" in low
+            or "cannot find any entity" in low
+            or "access_hash" in low
+            or detail == "peer not found"
+        ):
             hint = (
-                "Не удалось открыть пользователя. "
-                "Нужен @username или тот же аккаунт фермы, что сканировал группу."
+                "Не удалось открыть пользователя (нет access_hash). "
+                "Нужен @username или аккаунт фермы из той же группы/сбора."
             )
             return None, hint
         if "username" in low and ("not occupied" in low or "invalid" in low or "no user" in low):

@@ -727,8 +727,8 @@ function WorkspaceHome(){
   },[allowedNav,view]);
 
   const navBadges=useMemo(()=>{
+    // Только непрочитанные ответы клиента — не все открытые переписки
     const needManager=list('lead').filter(r=>!!r.data.needsManager&&!r.data.excludeFromTraining).length;
-    const drafts=needManager||list('lead').filter(r=>(!!r.data.conversationOpen||!!r.data.draft)&&!r.data.excludeFromTraining).length;
     const groups=list('group').filter(r=>{
       const d=r.data||{};
       return d.status==='error'||d.membership==='pending'||JOIN_BUSY.has(String(d.joinState||''));
@@ -744,7 +744,7 @@ function WorkspaceHome(){
     const badges:Partial<Record<NavName,number>>={
       'Уведомления':notices.filter(n=>!n.read).length,
       'Лиды':freshLeads.length,
-      'Переписки':drafts,
+      'Переписки':needManager,
       'Группы и каналы':groups,
       'Сбор аудитории':audienceBusy,
       'Инвайтинг':inviteBusy,

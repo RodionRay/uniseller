@@ -676,7 +676,11 @@ async def join_group(client, url: str) -> dict[str, Any]:
                     "ok": False,
                     "status": "error",
                     "join": "missing",
-                    "error": f'Группа @{ref["value"]} не найдена в Telegram. Укажите реальную ссылку t.me/… или инвайт.',
+                    "usernameMissing": True,
+                    "error": (
+                        f"Слот не видит @{ref['value']} (ResolveUsername). "
+                        "Часто ложь фермы — нужен другой аккаунт или инвайт-ссылка."
+                    )[:400],
                     "member": False,
                 }
             except RPCError as e:
@@ -1125,9 +1129,72 @@ def _serialize_audience_user(user, *, is_admin: bool = False) -> dict[str, Any] 
     }
 
 
+async def _match_username_in_peers(peers, want: str):
+    want = (want or "").lower().lstrip("@")
+    if not want:
+        return None
+    for ent in peers or []:
+        if ent is None:
+            continue
+        if (getattr(ent, "username", None) or "").lower() == want:
+            return ent
+    return None
+
+
+async def _resolve_username_via_search(client, want: str):
+    """Ферма часто врёт на ResolveUsername; Search / SearchGlobal иногда видят тот же @."""
+    want = (want or "").lower().lstrip("@")
+    if not want:
+        return None
+    try:
+        from telethon.tl.functions.contacts import SearchRequest
+
+        res = await client(SearchRequest(q=want, limit=25))
+        found = await _match_username_in_peers(
+            list(getattr(res, "chats", None) or [])
+            + list(getattr(res, "users", None) or []),
+            want,
+        )
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    try:
+        from telethon.tl.functions.messages import SearchGlobalRequest
+        from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty
+
+        res = await client(
+            SearchGlobalRequest(
+                q=want,
+                filter=InputMessagesFilterEmpty(),
+                min_date=None,
+                max_date=None,
+                offset_rate=0,
+                offset_peer=InputPeerEmpty(),
+                offset_id=0,
+                limit=25,
+            )
+        )
+        found = await _match_username_in_peers(
+            list(getattr(res, "chats", None) or [])
+            + list(getattr(res, "users", None) or []),
+            want,
+        )
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    # Повторный Resolve после Search — иногда кэш сессии уже тёплый
+    try:
+        return await client.get_entity(want)
+    except Exception:
+        return None
+
+
 async def _resolve_entity(client, url: str):
     from telethon.tl.functions.messages import CheckChatInviteRequest
     from telethon.tl.types import ChatInviteAlready
+    from telethon.errors import UsernameNotOccupiedError, UsernameInvalidError
 
     ref = parse_group_ref(url)
     if ref["kind"] == "invite":
@@ -1141,8 +1208,47 @@ async def _resolve_entity(client, url: str):
                 "hasMore": False,
             }
         return invite.chat, None
-    entity = await client.get_entity(ref["value"])
-    return entity, None
+    uname = str(ref.get("value") or "").lstrip("@")
+    want = uname.lower()
+    # Если слот уже в канале/чате — берём entity из диалогов, не ResolveUsername
+    if want:
+        try:
+            async for dialog in client.iter_dialogs(limit=400):
+                ent = getattr(dialog, "entity", None)
+                if ent is None:
+                    continue
+                if (getattr(ent, "username", None) or "").lower() == want:
+                    return ent, None
+        except Exception:
+            pass
+    try:
+        entity = await client.get_entity(ref["value"])
+        return entity, None
+    except (UsernameNotOccupiedError, UsernameInvalidError, ValueError) as e:
+        detail = str(e)
+        # Ферма часто врёт «No user has …» на живых публичных каналах
+        if (
+            isinstance(e, (UsernameNotOccupiedError, UsernameInvalidError))
+            or "no user has" in detail.lower()
+            or "nobody is using" in detail.lower()
+            or "username not occupied" in detail.lower()
+        ):
+            found = await _resolve_username_via_search(client, want)
+            if found is not None:
+                return found, None
+            return None, {
+                "ok": False,
+                "status": "error",
+                "join": "missing",
+                "usernameMissing": True,
+                "error": (
+                    f"Слот не видит @{uname} (ResolveUsername). "
+                    "Часто ложь фермы — нужен другой аккаунт или инвайт-ссылка."
+                )[:400],
+                "users": [],
+                "hasMore": False,
+            }
+        raise
 
 
 async def collect_audience(client, payload: dict[str, Any]) -> dict[str, Any]:

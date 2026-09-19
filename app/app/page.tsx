@@ -1398,7 +1398,7 @@ function WorkspaceHome(){
       if(modal.kind==='group')payload.url=canonicalizeTgUrl(payload.url||'');
       if(modal.kind==='audience_task')payload.url=canonicalizeTgUrl(payload.url||'');
       if(modal.kind==='invite_task')payload.targetUrl=canonicalizeTgUrl(payload.targetUrl||'');
-      const dup=findDuplicate(modal.kind,payload,records,modal.item?.id);
+      const dup=findDuplicate(modal.kind,payload,records.filter(r=>r.kind===modal.kind),modal.item?.id);
       if(dup){
         setFormError(duplicateReason(modal.kind,payload,dup.data)||'Такая запись уже есть');
         setBusy(false);
@@ -1490,10 +1490,12 @@ function WorkspaceHome(){
     setDetail(item);
     setChatMode('dm');
     setChatText(item.data.draft||'');
-    if(item.data.viewed)return;
+    // Просмотр = просмотрена + снять «нужен менеджер» (Переписки)
+    if(item.data.viewed&&!item.data.needsManager)return;
     const viewedAt=new Date().toISOString();
-    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,viewed:true,viewedAt}}:r));
-    setDetail(d=>d&&d.id===item.id?{...d,data:{...d.data,viewed:true,viewedAt}}:d);
+    const patch={viewed:true,viewedAt,needsManager:false};
+    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,...patch}}:r));
+    setDetail(d=>d&&d.id===item.id?{...d,data:{...d.data,...patch}}:d);
     try{
       await api({action:'mark_lead_viewed',id:item.id});
     }catch{/* не блокируем просмотр */}
@@ -4227,7 +4229,11 @@ function WorkspaceHome(){
           <form className="form-stack" onSubmit={save}>
             {modal?.kind!=='settings'&&modal?.kind!=='audience_task'&&modal?.kind!=='invite_task'&&modal?.kind!=='mailing_task'&&field('name','Название')}
             {modal?.kind==='audience_task'&&(
-              <AudienceTaskFields form={form} setForm={setForm} accounts={accountsUsableOpts}/>
+              <AudienceTaskFields
+                form={form}
+                setForm={(fn)=>{setFormError('');setForm(fn)}}
+                accounts={accountsUsableOpts}
+              />
             )}
             {modal?.kind==='invite_task'&&inviteWizardStep===1&&(
               <InviteModePicker mode={form.mode||'ordinary'} onPick={m=>setForm((f:any)=>({...f,mode:m}))} onContinue={()=>setInviteWizardStep(2)}/>

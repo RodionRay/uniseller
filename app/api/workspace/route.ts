@@ -15,7 +15,7 @@ import {
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew} from '@/lib/ai-keywords';
 import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
-import {canonicalizeTgUrl,duplicateReason,isDuplicateKind} from '@/lib/record-identity';
+import {canonicalizeTgUrl,duplicateReason,isDuplicateKind,telegramEntityKey} from '@/lib/record-identity';
 import {
  DEFAULT_DM_SOFT_CLOSE,
  isDeadAccountMailingError,
@@ -2202,10 +2202,16 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();
   if(!row)return reply({error:'Лид не найден'},404);
   const data=JSON.parse(row.data);
-  if(data.viewed)return reply({ok:true,already:true});
-  const next={...data,viewed:true,viewedAt:new Date().toISOString()};
+  // Повторный просмотр переписки тоже снимает needsManager
+  if(data.viewed&&!data.needsManager)return reply({ok:true,already:true});
+  const next={
+   ...data,
+   viewed:true,
+   viewedAt:data.viewedAt||new Date().toISOString(),
+   needsManager:false,
+  };
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'lead').run();
-  return reply({ok:true});
+  return reply({ok:true,lead:next});
  }
  if(b.action==='set_lead_training_exclude'){
   const id=z.string().uuid().parse(b.id);
@@ -2894,7 +2900,32 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   for(const r of accRows.results){
    try{accMap.set(String(r.id),JSON.parse(String(r.data)))}catch{/* */}
   }
-  const liveIds=accountIds.filter(aid=>isAccountUsable(accMap.get(aid)));
+  const liveIdsRaw=accountIds.filter(aid=>{
+   const a=accMap.get(aid);
+   if(!a)return false;
+   // status=cooldown без живого таймера раньше проходил isAccountUsable — для сбора не берём
+   if(String(a.status||'')==='cooldown')return false;
+   return isAccountUsable(a);
+  });
+  // Аккаунт, уже вступивший в этот источник (из «Группы») — первым
+  let preferId='';
+  try{
+   const sourceKey=telegramEntityKey(String(data.url||''));
+   if(sourceKey){
+    const groups=await db.prepare("SELECT data FROM records WHERE owner=? AND kind='group'").bind(owner).all();
+    for(const g of groups.results){
+     try{
+      const gd=JSON.parse(String(g.data));
+      if(telegramEntityKey(String(gd.url||''))!==sourceKey)continue;
+      const aid=String(gd.accountId||'');
+      if(aid&&liveIdsRaw.includes(aid)&&(gd.membership==='joined'||gd.joinedAt)){
+       preferId=aid;break;
+      }
+     }catch{/* */}
+    }
+   }
+  }catch{/* */}
+  const liveIds=preferId?[preferId,...liveIdsRaw.filter(x=>x!==preferId)]:liveIdsRaw;
   if(!liveIds.length){
    const next={
     ...data,
@@ -2905,32 +2936,95 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'audience_task').run();
    return reply({ok:false,error:next.error,task:next});
   }
-  const accountId=liveIds[0];
-  try{
-   const {payload}=await loadAccountSessionPayload(owner,accountId);
-   // Недавние userId задачи задачи — чтобы батч не дублировал
-   const existingUsers=await db.prepare("SELECT data FROM records WHERE owner=? AND kind='audience_user'").bind(owner).all();
-   const seenIds:string[]=[];
-   for(const r of existingUsers.results){
-    try{
-     const u=JSON.parse(String(r.data));
-     if(u.taskId===id&&u.userId)seenIds.push(String(u.userId));
-    }catch{/* */}
+  // Недавние userId задачи — один раз на тик
+  const existingUsers=await db.prepare("SELECT data FROM records WHERE owner=? AND kind='audience_user'").bind(owner).all();
+  const seenIds:string[]=[];
+  for(const r of existingUsers.results){
+   try{
+    const u=JSON.parse(String(r.data));
+    if(u.taskId===id&&u.userId)seenIds.push(String(u.userId));
+   }catch{/* */}
+  }
+
+  const isSlotBlindErr=(msg:string)=>
+   /не видит @|usernameMissing|no user has|nobody is using|username_not_occupied|join.?missing/i.test(msg);
+  const isDeadSessionErr=(msg:string)=>
+   isDeadAccountMailingError(msg)||/tdesktopunauthorized|fromtdesktop/i.test(msg);
+
+  let accountId='';
+  let payload:any=null;
+  let result:any=null;
+  const sessionErrors:string[]=[];
+  for(const aid of liveIds.slice(0,10)){
+   accountId=aid;
+   try{
+    const loaded=await loadAccountSessionPayload(owner,accountId);
+    payload=loaded.payload;
+    result=await workerPost('/collect-audience',{
+     ...payload,
+     url:data.url,
+     collectMode:data.collectMode,
+     rangeMode:data.rangeMode,
+     messageLimit:data.messageLimit,
+     periodDays:data.periodDays,
+     audienceScope:data.audienceScope,
+     premiumFilter:data.premiumFilter,
+     statusFilter:data.statusFilter,
+     batchSize:80,
+     cursor:data.cursor||'',
+     seenIds:seenIds.slice(-5000),
+    },180_000);
+   }catch(e){
+    const errMsg=String((e as Error).message||e).slice(0,500);
+    sessionErrors.push(errMsg);
+    if(isDeadSessionErr(errMsg)){
+     try{
+      await putAccountUnauthorized(owner,accountId,accMap.get(accountId)||{},{lastError:errMsg});
+      accMap.set(accountId,{...(accMap.get(accountId)||{}),status:'unauthorized'});
+     }catch{/* */}
+     data={...data,log:pushTaskLog(data.log,'warn',`Слот ${bracketLabel(String(accMap.get(accountId)?.name||accountId))}: сессия мертва — следующий`)};
+     continue;
+    }
+    if(isSlotBlindErr(errMsg)){
+     data={...data,log:pushTaskLog(data.log,'warn',`Слот ${bracketLabel(String(accMap.get(accountId)?.name||accountId))}: не видит источник — следующий`)};
+     continue;
+    }
+    const next={...data,status:'error',error:errMsg,log:pushTaskLog(data.log,'error',errMsg)};
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'audience_task').run();
+    return reply({ok:false,error:errMsg,task:next},503);
    }
-   const result=await workerPost('/collect-audience',{
-    ...payload,
-    url:data.url,
-    collectMode:data.collectMode,
-    rangeMode:data.rangeMode,
-    messageLimit:data.messageLimit,
-    periodDays:data.periodDays,
-    audienceScope:data.audienceScope,
-    premiumFilter:data.premiumFilter,
-    statusFilter:data.statusFilter,
-    batchSize:80,
-    cursor:data.cursor||'',
-    seenIds:seenIds.slice(-5000),
-   },180_000);
+   if(result?.ok||result?.join==='need_join')break;
+   const errMsg=String(result?.error||'Сбор не удался').slice(0,500);
+   if(isDeadSessionErr(errMsg)||result?.status==='disconnected'||result?.status==='unauthorized'){
+    sessionErrors.push(errMsg);
+    try{
+     await putAccountUnauthorized(owner,accountId,accMap.get(accountId)||{},{lastError:errMsg});
+     accMap.set(accountId,{...(accMap.get(accountId)||{}),status:'unauthorized'});
+    }catch{/* */}
+    data={...data,log:pushTaskLog(data.log,'warn',`Слот ${bracketLabel(String(accMap.get(accountId)?.name||accountId))}: tdata/session недействителен — следующий`)};
+    result=null;
+    continue;
+   }
+   if(result?.usernameMissing||result?.join==='missing'||isSlotBlindErr(errMsg)){
+    sessionErrors.push(errMsg);
+    data={...data,log:pushTaskLog(data.log,'warn',`Слот ${bracketLabel(String(accMap.get(accountId)?.name||accountId))}: не видит источник — следующий`)};
+    result=null;
+    continue;
+   }
+   break;
+  }
+  try{
+   if(!result){
+    const errMsg=(sessionErrors[0]||'Нет рабочих сессий для сбора').slice(0,500);
+    const next={
+     ...data,
+     status:'paused',
+     error:errMsg,
+     log:pushTaskLog(data.log,'error',`Все слоты без доступа к источнику · ${errMsg.slice(0,120)}`),
+    };
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'audience_task').run();
+    return reply({ok:false,error:errMsg,task:next});
+   }
    if(result.join==='need_join'){
     const joinRes=await workerPost('/join-group',{...payload,url:data.url});
     if(!joinRes.ok){

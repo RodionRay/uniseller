@@ -7,6 +7,7 @@ import {
   canPollDmInbox,
   cooldownRemainingShort,
   isAccountUsable,
+  isDayLimitCooldown,
   relativeTimeRu,
   withDayLimitCooldown,
   withFrozenStatus,
@@ -108,5 +109,28 @@ describe("менеджер аккаунтов · helpers", () => {
     });
     expect(out.status).toBe("cooldown");
     expect(String(out.error)).toMatch(/вступлений/);
+  });
+
+  it("day_chat / day_memberInvite ставят cooldownReason и блокируют аккаунт", () => {
+    const chat = withDayLimitCooldown({ status: "active" }, "chat");
+    expect(chat.status).toBe("cooldown");
+    expect(chat.cooldownReason).toBe("day_chat");
+    expect(String(chat.error)).toMatch(/комментариев/i);
+    expect(isAccountUsable(chat)).toBe(false);
+
+    const member = withDayLimitCooldown({ status: "active" }, "memberInvite");
+    expect(member.status).toBe("cooldown");
+    expect(member.cooldownReason).toBe("day_memberInvite");
+    expect(String(member.error)).toMatch(/инвайт/i);
+    expect(isAccountUsable(member)).toBe(false);
+  });
+
+  it("isDayLimitCooldown: только status=cooldown + живой таймер", () => {
+    const future = new Date(Date.now() + 3600_000).toISOString();
+    const past = new Date(Date.now() - 3600_000).toISOString();
+    expect(isDayLimitCooldown({ status: "cooldown", cooldownUntil: future })).toBe(true);
+    expect(isDayLimitCooldown({ status: "active", cooldownUntil: future })).toBe(false);
+    expect(isDayLimitCooldown({ status: "cooldown", cooldownUntil: past })).toBe(false);
+    expect(isDayLimitCooldown({ status: "cooldown", cooldownUntil: "" })).toBe(false);
   });
 });

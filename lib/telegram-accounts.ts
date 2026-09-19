@@ -83,6 +83,18 @@ export function isOnCooldown(cooldownUntil?: string | null): boolean {
   return Number.isFinite(t) && t > Date.now();
 }
 
+/**
+ * Дневная отлёжка: только явный status=cooldown + живой таймер.
+ * Голый cooldownUntil (старый FloodWait/коннект) — НЕ отлёжка.
+ */
+export function isDayLimitCooldown(data: {
+  status?: string | null;
+  cooldownUntil?: string | null;
+} | null | undefined): boolean {
+  if (!data) return false;
+  return String(data.status || "") === "cooldown" && isOnCooldown(data.cooldownUntil);
+}
+
 /** Можно ли ставить в работу (рассылка / инвайт / сбор / группы). */
 export function isAccountUsable(data: {
   status?: string | null;

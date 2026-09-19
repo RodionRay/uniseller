@@ -1,5 +1,6 @@
 import {getSessionUser} from '@/lib/auth';
 import {isCatalogPlaceholderUrl} from '@/lib/group-catalog';
+import {sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
 import {aiChatText,envAiApiKey,resolveAiConfig} from '@/lib/ai-client';
 import {buildProjectBrief,leadMessageFingerprint,normalizeLeadMessage,parseLeadTemperature,ratingFromTemperatures,strongPlusTerms,type LeadTemperature} from '@/lib/lead-filter';
@@ -926,12 +927,7 @@ function isHardDeadAccountStatus(status:string){
  return ['disconnected','unauthorized','frozen','spamblock','proxy_error'].includes(st);
 }
 
-/** Нормализация joinStateError (битый JSON / слишком длинная строка). */
-function sanitizeJoinStateError(v:unknown):string{
- if(v==null)return '';
- if(typeof v==='object')return '';
- return String(v).slice(0,500);
-}
+/** Нормализация joinStateError — см. lib/processes/join-flow.sanitizeJoinStateError */
 
 /** Починить группы после бага set_group_join_state (Zod-объект в JSON). */
 async function healCorruptGroupJoinFields(owner:string){

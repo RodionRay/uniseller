@@ -80,6 +80,7 @@ import {
   DEFAULT_AUDIENCE_TASK,
   DEFAULT_INVITE_TASK,
   displayTgHandle,
+  normalizeStatusFilters,
   normalizeTgRef,
   parseGroupUrlLines,
   telegramMessageLink,
@@ -657,7 +658,13 @@ function WorkspaceHome(){
   const openTask=(kind:'audience_task'|'invite_task'|'mailing_task',item?:RecordItem)=>{
     setInviteWizardStep(item?2:1);
     setModal({kind,item});
-    setForm({...defaults[kind],...item?.data});
+    const data={...defaults[kind],...item?.data};
+    if(kind==='audience_task'){
+      const statusFilters=normalizeStatusFilters(data.statusFilters,data.statusFilter);
+      data.statusFilters=statusFilters;
+      data.statusFilter=statusFilters.length===1?statusFilters[0]:'all';
+    }
+    setForm(data);
     setFormError('');
   };
   const goLeads=(opts?:{groupId?:string;filter?:string})=>{
@@ -1356,6 +1363,9 @@ function WorkspaceHome(){
       if(modal.kind==='audience_task'){
         payload.url=normalizeTgRef(payload.url||'');
         payload.name=payload.name||displayTgHandle(payload.url);
+        const statusFilters=normalizeStatusFilters(payload.statusFilters,payload.statusFilter);
+        payload.statusFilters=statusFilters;
+        payload.statusFilter=statusFilters.length===1?statusFilters[0]:'all';
         if(!modal.item)payload.status=autoStartAudience?'scheduled':'draft';
         // Журнал на сервере; с формы не гоняем 100+ строк (ломало save: «Проверьте поля: log»).
         if(modal.item)delete payload.log;

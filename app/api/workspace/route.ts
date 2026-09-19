@@ -15,7 +15,7 @@ import {
 } from '@/lib/lead-core';
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew} from '@/lib/ai-keywords';
 import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasChatQuota,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isDayLimitCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
-import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
+import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeStatusFilters,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
 import {canonicalizeTgUrl,duplicateReason,isDuplicateKind,telegramEntityKey} from '@/lib/record-identity';
 import {
  DEFAULT_DM_SOFT_CLOSE,
@@ -259,6 +259,9 @@ const schemas={
   periodDays:z.coerce.number().int().min(1).max(365).default(30),
   audienceScope:z.enum(['no_admins','all']).default('no_admins'),
   premiumFilter:z.enum(['all','only','exclude']).default('all'),
+  /** Мультивыбор статусов; пусто = все. */
+  statusFilters:z.array(z.enum(['online','recently','last_week','last_month','long_ago'])).max(5).default([]),
+  /** @deprecated одиночный фильтр — нормализуем в statusFilters */
   statusFilter:z.enum(['all','online','recently','last_week','last_month','long_ago']).default('all'),
   accountIds:z.array(z.string().uuid()).min(1).max(40),
   status:z.enum(['draft','scheduled','running','paused','completed','error']).default('draft'),
@@ -2936,7 +2939,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     periodDays:data.periodDays,
     audienceScope:data.audienceScope,
     premiumFilter:data.premiumFilter,
-    statusFilter:data.statusFilter,
+    statusFilters:normalizeStatusFilters(data.statusFilters,data.statusFilter),
+    statusFilter:normalizeStatusFilters(data.statusFilters,data.statusFilter).length
+      ?normalizeStatusFilters(data.statusFilters,data.statusFilter)[0]
+      :'all',
     batchSize:80,
     cursor:data.cursor||'',
     seenIds:seenIds.slice(-5000),

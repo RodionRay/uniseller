@@ -49,6 +49,61 @@ export const USER_STATUS_FILTERS = [
 ] as const;
 export type UserStatusFilter = (typeof USER_STATUS_FILTERS)[number];
 
+/** Конкретные статусы без «все» — для мультивыбора. */
+export const USER_STATUS_OPTIONS = [
+  "online",
+  "recently",
+  "last_week",
+  "last_month",
+  "long_ago",
+] as const;
+export type UserStatusOption = (typeof USER_STATUS_OPTIONS)[number];
+
+export const USER_STATUS_OPTION_LABELS: Record<UserStatusOption, string> = {
+  online: "Онлайн",
+  recently: "Недавно",
+  last_week: "На прошлой неделе",
+  last_month: "В этом месяце",
+  long_ago: "Давно",
+};
+
+/**
+ * Нормализация фильтра статусов.
+ * Пустой массив / «all» → все статусы.
+ * Старое поле statusFilter:string тоже принимается.
+ */
+export function normalizeStatusFilters(
+  input: unknown,
+  legacySingle?: unknown,
+): UserStatusOption[] {
+  const allowed = new Set<string>(USER_STATUS_OPTIONS);
+  const fromList = (raw: unknown): UserStatusOption[] => {
+    if (!Array.isArray(raw)) return [];
+    const out: UserStatusOption[] = [];
+    for (const v of raw) {
+      const s = String(v || "");
+      if (s === "all") return [];
+      if (allowed.has(s) && !out.includes(s as UserStatusOption)) {
+        out.push(s as UserStatusOption);
+      }
+    }
+    return out;
+  };
+  const multi = fromList(input);
+  if (multi.length) return multi;
+  const single = String(legacySingle ?? "").trim();
+  if (single && single !== "all" && allowed.has(single)) {
+    return [single as UserStatusOption];
+  }
+  return [];
+}
+
+/** Подпись для UI: «Все статусы» или «Онлайн, Недавно». */
+export function statusFiltersLabel(filters: UserStatusOption[]): string {
+  if (!filters.length) return "Все статусы";
+  return filters.map((f) => USER_STATUS_OPTION_LABELS[f] || f).join(", ");
+}
+
 export const INVITE_TASK_STATUSES = [
   "draft",
   "scheduled",
@@ -317,6 +372,9 @@ export const DEFAULT_AUDIENCE_TASK = {
   periodDays: 30,
   audienceScope: "no_admins" as "no_admins" | "all",
   premiumFilter: "all" as PremiumFilter,
+  /** Пусто = все статусы; иначе мультивыбор. */
+  statusFilters: [] as UserStatusOption[],
+  /** @deprecated — совместимость со старыми задачами */
   statusFilter: "all" as UserStatusFilter,
   accountIds: [] as string[],
   status: "draft" as AudienceTaskStatus,

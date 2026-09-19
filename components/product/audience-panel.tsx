@@ -463,23 +463,82 @@ export function AudienceTaskFields({ form, setForm, accounts }: FormProps) {
           ))}
         </div>
       </div>
-      <label className="field">
-        Фильтр по статусам
-        <select
-          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
-          value={form.statusFilter || "all"}
-          onChange={(e) =>
-            setForm((f: any) => ({ ...f, statusFilter: e.target.value }))
+      <div>
+        <p className="text-sm font-medium mb-2">Фильтр по статусам</p>
+        <p className="small-note mb-2">Можно выбрать несколько. Пусто = все статусы.</p>
+        <div className="flex flex-wrap gap-2">
+          {(
+            [
+              ["online", "Онлайн"],
+              ["recently", "Недавно"],
+              ["last_week", "На прошлой неделе"],
+              ["last_month", "В этом месяце"],
+              ["long_ago", "Давно"],
+            ] as const
+          ).map(([v, label]) => {
+            const selected: string[] = Array.isArray(form.statusFilters)
+              ? form.statusFilters
+              : form.statusFilter && form.statusFilter !== "all"
+                ? [form.statusFilter]
+                : [];
+            const on = selected.includes(v);
+            return (
+              <Button
+                key={v}
+                type="button"
+                size="sm"
+                variant={on ? "default" : "outline"}
+                onClick={() =>
+                  setForm((f: any) => {
+                    const cur: string[] = Array.isArray(f.statusFilters)
+                      ? [...f.statusFilters]
+                      : f.statusFilter && f.statusFilter !== "all"
+                        ? [f.statusFilter]
+                        : [];
+                    const next = on ? cur.filter((x) => x !== v) : [...cur, v];
+                    return {
+                      ...f,
+                      statusFilters: next,
+                      statusFilter: next.length === 1 ? next[0] : next.length ? "all" : "all",
+                    };
+                  })
+                }
+              >
+                {label}
+              </Button>
+            );
+          })}
+        </div>
+        {(() => {
+          const selected: string[] = Array.isArray(form.statusFilters)
+            ? form.statusFilters
+            : form.statusFilter && form.statusFilter !== "all"
+              ? [form.statusFilter]
+              : [];
+          if (!selected.length) {
+            return <p className="small-note mt-2">Сейчас: все статусы</p>;
           }
-        >
-          <option value="all">Все статусы</option>
-          <option value="online">Онлайн</option>
-          <option value="recently">Недавно</option>
-          <option value="last_week">На прошлой неделе</option>
-          <option value="last_month">В этом месяце</option>
-          <option value="long_ago">Давно</option>
-        </select>
-      </label>
+          return (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <p className="small-note">Выбрано: {selected.length}</p>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  setForm((f: any) => ({
+                    ...f,
+                    statusFilters: [],
+                    statusFilter: "all",
+                  }))
+                }
+              >
+                Сбросить
+              </Button>
+            </div>
+          );
+        })()}
+      </div>
       <div>
         <div className="flex items-center justify-between gap-2 mb-2">
           <p className="text-sm font-medium">Рабочие аккаунты</p>

@@ -23,12 +23,14 @@ import {
  isPeerFloodMailingError,
  isPermanentMailingRecipientError,
  isRateLimitMailingError,
+ isTransientPeerResolveError,
  mailingEmptyBatchDecision,
  mailingFailText,
  mailingOkText,
  mailingTextPreview,
  normalizeMailText,
  parseMailingFloodWaitSec,
+ pickMailingSendAccountId,
  pushMailingDelivery,
  recipientKey,
  resolveSpintax,
@@ -279,6 +281,10 @@ const schemas={
   isAdmin:z.boolean().default(false),
   status:z.string().max(40).default(''),
   invited:z.boolean().default(false),
+  /** Telethon access_hash сессии, которая собирала аудиторию */
+  accessHash:z.string().max(40).default(''),
+  /** Аккаунт фермы, который видел этого пользователя */
+  collectedByAccountId:z.string().max(40).default(''),
  }),
   invite_task:z.object({
   name:z.string().max(200).default(''),
@@ -2967,6 +2973,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      isAdmin:!!u.isAdmin,
      status:String(u.status||'').slice(0,40),
      invited:false,
+     accessHash:String(u.accessHash||'').slice(0,40),
+     collectedByAccountId:accountId,
     };
     await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)').bind(crypto.randomUUID(),owner,'audience_user',JSON.stringify(userData),null,new Date().toISOString()).run();
     added++;
@@ -3726,8 +3734,6 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
 
   let accountIndex=Number(data.accountIndex)||0;
   if(accountIndex>=liveIds.length)accountIndex=0;
-  const accountId=liveIds[accountIndex%liveIds.length];
-  const accountLabel=accName(accountId);
   const prevAccountId=String(data.lastAccountId||'');
   const deliveredKeys=new Set<string>(Array.isArray(data.deliveredKeys)?data.deliveredKeys:[]);
   const deferredUntil:Record<string,string>={
@@ -3741,7 +3747,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    return Number.isFinite(t)&&t>nowMs;
   };
   const batchSize=Math.max(1,Math.min(10,Number(data.batchPerTick)||1));
-  type Cand={key:string;userId:string;username:string;leadId:string;groupUrl:string;tgMsgId:string;accessHash:string;recordId:string};
+  type Cand={
+   key:string;
+   userId:string;
+   username:string;
+   leadId:string;
+   groupUrl:string;
+   tgMsgId:string;
+   accessHash:string;
+   recordId:string;
+   preferredAccountId:string;
+  };
   const candidates:Cand[]=[];
   const sourceKind=(data.sourceKind||'audience') as MailingSourceKind;
   const deliveryMode=(data.deliveryMode||'dm') as MailingDeliveryMode;
@@ -3775,10 +3791,19 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       tgMsgId:String(L.tgMsgId||''),
       accessHash:String(L.senderAccessHash||''),
       recordId:String(r.id),
+      preferredAccountId:String(L.accountId||g?.accountId||g?.joinedAccountId||''),
      });
     }catch{/* */}
    }
   }else{
+   const audienceTaskId=String(data.audienceTaskId||'');
+   let audienceUrl='';
+   if(audienceTaskId){
+    try{
+     const trow:any=await db.prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,audienceTaskId,'audience_task').first();
+     if(trow)audienceUrl=String(JSON.parse(String(trow.data)).url||'');
+    }catch{/* */}
+   }
    const allUsers=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='audience_user'").bind(owner).all();
    for(const r of allUsers.results){
     try{
@@ -3792,10 +3817,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       userId:String(u.userId||''),
       username:String(u.username||'').replace(/^@/,''),
       leadId:'',
-      groupUrl:'',
+      groupUrl:audienceUrl,
       tgMsgId:'',
       accessHash:String(u.accessHash||u.senderAccessHash||''),
       recordId:String(r.id),
+      preferredAccountId:String(u.collectedByAccountId||''),
      });
     }catch{/* */}
    }
@@ -3832,6 +3858,14 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    return reply({ok:true,completed:true,task:next});
   }
 
+  let accountId=pickMailingSendAccountId(
+   liveIds,
+   batch.map(c=>c.preferredAccountId),
+   accountIndex,
+  );
+  if(!accountId)accountId=liveIds[accountIndex%liveIds.length];
+  let accountLabel=accName(accountId);
+
   const logEntries:{level:'info'|'ok'|'warn'|'error';text:string}[]=[
    {level:'info',text:`Работает аккаунт ${bracketLabel(accountLabel)}`},
   ];
@@ -3858,7 +3892,16 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   };
 
   try{
-   const {payload}=await loadAccountSessionPayload(owner,accountId);
+   const payloadCache=new Map<string,any>();
+   const loadPayload=async(aid:string)=>{
+    if(payloadCache.has(aid))return payloadCache.get(aid);
+    const {payload}=await loadAccountSessionPayload(owner,aid);
+    payloadCache.set(aid,payload);
+    return payload;
+   };
+   let activeAccountId=accountId;
+   let activeLabel=accountLabel;
+   let payload=await loadPayload(activeAccountId);
    let okN=0;
    let failN=0;
    let accountWentCooldown=false;
@@ -3867,6 +3910,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    let aiPoolUsed=Number(data.aiPoolUsed)||0;
    let deliveries:MailingDelivery[]=Array.isArray(data.deliveries)?[...data.deliveries]:[];
    const newKeys:string[]=[...deliveredKeys];
+   let nextAccountIndex=accountIndex;
 
    for(const cand of batch){
     let text='';
@@ -3885,7 +3929,18 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      }
     }
 
-    const result=await workerPost('/send-message',{
+    // Для DM предпочитаем слот, который видел peer (скан/сбор)
+    if(deliveryMode==='dm'){
+     const preferred=pickMailingSendAccountId(liveIds,[cand.preferredAccountId],nextAccountIndex);
+     if(preferred&&preferred!==activeAccountId){
+      activeAccountId=preferred;
+      activeLabel=accName(activeAccountId);
+      payload=await loadPayload(activeAccountId);
+      logEntries.push({level:'info',text:`Peer → аккаунт ${bracketLabel(activeLabel)}`});
+     }
+    }
+
+    let result=await workerPost('/send-message',{
      ...payload,
      mode:deliveryMode,
      text,
@@ -3899,6 +3954,28 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      // Удаление диалога ломает входящие ответы → «Переписки»
      deleteDialog:false,
     },120_000);
+
+    // Чужой access_hash → retry без hash (username/группа/кэш)
+    if(
+     !result.ok&&
+     deliveryMode==='dm'&&
+     cand.accessHash&&
+     /invalid peer|неверный peer/i.test(String(result.error||''))
+    ){
+     result=await workerPost('/send-message',{
+      ...payload,
+      mode:'dm',
+      text,
+      url:cand.groupUrl||'',
+      replyTo:'',
+      tgMsgId:cand.tgMsgId||'',
+      senderId:cand.userId||'',
+      senderUsername:cand.username||'',
+      senderAccessHash:'',
+      silent:!!data.silent,
+      deleteDialog:false,
+     },120_000);
+    }
 
     const errRaw=String(result.error||'');
     const peerFlood=
@@ -3928,9 +4005,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       aiPool.unshift(text);
       aiPoolUsed=Math.max(0,aiPoolUsed-1);
      }
-     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)}: лимит Telegram · пауза ${waitSec}с`});
+     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(activeLabel)}: лимит Telegram · пауза ${waitSec}с`});
      logEntries.push({level:'info',text:`Получатель отложен на ${Math.ceil(waitSec/60)} мин (Too many requests)`});
      // Меняем слот фермы; статус аккаунта не трогаем.
+     nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
      break;
     }
     if(accountFrozen){
@@ -3939,39 +4017,44 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       aiPool.unshift(text);
       aiPoolUsed=Math.max(0,aiPoolUsed-1);
      }
-     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} заморожен Telegram`});
-     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
+     cooldownUntil=moscowNextMidnightIso();
+     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(activeLabel)}: заморожен Telegram`});
+     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,activeAccountId,'account').first();
      if(arow){
       const adata=JSON.parse(arow.data);
       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(
-       withFrozenStatus(adata,errRaw||'Аккаунт заморожен Telegram'),
-      ),owner,accountId,'account').run();
+       withFrozenStatus(adata,errRaw.slice(0,500)||'FROZEN'),
+      ),owner,activeAccountId,'account').run();
      }
-    }else if(peerFlood){
-     cooldownUntil=cooldownHoursFromNow(24);
+     nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
+     break;
+    }
+    const banWrite=/banned from sending|chat_write_forbidden|user_banned_in_channel/i.test(errRaw);
+    if(peerFlood||banWrite){
      accountWentCooldown=true;
+     cooldownUntil=cooldownHoursFromNow(24);
      if(data.contentMode==='ai'&&text){
       aiPool.unshift(text);
       aiPoolUsed=Math.max(0,aiPoolUsed-1);
      }
-     const banWrite=/banned from sending|chat_write_forbidden|user_banned_in_channel|ограничен telegram|нельзя писать в чаты/i.test(errRaw);
-     logEntries.push({
-      level:'error',
-      text:banWrite
-       ?`Аккаунт ${bracketLabel(accountLabel)}: ограничен Telegram (бан на запись) · спамблок 24ч`
-       :`Аккаунт ${bracketLabel(accountLabel)}: спамблок`,
+     logEntries.push({level:'error',text:banWrite
+       ?`Аккаунт ${bracketLabel(activeLabel)}: ограничен Telegram (бан на запись) · спамблок 24ч`
+       :`Аккаунт ${bracketLabel(activeLabel)}: спамблок`,
      });
-     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
+     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,activeAccountId,'account').first();
      if(arow){
       const adata=JSON.parse(arow.data);
       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(
        withSpamblockStatus(adata,banWrite?'WRITE_BAN_SUPERGROUPS':(errRaw.slice(0,500)||'PEER_FLOOD')),
-      ),owner,accountId,'account').run();
+      ),owner,activeAccountId,'account').run();
      }
+     nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
+     break;
     }
 
     const link=String(result.link||'').slice(0,300);
     const messageId=String(result.messageId||'').slice(0,40);
+    const freshHash=String(result.senderAccessHash||'').slice(0,40);
     const ok=!!result.ok;
     if(ok){
      okN++;
@@ -4001,10 +4084,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
           ...L,
           replies,
           mailingTaskId:L.mailingTaskId||id,
-          accountId:L.accountId||accountId,
+          accountId:activeAccountId,
           senderId:L.senderId||cand.userId,
-          senderUsername:L.senderUsername||cand.username,
-          senderAccessHash:L.senderAccessHash||cand.accessHash||'',
+          senderUsername:L.senderUsername||cand.username||String(result.senderUsername||''),
+          senderAccessHash:freshHash||L.senderAccessHash||cand.accessHash||'',
          }),owner,cand.leadId,'lead').run();
         }
        }else{
@@ -4024,8 +4107,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
          viewedAt:'',
          excludeFromTraining:false,
          senderId:String(cand.userId||'').slice(0,40),
-         senderUsername:String(cand.username||'').slice(0,64),
-         senderAccessHash:String(cand.accessHash||'').slice(0,40),
+         senderUsername:String(cand.username||result.senderUsername||'').slice(0,64),
+         senderAccessHash:String(freshHash||cand.accessHash||'').slice(0,40),
          messageKind:'',
          peerId:String(cand.userId||'').slice(0,40),
          replyToMsgId:'',
@@ -4035,17 +4118,44 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
          incomingLastText:'',
          needsManager:false,
          mailingTaskId:id,
-         accountId,
+         accountId:activeAccountId,
         };
         await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)').bind(newId,owner,'lead',JSON.stringify(leadData),null,new Date().toISOString()).run();
         cand.leadId=newId;
+        // Обновим hash у audience_user — пригодится на повторной рассылке
+        if(cand.recordId&&freshHash){
+         try{
+          const urow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,cand.recordId,'audience_user').first();
+          if(urow){
+           const ud=JSON.parse(urow.data);
+           await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
+            ...ud,
+            accessHash:freshHash,
+            collectedByAccountId:ud.collectedByAccountId||activeAccountId,
+           }),owner,cand.recordId,'audience_user').run();
+          }
+         }catch{/* */}
+        }
        }
       }catch{/* */}
      }
+     // После успеха крутим слот (если не sticky-only)
+     nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
     }else if(rateLimited||peerFlood||accountFrozen){
      // FloodWait / spam / freeze — получателя не списываем навсегда
      if((peerFlood||accountFrozen)&&!rateLimited){
       deferredUntil[cand.key]=cooldownUntil||cooldownHoursFromNow(1);
+     }
+    }else if(isTransientPeerResolveError(errRaw)){
+     // Peer не виден этой сессии — отложить и сменить слот, НЕ снимать с очереди
+     failN++;
+     deferredUntil[cand.key]=new Date(Date.now()+3*60*1000).toISOString();
+     logEntries.push({level:'error',text:mailingFailText(cand.username,cand.userId,errRaw||'fail')});
+     logEntries.push({level:'info',text:'Peer отложен · следующий тик другим аккаунтом фермы'});
+     nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
+     if(data.contentMode==='ai'&&text){
+      aiPool.unshift(text);
+      aiPoolUsed=Math.max(0,aiPoolUsed-1);
      }
     }else{
      failN++;
@@ -4057,8 +4167,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      }
      if(isDeadAccountMailingError(errRaw)){
       accountWentCooldown=true;
-      logEntries.push({level:'warn',text:`Аккаунт ${bracketLabel(accountLabel)} недоступен: ${errRaw.slice(0,120)}`});
-      const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
+      logEntries.push({level:'warn',text:`Аккаунт ${bracketLabel(activeLabel)} недоступен: ${errRaw.slice(0,120)}`});
+      const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,activeAccountId,'account').first();
       if(arow){
        const adata=JSON.parse(arow.data);
        await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
@@ -4066,8 +4176,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
         status:'unauthorized',
         error:errRaw.slice(0,500),
         checkingAt:'',
-       }),owner,accountId,'account').run();
+       }),owner,activeAccountId,'account').run();
       }
+      nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
+      break;
      }
     }
     if(ok||(!rateLimited&&!peerFlood&&!accountFrozen)){
@@ -4077,7 +4189,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       userId:String(cand.userId||result.chatId||''),
       username:cand.username,
       leadId:cand.leadId,
-      accountId,
+      accountId:activeAccountId,
       ok,
       error:ok?'':String(result.error||'').slice(0,400),
       messageId,
@@ -4091,6 +4203,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
 
     if(accountWentCooldown)break;
    }
+
+   accountId=activeAccountId;
+   accountLabel=activeLabel;
+   accountIndex=nextAccountIndex;
 
    if(okN){
     const arow2:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
@@ -4161,7 +4277,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    }
 
    const nextLive=stillLive.length?stillLive:liveIds;
-   const nextIndex=accountWentCooldown?0:(accountIndex+1)%nextLive.length;
+   const nextIndex=accountWentCooldown?0:(accountIndex%Math.max(1,nextLive.length));
    const next=await persistMailingTask({
     sentTotal:(Number(data.sentTotal)||0)+okN,
     sentToday:sentToday+okN,

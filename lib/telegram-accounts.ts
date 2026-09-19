@@ -83,16 +83,25 @@ export function isOnCooldown(cooldownUntil?: string | null): boolean {
   return Number.isFinite(t) && t > Date.now();
 }
 
+/**
+ * Дневная отлёжка: только явный status=cooldown + живой таймер.
+ * Голый cooldownUntil (старый FloodWait/коннект) — НЕ отлёжка.
+ */
+export function isDayLimitCooldown(data: {
+  status?: string | null;
+  cooldownUntil?: string | null;
+} | null | undefined): boolean {
+  if (!data) return false;
+  return String(data.status || "") === "cooldown" && isOnCooldown(data.cooldownUntil);
+}
+
 /** Можно ли ставить в работу (рассылка / инвайт / сбор / группы). */
 export function isAccountUsable(data: {
   status?: string | null;
   cooldownUntil?: string | null;
 } | null | undefined): boolean {
   if (!data) return false;
-  if (isOnCooldown(data.cooldownUntil)) return false;
   const st = String(data.status || "");
-  // status=cooldown без актуального until — отлёжка уже прошла, слот снова живой
-  if (st === "cooldown") return true;
   if (
     [
       "spamblock",
@@ -108,8 +117,46 @@ export function isAccountUsable(data: {
   ) {
     return false;
   }
-  // active / пустой / legacy ok|connected
+  // Отлёжка только при явном status=cooldown и живом таймере (дневной лимит).
+  if (st === "cooldown") {
+    return !isOnCooldown(data.cooldownUntil);
+  }
+  // active / пустой / legacy — cooldownUntil без статуса cooldown игнорируем (старые фейлы коннекта).
   return !st || st === "active" || st === "ok" || st === "connected";
+}
+
+/**
+ * Можно ли читать входящие ЛС.
+ * spamblock/cooldown — писать нельзя, но ответы клиентов всё ещё приходят в эту сессию.
+ */
+export function canPollDmInbox(data: {
+  status?: string | null;
+} | null | undefined): boolean {
+  if (!data) return false;
+  const st = String(data.status || "");
+  if (
+    [
+      "frozen",
+      "unauthorized",
+      "disconnected",
+      "proxy_error",
+      "checking",
+      "setup",
+      "inactive",
+      "error",
+    ].includes(st)
+  ) {
+    return false;
+  }
+  // active / cooldown / spamblock / пустой / legacy
+  return (
+    !st ||
+    st === "active" ||
+    st === "ok" ||
+    st === "connected" ||
+    st === "cooldown" ||
+    st === "spamblock"
+  );
 }
 
 export function cooldownLabel(cooldownUntil?: string | null): string {
@@ -117,9 +164,143 @@ export function cooldownLabel(cooldownUntil?: string | null): string {
   return `до ${new Date(cooldownUntil!).toLocaleString("ru-RU", { timeZone: "Europe/Moscow" })} МСК`;
 }
 
-/** Авто-отлежка на N часов (как TGLab: лимит / PEER_FLOOD → 24ч). */
+/** Авто-отлежка на N часов (спамблок). */
 export function cooldownHoursFromNow(hours: number): string {
   return new Date(Date.now() + hours * 3600_000).toISOString();
+}
+
+export type DayLimitKind = "invite" | "message" | "chat" | "memberInvite";
+
+const DAY_LIMIT_LABELS: Record<DayLimitKind, string> = {
+  invite: "вступлений",
+  message: "сообщений (рассылка/ЛС)",
+  chat: "комментариев",
+  memberInvite: "инвайтов участников",
+};
+
+/**
+ * Отлёжка только по правилам продукта:
+ * — дневной лимит (до полуночи МСК);
+ * — spamblock / PEER_FLOOD;
+ * — заморозка Telegram.
+ * FloodWait и ошибка коннекта/прокси — НЕ отлёжка.
+ */
+export function withDayLimitCooldown<T extends Record<string, unknown>>(
+  data: T,
+  kind: DayLimitKind,
+): T & {
+  status: "cooldown";
+  cooldownUntil: string;
+  cooldownReason: string;
+  error: string;
+} {
+  return {
+    ...data,
+    status: "cooldown",
+    cooldownUntil: moscowNextMidnightIso(),
+    cooldownReason: `day_${kind}`,
+    error: `Дневной лимит ${DAY_LIMIT_LABELS[kind]} исчерпан — до полуночи МСК`,
+  };
+}
+
+export function withSpamblockStatus<T extends Record<string, unknown>>(
+  data: T,
+  error = "PEER_FLOOD",
+): T & {
+  status: "spamblock";
+  cooldownUntil: string;
+  cooldownReason: string;
+  error: string;
+} {
+  return {
+    ...data,
+    status: "spamblock",
+    cooldownUntil: cooldownHoursFromNow(24),
+    cooldownReason: "spamblock",
+    error: String(error || "PEER_FLOOD").slice(0, 500),
+  };
+}
+
+export function withFrozenStatus<T extends Record<string, unknown>>(
+  data: T,
+  error = "Аккаунт заморожен Telegram",
+): T & {
+  status: "frozen";
+  cooldownUntil: string;
+  cooldownReason: string;
+  error: string;
+} {
+  return {
+    ...data,
+    status: "frozen",
+    // Заморозка — не таймер отлёжки; статус frozen достаточно для блокировки.
+    cooldownUntil: "",
+    cooldownReason: "frozen",
+    error: String(error || "Аккаунт заморожен Telegram").slice(0, 500),
+  };
+}
+
+export function hasChatQuota(data: {
+  limits?: { chat?: unknown };
+  chatsToday?: number;
+  chatsDay?: string;
+} | null | undefined): boolean {
+  if (!data) return false;
+  return hasDayQuota(
+    dayCounter(data.chatsDay, data.chatsToday),
+    data.limits?.chat ?? DEFAULT_ACCOUNT_LIMITS.chat,
+  );
+}
+
+export function bumpChatCounters<T extends Record<string, unknown>>(
+  data: T,
+  n = 1,
+): T & { chatsDay: string; chatsToday: number } {
+  const day = moscowDayKey();
+  const prev = (data as { chatsDay?: string; chatsToday?: number }).chatsDay === day
+    ? Number((data as { chatsToday?: number }).chatsToday) || 0
+    : 0;
+  return {
+    ...data,
+    chatsDay: day,
+    chatsToday: prev + Math.max(0, n),
+  };
+}
+
+/** Если после операции дневной лимит кончился — увести в отлёжку до полуночи. */
+export function applyQuotaCooldownIfExhausted<T extends Record<string, unknown>>(
+  data: T,
+): T {
+  const st = String((data as { status?: string }).status || "");
+  if (st === "spamblock" || st === "frozen") return data;
+  if (isDayLimitCooldown(data as { status?: string; cooldownUntil?: string })) {
+    return data;
+  }
+
+  if (!hasInviteQuota(data as Parameters<typeof hasInviteQuota>[0])) {
+    return withDayLimitCooldown(data, "invite");
+  }
+  if (!hasMessageQuota(data as Parameters<typeof hasMessageQuota>[0])) {
+    return withDayLimitCooldown(data, "message");
+  }
+  if (!hasMemberInviteQuota(data as Parameters<typeof hasMemberInviteQuota>[0])) {
+    return withDayLimitCooldown(data, "memberInvite");
+  }
+  if (!hasChatQuota(data as Parameters<typeof hasChatQuota>[0])) {
+    return withDayLimitCooldown(data, "chat");
+  }
+  // Сброс «осиротевшего» таймера от старых FloodWait/коннект-фейлов.
+  if (
+    st !== "cooldown" &&
+    isOnCooldown(String((data as { cooldownUntil?: string }).cooldownUntil || ""))
+  ) {
+    return {
+      ...data,
+      cooldownUntil: "",
+      cooldownReason: "",
+    };
+  }
+  return data;
 }
 
 /** Пауза между вступлениями в группы (антибан). */
@@ -245,6 +426,145 @@ export function normalizeJoinsToday(state: JoinPaceState): number {
   const day = moscowDayKey();
   if (state.joinsDay !== day) return 0;
   return Math.max(0, Number(state.joinsToday) || 0);
+}
+
+export function normalizeMessagesToday(data: {
+  messagesToday?: number;
+  messagesDay?: string;
+} | null | undefined): number {
+  if (!data) return 0;
+  return dayCounter(data.messagesDay, data.messagesToday);
+}
+
+export function normalizeMemberInvitesToday(data: {
+  memberInvitesToday?: number;
+  memberInviteDay?: string;
+} | null | undefined): number {
+  if (!data) return 0;
+  return dayCounter(data.memberInviteDay, data.memberInvitesToday);
+}
+
+export type AccountLimitsUsage = {
+  joins: number;
+  messages: number;
+  memberInvites: number;
+  inviteLimit: number;
+  messageLimit: number;
+  chatLimit: number;
+  memberInviteLimit: number;
+};
+
+/** Суточные счётчики и лимиты для UI менеджера аккаунтов. */
+export function accountLimitsUsage(data: {
+  limits?: {
+    invite?: unknown;
+    message?: unknown;
+    chat?: unknown;
+    memberInvite?: unknown;
+  };
+  joinsToday?: number;
+  joinsDay?: string;
+  messagesToday?: number;
+  messagesDay?: string;
+  memberInvitesToday?: number;
+  memberInviteDay?: string;
+} | null | undefined): AccountLimitsUsage {
+  const limits = data?.limits || {};
+  const inviteLimit = Number(limits.invite);
+  const messageLimit = Number(limits.message);
+  const chatLimit = Number(limits.chat);
+  const memberInviteLimit = Number(limits.memberInvite);
+  return {
+    joins: normalizeJoinsToday(data || {}),
+    messages: normalizeMessagesToday(data),
+    memberInvites: normalizeMemberInvitesToday(data),
+    inviteLimit: Number.isFinite(inviteLimit) ? inviteLimit : DEFAULT_ACCOUNT_LIMITS.invite,
+    messageLimit: Number.isFinite(messageLimit)
+      ? messageLimit
+      : DEFAULT_ACCOUNT_LIMITS.message,
+    chatLimit: Number.isFinite(chatLimit) ? chatLimit : DEFAULT_ACCOUNT_LIMITS.chat,
+    memberInviteLimit: Number.isFinite(memberInviteLimit) ? memberInviteLimit : 40,
+  };
+}
+
+/** Короткий хвост отлёжки: «5 часов», «40 мин»; пусто если нет. */
+export function cooldownRemainingShort(
+  cooldownUntil?: string | null,
+  now = Date.now(),
+): string {
+  if (!cooldownUntil) return "";
+  const t = Date.parse(cooldownUntil);
+  if (!Number.isFinite(t) || t <= now) return "";
+  const mins = Math.max(1, Math.round((t - now) / 60_000));
+  if (mins < 60) return `${mins} мин`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} ${hours === 1 ? "час" : hours < 5 ? "часа" : "часов"}`;
+  const days = Math.round(hours / 24);
+  return `${days} ${days === 1 ? "день" : days < 5 ? "дня" : "дней"}`;
+}
+
+/** Относительное «обновлено»: «39 минут назад». */
+export function relativeTimeRu(iso?: string | null, now = Date.now()): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "—";
+  const sec = Math.max(0, Math.round((now - t) / 1000));
+  if (sec < 45) return "только что";
+  const mins = Math.round(sec / 60);
+  if (mins < 60) {
+    return `${mins} ${mins === 1 ? "минуту" : mins < 5 ? "минуты" : "минут"} назад`;
+  }
+  const hours = Math.round(mins / 60);
+  if (hours < 24) {
+    return `${hours} ${hours === 1 ? "час" : hours < 5 ? "часа" : "часов"} назад`;
+  }
+  const days = Math.round(hours / 24);
+  if (days < 14) {
+    return `${days} ${days === 1 ? "день" : days < 5 ? "дня" : "дней"} назад`;
+  }
+  return new Date(t).toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Лучшая метка «обновлено» для строки аккаунта. */
+export function accountUpdatedAt(data: {
+  checkingAt?: string;
+  lastJoinAt?: string;
+  lastChecked?: string;
+} | null | undefined, created?: string): string {
+  const candidates = [
+    data?.checkingAt,
+    data?.lastChecked,
+    data?.lastJoinAt,
+    created,
+  ].filter(Boolean) as string[];
+  if (!candidates.length) return "";
+  return candidates.reduce((best, cur) =>
+    Date.parse(cur) > Date.parse(best) ? cur : best,
+  );
+}
+
+const AVATAR_PALETTE = [
+  "#eab308",
+  "#22c55e",
+  "#84cc16",
+  "#ef4444",
+  "#15803d",
+  "#3b82f6",
+  "#a855f7",
+  "#f97316",
+  "#06b6d4",
+  "#ec4899",
+];
+
+export function accountAvatarColor(seed: string): string {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return AVATAR_PALETTE[h % AVATAR_PALETTE.length]!;
 }
 
 export function bumpJoinCounters(state: JoinPaceState): JoinPaceState {

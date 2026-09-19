@@ -158,14 +158,31 @@ export const DEFAULT_MAILING_TASK = {
   tickLockUntil: "",
 };
 
-export function mailingOkText(username: string, userId: string, link: string): string {
+/** Короткое превью текста для лога / доставок. */
+export function mailingTextPreview(text: string, max = 80): string {
+  const s = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s) return "";
+  if (s.length <= max) return s;
+  return `${s.slice(0, Math.max(1, max - 1))}…`;
+}
+
+export function mailingOkText(
+  username: string,
+  userId: string,
+  link: string,
+  textPreview?: string,
+): string {
   const label = username
     ? `@${username.replace(/^@/, "")}`
     : userId
       ? `id${userId}`
       : "получатель";
-  if (link) return `Доставлено ${label} · ${link}`;
-  return `Доставлено ${label}`;
+  const base = link ? `Доставлено ${label} · ${link}` : `Доставлено ${label}`;
+  const preview = mailingTextPreview(textPreview || "", 80);
+  if (preview) return `${base} · «${preview}»`;
+  return base;
 }
 
 export function mailingFailText(username: string, userId: string, error: string): string {
@@ -182,27 +199,82 @@ export function mailingFailText(username: string, userId: string, error: string)
     return `${label}: лимит Telegram (Too many requests)`;
   }
   if (
+    e.includes("banned from sending") ||
+    e.includes("chat_write_forbidden") ||
+    e.includes("user_banned_in_channel") ||
+    e.includes("ограничен telegram")
+  ) {
+    return `${label}: аккаунт ограничен Telegram (бан на запись в чаты) — смените слот фермы`;
+  }
+  if (e.includes("каналом/чатом") || e.includes("не пользователем")) {
+    return `${label}: это канал/чат, не человек — нужен @username пользователя`;
+  }
+  if (
+    e.includes("could not find the input entity") ||
+    e.includes("cannot find any entity") ||
+    e.includes("нет access_hash") ||
+    e.includes("не удалось открыть пользователя")
+  ) {
+    return `${label}: Telegram не видит пользователя (нет access_hash). Нужен @username или аккаунт из той же группы`;
+  }
+  if (
     e.includes("no user has") ||
     e.includes("username_not_occupied") ||
     e.includes("username_invalid") ||
-    e.includes("nobody is using this username")
+    e.includes("nobody is using this username") ||
+    (e.includes("username @") && e.includes("не существует"))
   ) {
     return `${label}: username не существует`;
   }
   return `Ошибка ${label}: ${String(error || "fail").slice(0, 100)}`;
 }
 
+/** PEER_FLOOD / spamblock / write-ban — не путать с FloodWait (временный лимит). */
+export function isPeerFloodMailingError(error: string): boolean {
+  const e = String(error || "").toLowerCase();
+  return (
+    e.includes("peer_flood") ||
+    e.includes("spamblock") ||
+    e.includes("banned from sending") ||
+    e.includes("chat_write_forbidden") ||
+    e.includes("user_banned_in_channel") ||
+    e.includes("ограничен telegram") ||
+    e.includes("нельзя писать в чаты")
+  );
+}
+
 /** Flood / Too many requests — отлёжка аккаунта + отложить получателя. */
 export function isRateLimitMailingError(error: string): boolean {
   const e = String(error || "").toLowerCase();
+  // PEER_FLOOD содержит «flood», но это спамблок, не FloodWait.
+  if (isPeerFloodMailingError(e)) return false;
   return (
     e.includes("too many requests") ||
     e.includes("floodwait") ||
     e.includes("flood_wait") ||
-    e.includes("flood") ||
+    (e.includes("flood") && !e.includes("peer_flood")) ||
     e.includes("slowmode") ||
     /\bwait\s*\d+\s*s/.test(e)
   );
+}
+
+/** Если очередь пуста только из‑за отложенных — ждать, а не «Готово». */
+export function mailingEmptyBatchDecision(
+  deferredUntil: Record<string, string> | undefined,
+  nowMs = Date.now(),
+): { action: "complete" } | { action: "wait"; nextAt: string; waitSec: number } {
+  let nextAt = "";
+  let waitSec = 0;
+  for (const v of Object.values(deferredUntil || {})) {
+    const t = Date.parse(String(v || ""));
+    if (!Number.isFinite(t) || t <= nowMs) continue;
+    if (!nextAt || t < Date.parse(nextAt)) {
+      nextAt = new Date(t).toISOString();
+      waitSec = Math.max(60, Math.ceil((t - nowMs) / 1000));
+    }
+  }
+  if (nextAt) return { action: "wait", nextAt, waitSec };
+  return { action: "complete" };
 }
 
 /** Секунды паузы из текста ошибки или дефолт. */
@@ -235,6 +307,11 @@ export function isPermanentMailingRecipientError(error: string): boolean {
     e.includes("peer_id_invalid") ||
     e.includes("could not find the input entity") ||
     e.includes("cannot find any entity") ||
+    e.includes("нет access_hash") ||
+    e.includes("не удалось открыть пользователя") ||
+    e.includes("каналом/чатом") ||
+    e.includes("не пользователем") ||
+    e.includes("это бот") ||
     e.includes("no such user") ||
     e.includes("user not found")
   );

@@ -1,7 +1,7 @@
 "use client";
 import {useState,useEffect,useCallback,useRef,useMemo,Suspense} from 'react';
 import {useSearchParams} from 'next/navigation';
-import {Users,Radio,Shield,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge} from 'lucide-react';
+import {Users,Radio,Shield,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge,AlertTriangle,BarChart3,Folder,CircleX} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {OverviewDashboard} from '@/components/product/overview-dashboard';
 import {LeadCorePanel} from '@/components/product/lead-core-panel';
@@ -39,12 +39,18 @@ import {
   TELEGRAM_RECOMMENDED_LIMITS,
   JOIN_GAP_DEFAULT_SEC,
   PROXY_STATUS_LABELS,
+  accountAvatarColor,
+  accountLimitsUsage,
   accountStatusTone,
+  accountUpdatedAt,
   cooldownHoursFromNow,
   cooldownLabel,
+  cooldownRemainingShort,
   generateTelegramUsername,
   isAccountUsable,
   isOnCooldown,
+  moscowNextMidnightIso,
+  relativeTimeRu,
   type AccountStatus,
   type SessionMode,
 } from '@/lib/telegram-accounts';
@@ -54,6 +60,7 @@ import {
   MARKET_SECTIONS,
   catalogStats,
   isCatalogPlaceholderUrl,
+  marketVerifiedCount,
   nichesFromProjectText,
   searchGroupCatalog,
   type CatalogHit,
@@ -91,7 +98,7 @@ const defaults:any={
   account:{name:'',phone:'',proxyId:'',status:'setup',format:'manual',sessionMode:'keep',limits:{...DEFAULT_ACCOUNT_LIMITS,memberInvite:40},cooldownUntil:'',firstName:'',lastName:'',username:'',about:'',hasPhoto:false,error:''},
   proxy:{name:'',host:'',port:'1080',protocol:'socks5',username:'',status:'inactive',exitIp:'',lastChecked:'',checkError:''},
   group:{name:'',url:'',accountId:'',status:'setup',error:'',membership:'none',joinedAt:'',joinState:'',joinStateAt:'',joinStateError:'',leadsTotal:0,leadsHot:0,leadsWarm:0,leadsCold:0,scanMatched:0,rating:0,lastScanned:'',scanLog:[]},
-  lead:{name:'',message:'',source:'Вручную',status:'new',temperature:'warm',draft:'',tgMsgId:'',groupId:'',reason:'',viewed:false,viewedAt:'',excludeFromTraining:false,senderId:'',senderUsername:'',messageKind:'',peerId:'',replyToMsgId:'',replies:[],conversationOpen:false,conversationAt:'',incomingLastText:'',needsManager:false,mailingTaskId:'',accountId:''},
+  lead:{name:'',message:'',source:'Вручную',status:'new',temperature:'warm',draft:'',tgMsgId:'',groupId:'',reason:'',viewed:false,viewedAt:'',excludeFromTraining:false,senderId:'',senderUsername:'',senderAccessHash:'',messageKind:'',peerId:'',replyToMsgId:'',replies:[],conversationOpen:false,conversationAt:'',incomingLastText:'',needsManager:false,mailingTaskId:'',accountId:''},
   settings:{
     name:'Мой бизнес',
     model:'deepseek-chat',
@@ -133,7 +140,7 @@ AI будет использовать этот текст для отбора �
   invite_task:{...DEFAULT_INVITE_TASK},
   mailing_task:{...DEFAULT_MAILING_TASK},
 };
-const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов и черновики: менеджер подключается здесь. Уведомление уходит в Telegram-бота.','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Импорт tdata/session, статусы, лимиты и отлежка.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
+const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов и черновики: менеджер подключается здесь. Уведомление уходит в Telegram-бота.','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
 
 async function api(body?:unknown){
   const r=await fetch('/api/workspace',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});
@@ -145,6 +152,21 @@ async function api(body?:unknown){
     throw err;
   }
   return data;
+}
+
+/** Чистый payload группы: не тащим битый joinStateError из records в save. */
+function cleanGroupSaveData(data:Record<string,unknown>){
+  const err=data.joinStateError;
+  const joinStateError=
+    err==null||typeof err==='object'?'':String(err).slice(0,500);
+  const joinState=String(data.joinState||'');
+  const okState=['','queued','waiting','joining','scanning'].includes(joinState)?joinState:'';
+  return{
+    ...data,
+    joinState:okState,
+    joinStateAt:okState?String(data.joinStateAt||''):'',
+    joinStateError,
+  };
 }
 
 function sleep(ms:number){return new Promise(r=>setTimeout(r,ms))}
@@ -354,12 +376,77 @@ function statusBadge(status:string,kind?:Kind){
 }
 
 function accountRowStatus(data:any){
-  if(isOnCooldown(data.cooldownUntil))return 'cooldown';
+  // Отлёжка в UI — только status=cooldown (дневной лимит) или spamblock/frozen.
+  if(data.status==='spamblock')return 'spamblock';
+  if(data.status==='frozen')return 'frozen';
+  if(data.status==='cooldown'&&isOnCooldown(data.cooldownUntil))return 'cooldown';
+  if(data.status==='cooldown'&&!isOnCooldown(data.cooldownUntil))return 'active';
   return data.status||'setup';
 }
 
 function isAccountWorkable(data:any){
   return isAccountUsable(data);
+}
+
+function accountDisplayName(data:any){
+  const full=[data.firstName,data.lastName].filter(Boolean).join(' ').trim();
+  return full||String(data.name||'').trim()||'Без имени';
+}
+
+function accountIdentityLine(data:any,id:string){
+  if(data.username)return `@${String(data.username).replace(/^@/,'')}`;
+  if(data.phone)return String(data.phone).replace(/\D/g,'')||data.phone;
+  return id.replace(/-/g,'').slice(0,12);
+}
+
+function AccountStatusCell({status,error,cooldownUntil}:{status:string;error?:string;cooldownUntil?:string}){
+  const tone=accountStatusTone(status);
+  const label=ACCOUNT_STATUS_LABELS[status as AccountStatus]||status;
+  const Icon=
+    status==='active'?Check:
+    status==='spamblock'||status==='frozen'?AlertTriangle:
+    status==='checking'?Loader2:
+    status==='cooldown'?Timer:
+    status==='disconnected'||status==='unauthorized'||status==='proxy_error'?CircleX:
+    status==='setup'?Plug:AlertTriangle;
+  const sub=
+    status==='spamblock'&&error?.includes('PEER_FLOOD')?'PEER_FLOOD':
+    status==='spamblock'&&isOnCooldown(cooldownUntil)?cooldownRemainingShort(cooldownUntil):
+    status==='spamblock'?'Требуется проверка':
+    status==='setup'?'Нужна сессия':
+    status==='checking'?'Идёт проверка…':
+    status==='cooldown'?cooldownRemainingShort(cooldownUntil)||cooldownLabel(cooldownUntil):
+    error?String(error).slice(0,80):'';
+  return (
+    <div className={`acc-status acc-status-${tone}`}>
+      <span className={`acc-status-icon ${status==='checking'?'is-spin':''}`} aria-hidden>
+        <Icon size={14}/>
+      </span>
+      <div className="acc-status-text">
+        <strong>{label}</strong>
+        {sub?<span title={error||sub}>{sub}</span>:null}
+      </div>
+    </div>
+  );
+}
+
+function AccountLimitsCell({data}:{data:any}){
+  const u=accountLimitsUsage(data);
+  const fmt=(used:number,limit:number)=>limit>0?`${used}/${limit}`:`${used}/∞`;
+  const over=(used:number,limit:number)=>limit>0&&used>=limit;
+  return (
+    <div className="acc-limits" title={`Сброс лимитов: ${new Date(moscowNextMidnightIso()).toLocaleString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})} МСК`}>
+      <span className={over(u.joins,u.inviteLimit)?'is-over':''} title="Вступления в группы">
+        <UserPlus size={13}/><em>{fmt(u.joins,u.inviteLimit)}</em>
+      </span>
+      <span className={over(u.messages,u.messageLimit)?'is-over':''} title="Личные сообщения">
+        <Send size={13}/><em>{fmt(u.messages,u.messageLimit)}</em>
+      </span>
+      <span className={over(u.memberInvites,u.memberInviteLimit)?'is-over':''} title="Инвайты людей · чат-лимит">
+        <MessageSquare size={13}/><em>{fmt(u.memberInvites,u.memberInviteLimit||u.chatLimit)}</em>
+      </span>
+    </div>
+  );
 }
 
 function WorkspaceHome(){
@@ -385,7 +472,7 @@ function WorkspaceHome(){
   const [catalogSelected,setCatalogSelected]=useState<string[]>([]);
   const [catalogAccountId,setCatalogAccountId]=useState('');
   const [catalogHideAdded,setCatalogHideAdded]=useState(true);
-  const [catalogMarket,setCatalogMarket]=useState<string>('mp');
+  const [catalogMarket,setCatalogMarket]=useState<string>('all');
   const [catalogTab,setCatalogTab]=useState<'links'|'topics'>('links');
   const [catalogSearching,setCatalogSearching]=useState(false);
   const [catalogHits,setCatalogHits]=useState<CatalogHit[]>([]);
@@ -530,8 +617,9 @@ function WorkspaceHome(){
 
   async function persistJoinState(id:string,joinState:''|'queued'|'waiting'|'joining'|'scanning',joinStateError=''){
     const joinStateAt=joinState?new Date().toISOString():'';
-    patchGroupLocal(id,{joinState,joinStateAt,joinStateError});
-    try{await api({action:'set_group_join_state',id,joinState,joinStateError})}catch{/* сеть — UI уже обновлён */}
+    const err=String(joinStateError||'').slice(0,500);
+    patchGroupLocal(id,{joinState,joinStateAt,joinStateError:err});
+    try{await api({action:'set_group_join_state',id,joinState,joinStateError:err})}catch{/* сеть — UI уже обновлён */}
   }
 
   function setJoinQueueSync(updater:(prev:JoinQItem[])=>JoinQItem[]){
@@ -648,7 +736,7 @@ function WorkspaceHome(){
     const mailingBusy=list('mailing_task').filter(r=>r.data.status==='running'||r.data.status==='scheduled'||r.data.status==='error').length;
     const accounts=list('account').filter(r=>{
       const st=String(r.data.status||'');
-      return PROBLEM_ACCOUNT.has(st)||isOnCooldown(r.data.cooldownUntil);
+      return PROBLEM_ACCOUNT.has(st);
     }).length;
     const proxies=list('proxy').filter(r=>r.data.status!=='active').length;
     const badges:Partial<Record<NavName,number>>={
@@ -728,7 +816,7 @@ function WorkspaceHome(){
         }
         }
         try{
-          if(Date.now()-lastInboxPollAt.current>40_000){
+          if(Date.now()-lastInboxPollAt.current>15_000){
             lastInboxPollAt.current=Date.now();
             const inbox=await api({action:'poll_dm_replies'});
             if(inbox?.opened>0){
@@ -924,16 +1012,36 @@ function WorkspaceHome(){
   /** Фоновая очередь: вступление → холд → скан. Состояние в БД (переживает F5). */
   async function startBackgroundJoins(items:{id:string;name:string}[],opts?:{resume?:boolean}){
     if(!items.length)return;
+    try{await api({action:'heal_group_join_state'})}catch{/* */}
     if(!telegramConnected){
       toast.error('Запустите: npm run tg:worker');
       return;
     }
-    let toAdd=items.filter(i=>i.id);
+    let toAdd=items.filter(i=>{
+      if(!i.id)return false;
+      const g=list('group').find(x=>x.id===i.id)||records.find(x=>x.id===i.id);
+      if(g&&groupAlreadyIn(g)){
+        if(String(g.data.joinState||'')){
+          patchGroupLocal(g.id,{joinState:'',joinStateAt:'',joinStateError:''});
+          void persistJoinState(g.id,'');
+        }
+        return false;
+      }
+      return true;
+    });
+    if(!toAdd.length){
+      if(!opts?.resume)toast.message('Эти группы уже покрыты — вступление не нужно');
+      return;
+    }
     if(!opts?.resume){
       try{
         const enq=await api({action:'enqueue_joins',groupIds:toAdd.map(i=>i.id)});
-        if(Array.isArray(enq.items)&&enq.items.length){
+        if(Array.isArray(enq.items)){
           toAdd=enq.items.map((i:{id:string;name:string})=>({id:i.id,name:i.name||'Группа'}));
+          if(!toAdd.length){
+            toast.message('Эти группы уже покрыты — вступление не нужно');
+            return;
+          }
         }
       }catch(e){
         toast.error((e as Error).message||'Не удалось поставить в очередь');
@@ -975,9 +1083,17 @@ function WorkspaceHome(){
         saveJoinQueue(joinQueueRef.current,joinWorkRef.current);
         try{
           const cur=list('group').find(x=>x.id===g.id)||records.find(x=>x.id===g.id);
-          if(cur?.data?.membership==='joined'||cur?.data?.membership==='pending'||cur?.data?.joinedAt){
-            patchGroupLocal(g.id,{joinState:'',joinStateAt:'',joinStateError:'',membership:cur.data.membership==='pending'?'pending':'joined',status:cur.data.membership==='pending'?'pending':'active'});
-            setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:'Уже на аккаунте смеси'}:q));
+          if(cur&&groupAlreadyIn(cur)){
+            const pending=cur.data.membership==='pending'||cur.data.status==='pending';
+            patchGroupLocal(g.id,{
+              joinState:'',
+              joinStateAt:'',
+              joinStateError:'',
+              membership:pending?'pending':'joined',
+              status:pending?'pending':'active',
+              joinedAt:cur.data.joinedAt||new Date().toISOString(),
+            });
+            setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:'Уже в группе'}:q));
             void persistJoinState(g.id,'');
             onboarded++;
             continue;
@@ -1008,10 +1124,24 @@ function WorkspaceHome(){
             try{
               scan=await scanAfterJoin(g.id,g.name);
             }catch(scanErr){
+              const scanData=(scanErr as Error & {data?:any})?.data;
+              // Soft need_join после успешного join: membership сохраняем, не в авто-rejoin
+              const keepJoined=!!scanData?.soft||!!scanData?.preserved||!!scanData?.needJoin;
               void persistJoinState(g.id,'');
+              if(keepJoined){
+                patchGroupLocal(g.id,{
+                  status:'active',
+                  membership:'joined',
+                  joinedAt:new Date().toISOString(),
+                  joinState:'',
+                  joinStateAt:'',
+                  joinStateError:'',
+                  error:'',
+                });
+              }
               setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
               toast.message(`${g.name}: вступили, скан подхватит автообход`);
-              autoRescanPending.current=true;
+              // Не ставим autoRescanPending→rejoin: иначе снова в очередь
               onboarded++;
               await refresh();
               continue;
@@ -1099,8 +1229,16 @@ function WorkspaceHome(){
   useEffect(()=>{
     if(loading||joinResumeDone.current||joinRunnerLock.current)return;
     const fromDb=records
-      .filter(r=>r.kind==='group'&&JOIN_ACTIVE_STATES.has(String(r.data.joinState||'')))
+      .filter(r=>r.kind==='group'&&JOIN_ACTIVE_STATES.has(String(r.data.joinState||''))&&!groupAlreadyIn(r))
       .map(r=>({id:r.id,name:String(r.data.name||'Группа')}));
+    // Сбросить залипший joinState у уже вступивших (иначе UI крутит «В очереди»)
+    for(const r of records){
+      if(r.kind!=='group')continue;
+      if(!JOIN_ACTIVE_STATES.has(String(r.data.joinState||'')))continue;
+      if(!groupAlreadyIn(r))continue;
+      patchGroupLocal(r.id,{joinState:'',joinStateAt:'',joinStateError:''});
+      void persistJoinState(r.id,'');
+    }
     const saved=loadJoinQueue();
     const fromLs=saved.work.length
       ?saved.work
@@ -1406,6 +1544,7 @@ function WorkspaceHome(){
         const r=await api({action:'scan_group',id,force:!!opts?.force});
         if(r.skipped)continue;
         if(r.rejoinItem?.id){
+          if(r.soft||r.preserved)continue;
           rejoin.push({id:r.rejoinItem.id,name:r.rejoinItem.name||'Группа'});
           continue;
         }
@@ -1414,6 +1553,8 @@ function WorkspaceHome(){
       }catch(err){
         const data=(err as any)?.data;
         if(data?.rejoinItem?.id){
+          // Soft/preserved — не перекидываем в очередь вступлений
+          if(data?.soft||data?.preserved)continue;
           rejoin.push({id:data.rejoinItem.id,name:data.rejoinItem.name||'Группа'});
           continue;
         }
@@ -1770,7 +1911,8 @@ function WorkspaceHome(){
         ...defaults.account,
         ...item.data,
         cooldownUntil:hours===null?'':cooldownHoursFromNow(hours),
-        status:hours===null?(item.data.status==='cooldown'?'active':item.data.status):'cooldown',
+        cooldownReason:hours===null?'':(item.data.cooldownReason||'manual'),
+        status:hours===null?(item.data.status==='cooldown'||item.data.status==='spamblock'?'active':item.data.status):'cooldown',
         error:hours===null&&(item.data.error==='PEER_FLOOD'||/too many requests/i.test(String(item.data.error||'')))?'':item.data.error,
       };
       await api({action:'save',kind:'account',id:item.id,data});
@@ -1796,7 +1938,8 @@ function WorkspaceHome(){
             ...defaults.account,
             ...item.data,
             cooldownUntil:hours===null?'':cooldownHoursFromNow(hours),
-            status:hours===null?(item.data.status==='cooldown'?'active':item.data.status):'cooldown',
+            cooldownReason:hours===null?'':(item.data.cooldownReason||'manual'),
+            status:hours===null?(item.data.status==='cooldown'||item.data.status==='spamblock'?'active':item.data.status):'cooldown',
             error:hours===null?'':item.data.error,
           };
           await api({action:'save',kind:'account',id:item.id,data});
@@ -1992,7 +2135,8 @@ function WorkspaceHome(){
         const st=result?.status||'disconnected';
         const proxyNote=result?.proxyRotated?' · прокси сменён':'';
         if(st==='active')toast.success(`Активен · ${result?.profile?.username? '@'+result.profile.username : item.data.phone}${proxyNote}${result?.sessionRefreshed?' · сессия обновлена':''}`);
-        else if(st==='cooldown')toast.message(`Отлёжка после неудачных попыток${proxyNote}. Проверьте прокси.`);
+        else if(st==='cooldown')toast.message(`Отлёжка по лимиту / спамблоку${proxyNote}`);
+        else if(st==='disconnected'||st==='proxy_error')toast.error(`Не удалось подключить${proxyNote}. Проверьте прокси и сессию.`);
         else if(st==='unauthorized')toast.error(`Сессия недействительна — загрузите свежий tdata/session${proxyNote}`);
         else toast.error((ACCOUNT_STATUS_LABELS[st as AccountStatus]||st)+(result?.error?`: ${String(result.error).slice(0,120)}`:'')+proxyNote);
       }
@@ -2099,7 +2243,7 @@ function WorkspaceHome(){
       try{
         if(!id){
           const g=list('group').find(x=>x.id===accountPicker.groupId);
-          if(g)await api({action:'save',kind:'group',id:g.id,data:{...g.data,accountId:''}});
+          if(g)await api({action:'save',kind:'group',id:g.id,data:cleanGroupSaveData({...g.data,accountId:''})});
         }else{
           await api({action:'assign_group_accounts',mode:'single',groupIds:[accountPicker.groupId],accountIds:[id]});
         }
@@ -2179,32 +2323,37 @@ function WorkspaceHome(){
     }finally{setBusy(false)}
   }
 
-  function openCatalog(){
-    const s=list('settings')[0]?.data||defaults.settings;
-    const auto=nichesFromProjectText(s.product,s.audience,s.keywords,s.leadCriteria,s.name,s.pains,s.valueProps,s.hotSignals);
-    let marketId='mp';
-    let niche:GroupNiche|null=auto[0]||null;
-    if(auto.length){
-      let best={id:'mp',score:0};
-      for(const m of MARKET_SECTIONS){
-        const score=m.niches.filter(n=>auto.includes(n)).length;
-        if(score>best.score)best={id:m.id,score};
-      }
-      marketId=best.id;
-      const section=MARKET_SECTIONS.find(m=>m.id===marketId)!;
-      niche=section.niches.find(n=>auto.includes(n))||section.niches[0]||null;
-    }else{
-      niche=MARKET_SECTIONS.find(m=>m.id===marketId)?.niches[0]||null;
-    }
+  function openCatalog(preferredMarket?:string){
+    // Полная база / «В базе» — без сужения AI в «Маркетплейсы».
+    const hasDb=list('group').length>0;
+    const marketId=preferredMarket||(hasDb?'db':'all');
     setCatalogMarket(marketId);
-    setCatalogNiche(niche);
-    setCatalogHideAdded(true);
+    setCatalogNiche(null);
+    setCatalogHideAdded(false);
     setCatalogTab('links');
     setCatalogQuery('');
     setCatalogSelected([]);
     setCatalogAccountId(list('account').filter(a=>isAccountWorkable(a.data))[0]?.id||'');
     setCatalogOpen(true);
+    setCatalogSearching(true);
     setCatalogSearchTick(t=>t+1);
+  }
+
+  /** Одним запросом залить весь каталог в «Группы и каналы» текущего кабинета. */
+  async function importFullCatalogToDb(){
+    setBusy(true);
+    try{
+      const accountId=catalogAccountId||list('account').filter(a=>isAccountWorkable(a.data))[0]?.id||'';
+      const r=await api({action:'import_catalog',accountId:accountId||undefined});
+      await refresh();
+      const added=Number(r.added)||0;
+      const skipped=Number(r.skipped)||0;
+      toast.success(added?`В базу добавлено ${added} чатов`:`Уже в базе · ${skipped} чатов`);
+      setCatalogOpen(false);
+      navigate('Группы и каналы');
+      setGroupFilter('all');
+    }catch(e){toast.error((e as Error).message)}
+    finally{setBusy(false)}
   }
 
   function openManualGroup(){
@@ -2242,12 +2391,19 @@ function WorkspaceHome(){
         if(existing){
           skipped++;
           if(groupImportAccountId&&groupImportJoin){
-            const nextData={...existing.data,accountId:groupImportAccountId,name:existing.data.name||g.name};
+            const nextData=cleanGroupSaveData({
+              ...existing.data,
+              accountId:groupImportAccountId,
+              name:existing.data.name||g.name,
+              joinState:'',
+              joinStateAt:'',
+              joinStateError:'',
+            });
             if(existing.data.accountId!==groupImportAccountId){
               await api({action:'save',kind:'group',id:existing.id,data:nextData});
             }
             if(!(existing.data.membership==='joined'||existing.data.joinedAt)){
-              toJoin.push({id:existing.id,name:nextData.name||g.name});
+              toJoin.push({id:existing.id,name:String(nextData.name||g.name)});
             }
           }
           continue;
@@ -2291,7 +2447,7 @@ function WorkspaceHome(){
     finally{setBusy(false)}
   }
 
-  function selectCatalogNiche(n:GroupNiche){
+  function selectCatalogNiche(n:GroupNiche|null){
     setCatalogNiche(n);
     setCatalogSelected([]);
     setCatalogSearching(true);
@@ -2300,49 +2456,83 @@ function WorkspaceHome(){
 
   function selectMarket(marketId:string){
     setCatalogMarket(marketId);
-    const section=MARKET_SECTIONS.find(m=>m.id===marketId);
-    const next=section?.niches[0]||null;
-    setCatalogNiche(next);
+    setCatalogNiche(null);
     setCatalogSelected([]);
     setCatalogTab('links');
     setCatalogSearching(true);
     setCatalogSearchTick(t=>t+1);
   }
 
-  async function addCatalogGroups(overrideIds?:string[]){
+  /** Сохранить чаты каталога в «Группы и каналы». join=true — сразу фоновое вступление. */
+  async function saveCatalogGroupsToDb(overrideIds?:string[],opts?:{join?:boolean}){
     const selectedIds=overrideIds?.length?overrideIds:catalogSelected;
     const picks=GROUP_CATALOG.filter(g=>selectedIds.includes(g.id));
-    if(!picks.length){toast.message('Выберите чаты со ссылкой');return}
-    if(!catalogAccountId){toast.error('Сначала выберите аккаунт слева/сверху');return}
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    const ready=picks.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url));
+    const needLink=picks.filter(g=>!g.verified||!g.url||isCatalogPlaceholderUrl(g.url));
+    if(!ready.length&&!needLink.length){toast.message('Выберите чаты со ссылкой');return}
+    const doJoin=!!opts?.join;
+    if(doJoin){
+      if(!catalogAccountId){toast.error('Сначала выберите аккаунт слева/сверху');return}
+      if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    }
+    if(!ready.length){
+      toast.message('Нет чатов со ссылкой');
+      return;
+    }
     setBusy(true);
     try{
-      const ready=picks.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url));
-      const needLink=picks.filter(g=>!g.verified||!g.url||isCatalogPlaceholderUrl(g.url));
       const byUrl=new Map(list('group').map(r=>{
         const k=telegramEntityKey(r.data.url);
         return [k,r as RecordItem] as const;
       }).filter(([k])=>k));
       const toJoin:{id:string;name:string}[]=[];
+      let added=0;
+      const accountId=catalogAccountId||'';
       for(const g of ready){
         const key=telegramEntityKey(g.url);
         const existing=key?byUrl.get(key):undefined;
         if(existing){
-          const nextData={...existing.data,accountId:catalogAccountId,name:existing.data.name||g.name,url:existing.data.url||g.url};
-          if(existing.data.accountId!==catalogAccountId||existing.data.status!=='active'){
+          const nextData=cleanGroupSaveData({
+            ...existing.data,
+            accountId:accountId||existing.data.accountId||'',
+            name:existing.data.name||g.name,
+            url:existing.data.url||canonicalizeTgUrl(g.url),
+            joinState:'',
+            joinStateAt:'',
+            joinStateError:'',
+          });
+          if(accountId&&(existing.data.accountId!==accountId||existing.data.status!=='active')){
             await api({action:'save',kind:'group',id:existing.id,data:nextData});
           }
-          // Уже реально вступили — не гоняем повторно
-          if(!(existing.data.status==='active'&&(existing.data.joinedAt||existing.data.membership==='joined'))){
-            toJoin.push({id:existing.id,name:nextData.name||g.name});
+          if(doJoin&&!(existing.data.status==='active'&&(existing.data.joinedAt||existing.data.membership==='joined'))){
+            toJoin.push({id:existing.id,name:String(nextData.name||g.name)});
           }
           continue;
         }
         try{
-          const saved=await api({action:'save',kind:'group',data:{name:g.name,url:canonicalizeTgUrl(g.url),accountId:catalogAccountId,status:'setup',error:'',membership:'none',joinedAt:'',leadsTotal:0,leadsHot:0,leadsWarm:0,leadsCold:0,scanMatched:0,rating:0,lastScanned:''}});
+          const saved=await api({action:'save',kind:'group',data:cleanGroupSaveData({
+            name:g.name,
+            url:canonicalizeTgUrl(g.url),
+            accountId,
+            status:'setup',
+            error:'',
+            membership:'none',
+            joinedAt:'',
+            joinState:'',
+            joinStateAt:'',
+            joinStateError:'',
+            leadsTotal:0,
+            leadsHot:0,
+            leadsWarm:0,
+            leadsCold:0,
+            scanMatched:0,
+            rating:0,
+            lastScanned:'',
+          })});
+          added++;
           if(saved.id){
-            toJoin.push({id:saved.id,name:g.name});
-            if(key)byUrl.set(key,{id:saved.id,kind:'group',data:{name:g.name,url:g.url,accountId:catalogAccountId,status:'setup'},hasSecret:false,created:''});
+            if(doJoin)toJoin.push({id:saved.id,name:g.name});
+            if(key)byUrl.set(key,{id:saved.id,kind:'group',data:{name:g.name,url:g.url,accountId,status:'setup'},hasSecret:false,created:''});
           }
         }catch(e){
           const err=e as Error & {status?:number};
@@ -2351,19 +2541,20 @@ function WorkspaceHome(){
         }
       }
       setCatalogSelected(prev=>prev.filter(id=>!selectedIds.includes(id)));
-      if(toJoin.length){
+      await refresh();
+      if(doJoin&&toJoin.length){
         setCatalogOpen(false);
-        await refresh();
         void startBackgroundJoins(toJoin);
         toast.message(`Сразу вступаем: ${toJoin.length} чат(ов) в фоне`);
-      }else if(ready.length&&!needLink.length){
+      }else if(doJoin&&ready.length&&!needLink.length){
         toast.message('Выбранные чаты уже подключены');
         setCatalogOpen(false);
-        await refresh();
-      }else if(!needLink.length){
-        toast.message('Нет чатов со ссылкой для вступления');
+      }else if(!doJoin){
+        toast.success(added?`В базу добавлено: ${added}`:`Уже в базе · показано ${ready.length}`);
+        navigate('Группы и каналы');
+        setCatalogOpen(false);
       }
-      if(needLink.length){
+      if(needLink.length&&doJoin){
         setJoinQueue(prev=>[
           ...prev,
           ...needLink.map((g,i)=>({id:`need-${Date.now()}-${i}-${g.id}`,name:g.name,status:'need_url' as const})),
@@ -2379,6 +2570,10 @@ function WorkspaceHome(){
       }
     }catch(e){toast.error((e as Error).message)}
     finally{setBusy(false)}
+  }
+
+  async function addCatalogGroups(overrideIds?:string[]){
+    return saveCatalogGroupsToDb(overrideIds,{join:true});
   }
 
   /** Клик по чату в каталоге = сразу вступить (без отдельной кнопки на карточке группы). */
@@ -2443,7 +2638,7 @@ function WorkspaceHome(){
   const listSortTypes=useMemo(():Record<string,SortValueType>=>{
     if(currentKind==='lead')return{name:'string',temperature:'status',status:'status',source:'string',created:'date'};
     if(currentKind==='group')return{name:'string',account:'string',status:'status',sync:'date'};
-    if(currentKind==='account')return{name:'string',phone:'string',proxy:'string',status:'status'};
+    if(currentKind==='account')return{name:'string',status:'status',cooldown:'date',updated:'date',proxy:'string'};
     if(currentKind==='proxy')return{name:'string',host:'string',protocol:'string',status:'status'};
     return{};
   },[currentKind]);
@@ -2463,10 +2658,18 @@ function WorkspaceHome(){
       if(key==='sync')return r.data.lastScanned||'';
     }
     if(currentKind==='account'){
-      if(key==='name')return r.data.name||'';
+      if(key==='name')return accountDisplayName(r.data);
       if(key==='phone')return r.data.phone||'';
       if(key==='proxy')return records.find(x=>x.id===r.data.proxyId)?.data.name||'';
       if(key==='status')return accountRowStatus(r.data);
+      if(key==='cooldown'){
+        const st=String(r.data.status||'');
+        if(st==='cooldown'||st==='spamblock'){
+          return isOnCooldown(r.data.cooldownUntil)?r.data.cooldownUntil:'';
+        }
+        return '';
+      }
+      if(key==='updated')return accountUpdatedAt(r.data,r.created);
     }
     if(currentKind==='proxy'){
       if(key==='name')return r.data.name||'';
@@ -2479,8 +2682,8 @@ function WorkspaceHome(){
 
   const {sorted:sortedList,sortKey,sortDir,onSort}=useTableSort(listRows,getListSortValue,{
     types:listSortTypes,
-    defaultKey:currentKind==='lead'?'created':null,
-    defaultDir:currentKind==='lead'?'desc':'asc',
+    defaultKey:currentKind==='lead'?'created':currentKind==='account'?'updated':null,
+    defaultDir:currentKind==='lead'||currentKind==='account'?'desc':'asc',
     resetKey:`${view}-${filter}-${groupFilter}-${leadGroupFilter}-${currentKind||''}`,
   });
 
@@ -2492,22 +2695,57 @@ function WorkspaceHome(){
     if(!catalogOpen)return;
     setCatalogSearching(true);
     const handle=window.setTimeout(()=>{
-      const niches=catalogNiche?[catalogNiche]:(MARKET_SECTIONS.find(m=>m.id===catalogMarket)?.niches||[]);
+      if(catalogMarket==='db'){
+        const q=catalogQuery.trim().toLowerCase();
+        const groups=list('group');
+        const hits=groups
+          .map(r=>{
+            const url=String(r.data.url||'');
+            const name=String(r.data.name||'Без названия');
+            const hay=`${name} ${url}`.toLowerCase();
+            const matched=!q||hay.includes(q);
+            const joined=r.data.membership==='joined'||!!r.data.joinedAt;
+            return {
+              id:`db:${r.id}`,
+              name,
+              url,
+              verified:!!url&&!isCatalogPlaceholderUrl(url),
+              description:joined?'В кабинете · можно сканировать лиды':'В кабинете · нужно вступить',
+              audience:String(r.data.source||'workspace'),
+              niches:[] as GroupNiche[],
+              searchHint:url||'Нет ссылки',
+              score:joined?20:10,
+              matched,
+              overlap:0,
+              recordId:r.id,
+            };
+          })
+          .filter(h=>h.matched)
+          .sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name,'ru'));
+        setCatalogHits(hits as any);
+        setCatalogSearching(false);
+        return;
+      }
+      const section=MARKET_SECTIONS.find(m=>m.id===catalogMarket);
+      const niches=catalogNiche
+        ?[catalogNiche]
+        :(section?.niches?.length?section.niches:[]);
       const hits=searchGroupCatalog({
         query:catalogQuery,
         niches,
         mergeProject:false,
-        onlyMatched:true,
+        onlyMatched:niches.length>0,
       });
       setCatalogHits(hits);
       setCatalogSearching(false);
     },220);
     return()=>window.clearTimeout(handle);
-  },[catalogOpen,catalogQuery,catalogNiche,catalogMarket,catalogSearchTick]);
+  },[catalogOpen,catalogQuery,catalogNiche,catalogMarket,catalogSearchTick,records]);
 
   const existingGroupUrlSet=new Set(list('group').map(r=>telegramEntityKey(r.data.url)).filter(Boolean));
   const catalogMarketNiches=MARKET_SECTIONS.find(m=>m.id===catalogMarket)?.niches||[];
   const catalogBaseHits=catalogHits.filter(h=>{
+    if(catalogMarket==='db')return true;
     if(!catalogHideAdded)return true;
     if(!h.url)return true;
     return !existingGroupUrlSet.has(telegramEntityKey(h.url));
@@ -2612,13 +2850,17 @@ function WorkspaceHome(){
       return (
         <Empty className="border-0 py-10">
           <EmptyHeader>
-            <EmptyTitle>Пока пусто</EmptyTitle>
-            <EmptyDescription>Найдите чаты по темам или добавьте ссылку — затем нажмите «Вступить».</EmptyDescription>
+            <EmptyTitle>В кабинете пока нет групп</EmptyTitle>
+            <EmptyDescription>
+              Залейте полный каталог ({catalogStats().uniqueUrls} чатов со ссылкой) — затем вступайте и собирайте лиды.
+            </EmptyDescription>
           </EmptyHeader>
           <div className="flex flex-wrap gap-2 justify-center">
-            <Button onClick={openCatalog}><Search size={16}/>Найти темы</Button>
+            <Button disabled={busy} onClick={()=>void importFullCatalogToDb()}>
+              <Database size={16}/>Залить все в базу ({catalogStats().uniqueUrls})
+            </Button>
+            <Button variant="outline" onClick={()=>openCatalog('all')}><Search size={16}/>Открыть каталог</Button>
             <Button variant="outline" onClick={openManualGroup}><Plus size={16}/>Ссылка</Button>
-            <Button variant="outline" onClick={openMassGroups}><Upload size={16}/>Массово</Button>
           </div>
         </Empty>
       );
@@ -2853,7 +3095,7 @@ function WorkspaceHome(){
           <div className="page-heading">
             <div>
               <div className="eyebrow">Telegram · UniLab</div>
-              <h1>{view==='Обзор'?'Обзор':view}</h1>
+              <h1>{view==='Обзор'?'Обзор':view==='Аккаунты'?'Менеджер аккаунтов':view}</h1>
               <p className="muted mt-2">{viewCopy[view]}</p>
             </div>
             <div className="flex flex-wrap gap-2 justify-end">
@@ -2863,11 +3105,16 @@ function WorkspaceHome(){
                 <>
                   <Button variant="outline" onClick={openManualGroup}><Plus size={16}/>Добавить группу</Button>
                   <Button variant="outline" onClick={openMassGroups}><Upload size={16}/>Добавить массово</Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy}
+                    onClick={()=>void importFullCatalogToDb()}
+                  >Залить каталог ({catalogStats().uniqueUrls})</Button>
                   <Button onClick={openCatalog}><Search size={16}/>Поиск по темам</Button>
                 </>
               ):view==='Настройки'||view==='Сбор аудитории'||view==='Инвайтинг'||view==='Рассылка'||view==='Уведомления'||view==='Сотрудники'?null:(
                 <Button onClick={()=>open(currentKind||'group',currentKind==='settings'?settings:undefined)}>
-                  {currentKind==='settings'?<><Plus size={16}/>Настроить AI</>:<><Plus size={16}/>Добавить {labels[currentKind||'group']}</>}
+                  {currentKind==='settings'?<><Plus size={16}/>Настроить AI</>:currentKind==='account'?<><Plus size={16}/>Добавить аккаунты</>:<><Plus size={16}/>Добавить {labels[currentKind||'group']}</>}
                 </Button>
               )}
             </div>
@@ -3455,73 +3702,172 @@ function WorkspaceHome(){
                     </Button>
                   </div>
                 )}
-                <Table className={currentKind==='account'?'accounts-table':currentKind==='proxy'?'proxies-table':''}>
+                {currentKind==='account'?(
+                <Table className="accounts-table accounts-manager">
                   <TableHeader>
                     <TableRow>
-                      {currentKind==='account'&&(
-                        <TableHead className="w-10">
-                          <Checkbox
-                            checked={sortedList.length>0&&sortedList.every(r=>accountSelected.includes(r.id))}
-                            onCheckedChange={v=>setAccountSelected(v===true?sortedList.map(r=>r.id):[])}
-                            aria-label="Выбрать все аккаунты"
-                          />
-                        </TableHead>
-                      )}
+                      <TableHead className="w-10">
+                        <Checkbox
+                          checked={sortedList.length>0&&sortedList.every(r=>accountSelected.includes(r.id))}
+                          onCheckedChange={v=>setAccountSelected(v===true?sortedList.map(r=>r.id):[])}
+                          aria-label="Выбрать все аккаунты"
+                        />
+                      </TableHead>
+                      <SortableTableHead columnKey="name" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Аккаунт</SortableTableHead>
+                      <TableHead>
+                        <span className="acc-limits-head">
+                          Дневные лимиты
+                          <button
+                            type="button"
+                            className="acc-limits-refresh"
+                            title={`Сброс в полночь МСК (~${new Date(moscowNextMidnightIso()).toLocaleTimeString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})})`}
+                            onClick={()=>toast.message(`Дневные лимиты сбрасываются в полночь МСК (~${new Date(moscowNextMidnightIso()).toLocaleTimeString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})})`)}
+                          >
+                            <RefreshCw size={13}/>
+                          </button>
+                        </span>
+                      </TableHead>
+                      <SortableTableHead columnKey="status" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Статус</SortableTableHead>
+                      <SortableTableHead columnKey="cooldown" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Отлёжка</SortableTableHead>
+                      <SortableTableHead columnKey="proxy" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Связи</SortableTableHead>
+                      <SortableTableHead columnKey="updated" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Обновлено</SortableTableHead>
+                      <TableHead className="text-right w-[148px]">Действия</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {sortedList.map(r=>{
+                      const rowStatus=accountRowStatus(r.data);
+                      const displayName=accountDisplayName(r.data);
+                      const identity=accountIdentityLine(r.data,r.id);
+                      const avatarLetter=(displayName.replace(/^@/,'').trim()[0]||'?').toUpperCase();
+                      const proxy=records.find(x=>x.id===r.data.proxyId);
+                      const linkedGroups=records.filter(g=>g.kind==='group'&&(g.data.accountId===r.id||g.data.joinedAccountId===r.id));
+                      const coolLeft=(rowStatus==='cooldown'||(rowStatus==='spamblock'&&isOnCooldown(r.data.cooldownUntil)))
+                        ?cooldownRemainingShort(r.data.cooldownUntil)
+                        :'';
+                      const updatedIso=accountUpdatedAt(r.data,r.created);
+                      const usage=accountLimitsUsage(r.data);
+                      return (
+                        <TableRow key={r.id} className={accountSelected.includes(r.id)?'bg-[rgba(255,169,44,0.06)]':''}>
+                          <TableCell>
+                            <Checkbox checked={accountSelected.includes(r.id)} onCheckedChange={v=>toggleAccountSelected(r.id,v===true)} aria-label={`Выбрать ${displayName}`}/>
+                          </TableCell>
+                          <TableCell className="min-w-0">
+                            <div className="acc-identity">
+                              <span className="acc-avatar" style={{background:accountAvatarColor(r.id+displayName)}} aria-hidden>{avatarLetter}</span>
+                              <div className="acc-identity-text min-w-0">
+                                <strong className="truncate" title={displayName}>{displayName}</strong>
+                                <span className="acc-id-line" title={identity}>{identity}</span>
+                                <div className="acc-meta-badges">
+                                  {r.data.format&&r.data.format!=='manual'&&<span className="badge neutral">{r.data.format}</span>}
+                                  {r.data.hasPhoto&&<span className="badge success">фото</span>}
+                                  {!r.hasSecret&&<span className="badge warning">нет сессии</span>}
+                                </div>
+                              </div>
+                            </div>
+                          </TableCell>
+                          <TableCell><AccountLimitsCell data={r.data}/></TableCell>
+                          <TableCell className="min-w-0">
+                            <AccountStatusCell status={rowStatus} error={r.data.error} cooldownUntil={r.data.cooldownUntil}/>
+                          </TableCell>
+                          <TableCell className="whitespace-nowrap">
+                            {coolLeft?(
+                              <span className="acc-cooldown is-on" title={cooldownLabel(r.data.cooldownUntil)}>{coolLeft}</span>
+                            ):(
+                              <span className="acc-cooldown is-off">Отключена</span>
+                            )}
+                          </TableCell>
+                          <TableCell className="min-w-0">
+                            <div className="acc-links">
+                              <span className={`acc-chip ${proxy?.data.status==='active'?'is-ok':proxy?'is-warn':'is-muted'}`} title={proxy?proxyDisplayLabel(proxy.data):'Прокси не назначен'}>
+                                <Network size={12}/>
+                                {proxy?proxyDisplayLabel(proxy.data).slice(0,18):'Без прокси'}
+                              </span>
+                              <span className={`acc-chip ${linkedGroups.length?'is-ok':'is-muted'}`} title={linkedGroups.length?linkedGroups.map(g=>g.data.name).join(', '):'Нет привязанных групп'}>
+                                <Folder size={12}/>
+                                {linkedGroups.length
+                                  ?(linkedGroups.length===1?String(linkedGroups[0]!.data.name||'Группа').slice(0,16):`${linkedGroups.length} групп`)
+                                  :'Нет групп'}
+                              </span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="whitespace-nowrap muted text-sm" title={updatedIso?new Date(updatedIso).toLocaleString('ru-RU'):''}>
+                            {relativeTimeRu(updatedIso)}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <div className="acc-actions">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                disabled={busy||r.data.status==='checking'}
+                                title="Проверить статус"
+                                aria-label={'Проверить '+displayName}
+                                onClick={()=>checkOneAccount(r)}
+                              >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<Plug size={15}/>}</Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title="Статистика лимитов"
+                                aria-label={'Статистика '+displayName}
+                                onClick={()=>setTaskLog({
+                                  title:`Статистика · ${displayName}`,
+                                  log:[
+                                    {at:new Date().toISOString(),level:'info',text:`Статус: ${ACCOUNT_STATUS_LABELS[rowStatus as AccountStatus]||rowStatus}`},
+                                    {at:new Date().toISOString(),level:'info',text:`Вступления сегодня: ${usage.joins}/${usage.inviteLimit||'∞'}`},
+                                    {at:new Date().toISOString(),level:'info',text:`Сообщения сегодня: ${usage.messages}/${usage.messageLimit||'∞'}`},
+                                    {at:new Date().toISOString(),level:'info',text:`Инвайты людей: ${usage.memberInvites}/${usage.memberInviteLimit||'∞'}`},
+                                    {at:new Date().toISOString(),level:coolLeft?'warn':'info',text:coolLeft?`Отлёжка ещё ${coolLeft} (${cooldownLabel(r.data.cooldownUntil)})`:'Отлёжка отключена'},
+                                    {at:new Date().toISOString(),level:'info',text:proxy?`Прокси: ${proxyDisplayLabel(proxy.data)} (${proxy.data.status||'?'})`:'Прокси не назначен'},
+                                    {at:new Date().toISOString(),level:'info',text:linkedGroups.length?`Групп: ${linkedGroups.map(g=>g.data.name||'—').join(', ')}`:'Групп не назначено'},
+                                    ...(r.data.error?[{at:new Date().toISOString(),level:'error',text:String(r.data.error)}]:[]),
+                                  ],
+                                })}
+                              ><BarChart3 size={15}/></Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title={isOnCooldown(r.data.cooldownUntil)?'Снять отлёжку':'Отлёжка 24ч'}
+                                aria-label="Отлёжка"
+                                onClick={()=>setAccountCooldown(r,isOnCooldown(r.data.cooldownUntil)?null:24)}
+                              ><Timer size={15}/></Button>
+                              <Button variant="ghost" size="icon" aria-label={'Изменить '+displayName} onClick={()=>open(r.kind,r)}><Pencil size={15}/></Button>
+                              <Button variant="ghost" size="icon" className="text-[var(--spike-danger,#fb977d)]" aria-label={'Удалить '+displayName} onClick={()=>setDeleting(r)}><Trash2 size={15}/></Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+                ):(
+                <Table className="proxies-table">
+                  <TableHeader>
+                    <TableRow>
                       <SortableTableHead columnKey="name" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Название</SortableTableHead>
-                      <SortableTableHead columnKey={currentKind==='account'?'phone':'host'} sortKey={sortKey} sortDir={sortDir} onSort={onSort}>
-                        {currentKind==='account'?'Телефон':'Адрес'}
-                      </SortableTableHead>
-                      <SortableTableHead columnKey={currentKind==='account'?'proxy':'protocol'} sortKey={sortKey} sortDir={sortDir} onSort={onSort}>
-                        {currentKind==='account'?'Прокси':'Тип'}
-                      </SortableTableHead>
+                      <SortableTableHead columnKey="host" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Адрес</SortableTableHead>
+                      <SortableTableHead columnKey="protocol" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Тип</SortableTableHead>
                       <SortableTableHead columnKey="status" sortKey={sortKey} sortDir={sortDir} onSort={onSort}>Состояние</SortableTableHead>
                       <TableHead className="text-right w-[140px]">Действия</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {sortedList.map(r=>{
-                      const rowStatus=currentKind==='account'?accountRowStatus(r.data):(r.data.status||'inactive');
+                      const rowStatus=r.data.status||'inactive';
                       return (
-                      <TableRow key={r.id} className={currentKind==='account'&&accountSelected.includes(r.id)?'bg-[rgba(255,169,44,0.06)]':''}>
-                        {currentKind==='account'&&(
-                          <TableCell>
-                            <Checkbox checked={accountSelected.includes(r.id)} onCheckedChange={v=>toggleAccountSelected(r.id,v===true)} aria-label={`Выбрать ${r.data.name}`}/>
-                          </TableCell>
-                        )}
+                      <TableRow key={r.id}>
                         <TableCell className="font-semibold min-w-0">
-                          {currentKind==='proxy'?(
-                            <span className={`proxy-ref ${r.data.status==='active'?'is-active':r.data.status==='checking'?'is-checking':''}`} title={proxyDisplayLabel(r.data)}>
-                              <span className="proxy-ref-name">{proxyDisplayLabel(r.data)}</span>
-                            </span>
-                          ):(
-                            <>
-                              <span className="block truncate" title={r.data.name}>{r.data.name}</span>
-                              {currentKind==='account'&&r.data.format&&r.data.format!=='manual'&&(
-                                <span className="badge neutral ml-0 mt-1">{r.data.format}</span>
-                              )}
-                              {currentKind==='account'&&r.data.hasPhoto&&(
-                                <span className="badge success ml-1 mt-1">фото</span>
-                              )}
-                              {currentKind==='account'&&r.data.about&&(
-                                <p className="small-note mt-1 font-normal line-clamp-1">{r.data.about}</p>
-                              )}
-                            </>
-                          )}
+                          <span className={`proxy-ref ${r.data.status==='active'?'is-active':r.data.status==='checking'?'is-checking':''}`} title={proxyDisplayLabel(r.data)}>
+                            <span className="proxy-ref-name">{proxyDisplayLabel(r.data)}</span>
+                          </span>
                         </TableCell>
                         <TableCell className="whitespace-nowrap font-variant-numeric tabular-nums">
-                          {currentKind==='account'
-                            ?(r.data.phone||'—')
-                            :(r.data.host&&r.data.port?`${r.data.host}:${r.data.port}`:'—')}
+                          {r.data.host&&r.data.port?`${r.data.host}:${r.data.port}`:'—'}
                         </TableCell>
-                        <TableCell className="min-w-0">
-                          {currentKind==='proxy'
-                            ? String(r.data.protocol||'').toUpperCase()
-                            : <ProxyRefLabel proxy={records.find(x=>x.id===r.data.proxyId)}/>}
-                        </TableCell>
-                        <TableCell className={currentKind==='proxy'?'proxy-status-cell min-w-0':'min-w-0 max-w-[280px]'}>
+                        <TableCell className="min-w-0">{String(r.data.protocol||'').toUpperCase()}</TableCell>
+                        <TableCell className="proxy-status-cell min-w-0">
                           <>
-                            {statusBadge(rowStatus,currentKind)}
-                            {currentKind==='proxy'&&(()=>{
+                            {statusBadge(rowStatus,'proxy')}
+                            {(()=>{
                               const bits:string[]=[];
                               if(r.data.status!=='checking'&&r.data.exitIp){
                                 bits.push(`IP ${r.data.exitIp}${r.data.telegramOk===false?' · TG?':r.data.telegramOk===true?' · TG ok':''}`);
@@ -3535,45 +3881,18 @@ function WorkspaceHome(){
                                 </p>
                               );
                             })()}
-                            {currentKind==='account'&&isOnCooldown(r.data.cooldownUntil)&&(
-                              <p className="small-note mt-1">{cooldownLabel(r.data.cooldownUntil)}</p>
-                            )}
-                            {currentKind==='account'&&r.data.error&&(
-                              <p className="small-note mt-1 text-[var(--spike-danger,#b91c1c)] line-clamp-2" title={r.data.error}>{r.data.error}</p>
-                            )}
                           </>
                         </TableCell>
                         <TableCell className="text-right w-[140px]">
-                          <div className={currentKind==='proxy'?'proxy-actions':'flex justify-end gap-1'}>
-                            {currentKind==='proxy'&&(
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                disabled={busy||r.data.status==='checking'}
-                                title={r.data.status==='active'?'Проверить снова':'Перезапустить проверку'}
-                                aria-label={'Проверить '+r.data.name}
-                                onClick={()=>checkOneProxy(r)}
-                              >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<RefreshCw size={15}/>}</Button>
-                            )}
-                            {currentKind==='account'&&(
-                              <>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  disabled={busy||r.data.status==='checking'}
-                                  title="Проверить статус"
-                                  aria-label={'Проверить '+r.data.name}
-                                  onClick={()=>checkOneAccount(r)}
-                                >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<Plug size={15}/>}</Button>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  title={isOnCooldown(r.data.cooldownUntil)?'Снять отлежку':'Отлежка 24ч'}
-                                  aria-label="Отлежка"
-                                  onClick={()=>setAccountCooldown(r,isOnCooldown(r.data.cooldownUntil)?null:24)}
-                                ><Check size={15}/></Button>
-                              </>
-                            )}
+                          <div className="proxy-actions">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              disabled={busy||r.data.status==='checking'}
+                              title={r.data.status==='active'?'Проверить снова':'Перезапустить проверку'}
+                              aria-label={'Проверить '+r.data.name}
+                              onClick={()=>checkOneProxy(r)}
+                            >{r.data.status==='checking'?<Loader2 className="animate-spin" size={15}/>:<RefreshCw size={15}/>}</Button>
                             <Button variant="ghost" size="icon" aria-label={'Изменить '+r.data.name} onClick={()=>open(r.kind,r)}><Pencil size={15}/></Button>
                             <Button variant="ghost" size="icon" aria-label={'Удалить '+r.data.name} onClick={()=>setDeleting(r)}><Trash2 size={15}/></Button>
                           </div>
@@ -3582,6 +3901,7 @@ function WorkspaceHome(){
                     )})}
                   </TableBody>
                 </Table>
+                )}
                 </>
               ):(
                 <Empty className="empty-state border-0">
@@ -4395,7 +4715,7 @@ function WorkspaceHome(){
           <DialogHeader className="px-6 pt-5 pb-4 border-b border-[var(--spike-border)] shrink-0">
             <DialogTitle>Найти чаты с клиентами</DialogTitle>
             <DialogDescription>
-              Выберите рынок и нишу. Нажмите «Вступить» у чата — сразу пойдёт фоновое вступление (антиспам-пауза между чатами).
+              «В базе» — ваши группы для сбора лидов. «Все чаты» — полный каталог ({catalogStats().uniqueUrls} ссылок). «Залить в базу» добавит их в «Группы и каналы».
             </DialogDescription>
           </DialogHeader>
 
@@ -4410,14 +4730,21 @@ function WorkspaceHome(){
                     className={`catalog-side-item ${catalogMarket===m.id?'active':''}`}
                     onClick={()=>selectMarket(m.id)}
                   >
-                    <strong>{m.title}</strong>
+                    <strong>{m.title} <em className="opacity-70 font-normal">· {m.id==='db'?list('group').length:marketVerifiedCount(m.id)}</em></strong>
                     <span>{m.hint}</span>
                   </button>
                 ))}
               </div>
 
+              {catalogMarket!=='db'&&(
+              <>
               <p className="catalog-step-label mt-4">Ниша</p>
               <div className="catalog-side-list catalog-niche-list">
+                <button
+                  type="button"
+                  className={`catalog-niche-btn ${catalogNiche===null?'active':''}`}
+                  onClick={()=>selectCatalogNiche(null)}
+                >Все ниши</button>
                 {catalogMarketNiches.map(n=>(
                   <button
                     key={n}
@@ -4437,19 +4764,30 @@ function WorkspaceHome(){
                   const s=list('settings')[0]?.data||defaults.settings;
                   const auto=nichesFromProjectText(s.product,s.audience,s.keywords,s.leadCriteria,s.name,s.pains,s.valueProps,s.hotSignals);
                   if(!auto.length){toast.message('В AI нет явных ниш — выберите рынок вручную');return}
-                  let best={id:MARKET_SECTIONS[0].id,score:0};
+                  let best={id:MARKET_SECTIONS.find(m=>m.niches.length)?.id||'all',score:0};
                   for(const m of MARKET_SECTIONS){
+                    if(!m.niches.length)continue;
                     const score=m.niches.filter(n=>auto.includes(n)).length;
                     if(score>best.score)best={id:m.id,score};
                   }
-                  const section=MARKET_SECTIONS.find(m=>m.id===best.id)!;
                   setCatalogMarket(best.id);
-                  setCatalogNiche(section.niches.find(n=>auto.includes(n))||section.niches[0]);
+                  setCatalogNiche(null);
                   setCatalogTab('links');
                   setCatalogSearching(true);
                   setCatalogSearchTick(t=>t+1);
                 }}
               ><Sparkles size={14}/>Подобрать по AI</Button>
+              </>
+              )}
+              {catalogMarket==='db'&&(
+                <Button
+                  type="button"
+                  size="sm"
+                  className="mt-3 w-full"
+                  disabled={busy}
+                  onClick={()=>void importFullCatalogToDb()}
+                ><Database size={14}/>Дозалить каталог ({catalogStats().uniqueUrls})</Button>
+              )}
             </aside>
 
             <div className="catalog-main">
@@ -4465,7 +4803,11 @@ function WorkspaceHome(){
                   {catalogSearching&&<Loader2 className="absolute right-3 top-2.5 animate-spin text-[var(--spike-primary)]" size={16}/>}
                 </div>
                 <label className="catalog-toggle">
-                  <Checkbox checked={catalogHideAdded} onCheckedChange={v=>setCatalogHideAdded(v===true)}/>
+                  <Checkbox
+                    checked={catalogHideAdded}
+                    disabled={catalogMarket==='db'}
+                    onCheckedChange={v=>setCatalogHideAdded(v===true)}
+                  />
                   Скрыть добавленные
                 </label>
               </div>
@@ -4473,17 +4815,19 @@ function WorkspaceHome(){
               <div className="catalog-params">
                 <span className="catalog-param">{catalogActiveMarket?.title||'—'}</span>
                 <span className="catalog-param-sep">/</span>
-                <span className="catalog-param accent">{catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Выберите нишу'}</span>
-                <span className="small-note ml-auto">{catalogSearching?'Ищем…':`${catalogVisibleHits.length} результатов`}</span>
+                <span className="catalog-param accent">{catalogMarket==='db'?'Ваш кабинет':(catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Все ниши')}</span>
+                <span className="small-note ml-auto">{catalogSearching?'Ищем…':`${catalogVisibleHits.length} результатов · база ${catalogStats().uniqueUrls}`}</span>
               </div>
 
               <div className="catalog-tabs">
                 <button type="button" className={catalogTab==='links'?'active':''} onClick={()=>{setCatalogTab('links');setCatalogSelected([])}}>
-                  Со ссылкой <em>{catalogLinkHits.length}</em>
+                  {catalogMarket==='db'?'Группы':'Со ссылкой'} <em>{catalogLinkHits.length}</em>
                 </button>
+                {catalogMarket!=='db'&&(
                 <button type="button" className={catalogTab==='topics'?'active':''} onClick={()=>{setCatalogTab('topics');setCatalogSelected([])}}>
                   Темы без ссылки <em>{catalogTopicHits.length}</em>
                 </button>
+                )}
               </div>
 
               {catalogTab==='topics'&&catalogVisibleHits.length>0&&(
@@ -4518,6 +4862,9 @@ function WorkspaceHome(){
                 ):catalogVisibleHits.length?catalogVisibleHits.map(g=>{
                   const canJoin=g.verified&&!!g.url&&!isCatalogPlaceholderUrl(g.url);
                   const checked=catalogSelected.includes(g.id);
+                  const dbId=catalogMarket==='db'&&String(g.id).startsWith('db:')?String(g.id).slice(3):'';
+                  const dbRec=dbId?list('group').find(x=>x.id===dbId):undefined;
+                  const dbJoined=!!(dbRec&&(dbRec.data.membership==='joined'||dbRec.data.joinedAt));
                   return (
                     <div key={g.id} className={`catalog-card ${checked?'is-checked':''} ${canJoin?'has-link':''}`}>
                       {catalogTab==='topics'?(
@@ -4532,12 +4879,27 @@ function WorkspaceHome(){
                         <span className="catalog-card-title">
                           {g.name}
                           {canJoin?<span className="badge success">t.me</span>:<span className="badge neutral">нужен инвайт</span>}
+                          {dbJoined&&<span className="badge success">вступили</span>}
                         </span>
                         <span className="text-sm muted block mt-1">{g.description}</span>
                         <span className="small-note block mt-1">{g.audience}</span>
                         <span className="small-note block mt-1 font-medium text-[var(--spike-primary)]">{canJoin?g.url:g.searchHint}</span>
                       </span>
-                      {canJoin?(
+                      {catalogMarket==='db'&&dbRec?(
+                        dbJoined?(
+                          <Button
+                            size="sm"
+                            disabled={busy||!telegramConnected}
+                            onClick={()=>{setCatalogOpen(false);void scanGroup(dbRec)}}
+                          >Скан лидов</Button>
+                        ):(
+                          <Button
+                            size="sm"
+                            disabled={busy||!telegramConnected||!dbRec.data.accountId}
+                            onClick={()=>{setCatalogOpen(false);void joinGroup(dbRec)}}
+                          >Вступить</Button>
+                        )
+                      ):canJoin?(
                         <Button
                           size="sm"
                           disabled={busy||!catalogAccountId}
@@ -4561,7 +4923,9 @@ function WorkspaceHome(){
                   );
                 }):(
                   <p className="muted text-sm py-6">
-                    {catalogTab==='links'&&catalogTopicHits.length
+                    {catalogMarket==='db'
+                      ? 'В кабинете пока нет групп — нажмите «Дозалить каталог» или откройте «Все чаты».'
+                      : catalogTab==='links'&&catalogTopicHits.length
                       ? 'Нет готовых ссылок в этой нише — откройте «Темы без ссылки» или смените нишу.'
                       : catalogHiddenAdded&&catalogHideAdded
                         ? 'В этой нише всё уже добавлено. Снимите «Скрыть добавленные» или выберите другую нишу.'
@@ -4573,11 +4937,42 @@ function WorkspaceHome(){
           </div>
 
           <div className="px-6 py-4 border-t border-[var(--spike-border)] flex flex-wrap gap-2 shrink-0">
-            {catalogTab==='links'?(
-              <Button
-                disabled={busy||!catalogReadyCount||!catalogAccountId}
-                onClick={()=>addCatalogGroups(catalogLinkHits.map(g=>g.id))}
-              >{busy?'Вступаем…':`Вступить во все (${catalogReadyCount})`}</Button>
+            {catalogMarket==='db'?(
+              <>
+                <Button
+                  disabled={busy||!telegramConnected||!list('group').filter(g=>g.data.membership==='joined'||g.data.joinedAt).length}
+                  onClick={()=>{
+                    setCatalogOpen(false);
+                    navigate('Группы и каналы');
+                    void (async()=>{
+                      setBusy(true);
+                      try{
+                        const r=await api({action:'rescan_groups',force:true});
+                        toast.message(`Переобход: ${r.queued||0} групп`);
+                        await refresh();
+                      }catch(e){toast.error((e as Error).message)}
+                      finally{setBusy(false)}
+                    })();
+                  }}
+                >Собрать лиды со вступивших</Button>
+                <Button variant="outline" disabled={busy} onClick={()=>void importFullCatalogToDb()}>
+                  Дозалить каталог ({catalogStats().uniqueUrls})
+                </Button>
+                <Button variant="ghost" onClick={()=>selectMarket('all')}>Все чаты каталога</Button>
+              </>
+            ):catalogTab==='links'?(
+              <>
+                <Button
+                  disabled={busy||!catalogReadyCount}
+                  variant="default"
+                  onClick={()=>catalogMarket==='all'?void importFullCatalogToDb():saveCatalogGroupsToDb(catalogLinkHits.map(g=>g.id),{join:false})}
+                >{busy?'Сохраняем…':catalogMarket==='all'?`Залить весь каталог (${catalogStats().uniqueUrls})`:`Залить в базу (${catalogReadyCount})`}</Button>
+                <Button
+                  disabled={busy||!catalogReadyCount||!catalogAccountId}
+                  variant="outline"
+                  onClick={()=>addCatalogGroups(catalogLinkHits.map(g=>g.id))}
+                >{busy?'Вступаем…':`Вступить во все (${catalogReadyCount})`}</Button>
+              </>
             ):(
               <Button
                 variant="outline"
@@ -4798,7 +5193,7 @@ function WorkspaceHome(){
           <DialogHeader>
             <DialogTitle>Отлежка · {accountSelected.length} акк.</DialogTitle>
             <DialogDescription>
-              После PEER_FLOOD / Too many requests поставьте паузу или снимите, если лимит уже прошёл.
+              После дневного лимита / PEER_FLOOD / заморозки — пауза или снимите, если лимит уже прошёл.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-wrap gap-2">

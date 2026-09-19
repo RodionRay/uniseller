@@ -278,6 +278,7 @@ async function tickOwner(
           continue;
         }
         if (r?.rejoinItem?.id) {
+          if (r?.soft || r?.preserved) continue;
           extraReassigned++;
           const jid = String(r.rejoinItem.id);
           if (left() >= 25_000) {
@@ -304,6 +305,7 @@ async function tickOwner(
       } catch (e) {
         const data = (e as any)?.data;
         if (data?.rejoinItem?.id) {
+          if (data?.soft || data?.preserved) continue;
           extraReassigned++;
           const jid = String(data.rejoinItem.id);
           if (left() >= 25_000 && !isAbort(e)) {

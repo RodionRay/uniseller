@@ -1450,21 +1450,236 @@ button.studio-metric:hover .studio-metric-card {
   table-layout: fixed;
   width: 100%;
 }
+.accounts-table th:nth-child(1),
+.accounts-table td:nth-child(1) {
+  width: 40px;
+}
 .accounts-table th:nth-child(2),
 .accounts-table td:nth-child(2) {
-  width: 22%;
+  width: 18%;
 }
 .accounts-table th:nth-child(3),
 .accounts-table td:nth-child(3) {
-  width: 16%;
+  width: 14%;
 }
 .accounts-table th:nth-child(4),
 .accounts-table td:nth-child(4) {
-  width: 22%;
+  width: 14%;
 }
 .accounts-table th:nth-child(5),
 .accounts-table td:nth-child(5) {
-  width: 28%;
+  width: 9%;
+}
+.accounts-table th:nth-child(6),
+.accounts-table td:nth-child(6) {
+  width: 16%;
+}
+.accounts-table th:nth-child(7),
+.accounts-table td:nth-child(7) {
+  width: 11%;
+}
+.accounts-table th:nth-child(8),
+.accounts-table td:nth-child(8) {
+  width: 148px;
+}
+.accounts-manager td,
+.accounts-manager th {
+  vertical-align: middle;
+}
+.acc-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.acc-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 650;
+  flex-shrink: 0;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18);
+}
+.acc-identity-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.acc-identity-text strong {
+  font-size: 0.925rem;
+  font-weight: 600;
+  color: var(--spike-text);
+}
+.acc-id-line {
+  font-size: 12px;
+  color: var(--spike-muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acc-meta-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+.acc-limits {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.acc-limits span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--spike-muted);
+  font-size: 12px;
+}
+.acc-limits em {
+  font-style: normal;
+  color: var(--spike-text);
+  font-weight: 550;
+}
+.acc-limits .is-over em {
+  color: var(--spike-danger, #fb977d);
+}
+.acc-limits-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.acc-limits-refresh {
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--spike-muted);
+  padding: 2px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.acc-limits-refresh:hover {
+  color: var(--spike-text);
+  background: var(--spike-hover);
+}
+.acc-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+.acc-status-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.acc-status-icon.is-spin svg {
+  animation: us-spin 1s linear infinite;
+}
+.acc-status-success .acc-status-icon {
+  background: color-mix(in srgb, var(--spike-success, #4bd08b) 22%, transparent);
+  color: var(--spike-success, #4bd08b);
+}
+.acc-status-warning .acc-status-icon {
+  background: color-mix(in srgb, var(--spike-warning, #ffd58a) 22%, transparent);
+  color: var(--spike-warning, #e8b86d);
+}
+.acc-status-danger .acc-status-icon {
+  background: color-mix(in srgb, var(--spike-danger, #fb977d) 22%, transparent);
+  color: var(--spike-danger, #fb977d);
+}
+.acc-status-neutral .acc-status-icon,
+.acc-status-default .acc-status-icon {
+  background: var(--spike-hover);
+  color: var(--spike-muted);
+}
+.acc-status-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.acc-status-text strong {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--spike-text);
+}
+.acc-status-text span {
+  font-size: 11px;
+  color: var(--spike-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+}
+.acc-cooldown.is-on {
+  color: var(--spike-warning, #e8b86d);
+  font-weight: 550;
+  font-size: 0.875rem;
+}
+.acc-cooldown.is-off {
+  color: var(--spike-muted);
+  font-size: 0.875rem;
+}
+.acc-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.acc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.2;
+  border: 1px solid var(--spike-border);
+  background: var(--spike-hover);
+  color: var(--spike-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acc-chip.is-ok {
+  border-color: color-mix(in srgb, var(--spike-success, #4bd08b) 35%, var(--spike-border));
+  color: var(--spike-text);
+  background: color-mix(in srgb, var(--spike-success, #4bd08b) 10%, transparent);
+}
+.acc-chip.is-warn {
+  border-color: color-mix(in srgb, var(--spike-warning, #ffd58a) 40%, var(--spike-border));
+  color: var(--spike-warning, #e8b86d);
+}
+.acc-chip.is-muted {
+  opacity: 0.85;
+}
+.acc-actions {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 1px;
+  width: 100%;
+  white-space: nowrap;
+}
+@media (max-width: 1100px) {
+  .accounts-manager {
+    table-layout: auto;
+  }
+  .accounts-table th:nth-child(n),
+  .accounts-table td:nth-child(n) {
+    width: auto;
+  }
 }
 .proxies-table th:nth-child(1),
 .proxies-table td:nth-child(1) {

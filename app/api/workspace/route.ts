@@ -13,7 +13,7 @@ import {
  type LeadCoreSettings,
 } from '@/lib/lead-core';
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew} from '@/lib/ai-keywords';
-import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
+import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasChatQuota,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isDayLimitCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
 import {canonicalizeTgUrl,duplicateReason,isDuplicateKind} from '@/lib/record-identity';
 import {
@@ -704,7 +704,7 @@ async function runAccountCheck(owner:string,id:string,opts?:{
    };
 
    if(workerResult.ok||status==='active'){
-    const okNext={...next,status:'active',cooldownUntil:'',error:''};
+    const okNext={...next,status:'active',cooldownUntil:'',cooldownReason:'',error:''};
     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(okNext),owner,id,'account').run();
     return {
      id,ok:true,status:'active',error:'',profile,
@@ -1098,7 +1098,8 @@ async function healDeadGroupAccounts(owner:string){
    const a=JSON.parse(String(r.data));
    const st=String(a.status||'');
    accHardDead.set(String(r.id),isHardDeadAccountStatus(st));
-   accOnCooldown.set(String(r.id),isOnCooldown(a.cooldownUntil));
+   // Отлёжка = дневной лимит (status=cooldown), не голый cooldownUntil от FloodWait/коннекта.
+   accOnCooldown.set(String(r.id),isDayLimitCooldown(a)||st==='spamblock'||st==='frozen');
    accJoinQuota.set(String(r.id),hasInviteQuota(a));
   }catch{
    accHardDead.set(String(r.id),true);
@@ -1646,7 +1647,6 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   if(!alreadyIn){
    const currentReady=
     isAccountUsable(adata)&&
-    !isOnCooldown(adata.cooldownUntil)&&
     hasInviteQuota(adata)&&
     joinWaitSec(adata)===0;
    if(!currentReady){
@@ -1661,7 +1661,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      try{await appendGlobalRescanLog(owner,'info',`${gdata.name||'Группа'}: ферма ${fromId.slice(0,8)} → ${pick.id.slice(0,8)}`)}catch{/* */}
     }else if(!pick){
      const inviteLimit=Number(adata.limits?.invite??DEFAULT_ACCOUNT_LIMITS.invite);
-     if(!hasInviteQuota(adata)||isOnCooldown(adata.cooldownUntil)||!isAccountUsable(adata)){
+     if(!hasInviteQuota(adata)||!isAccountUsable(adata)){
       return reply({
        error:`Дневной лимит вступлений у всех рабочих аккаунтов (лимит ${inviteLimit}/день). Завтра или добавьте аккаунт в ферму.`,
        limitReached:true,
@@ -1671,8 +1671,13 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     }
    }
   }
-  if(isOnCooldown(adata.cooldownUntil)){
-   return reply({error:`Аккаунт на отлежке до ${new Date(adata.cooldownUntil).toLocaleString('ru-RU')}`,waitSec:Math.ceil((Date.parse(adata.cooldownUntil)-Date.now())/1000),cooldown:true},429);
+  if(isDayLimitCooldown(adata)||String(adata.status||'')==='spamblock'||String(adata.status||'')==='frozen'){
+   const until=String(adata.cooldownUntil||'');
+   return reply({
+    error:until?`Аккаунт на отлежке до ${new Date(until).toLocaleString('ru-RU')}`:'Аккаунт на отлёжке (спамблок/заморозка/лимит)',
+    waitSec:until?Math.max(60,Math.ceil((Date.parse(until)-Date.now())/1000)||300):300,
+    cooldown:true,
+   },429);
   }
   if(!hasInviteQuota(adata)){
    const inviteLimit=Number(adata.limits?.invite??DEFAULT_ACCOUNT_LIMITS.invite);
@@ -1772,7 +1777,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     return reply({error:'Аккаунт группы не найден',accountDead:true},400);
    }
    const st=String(adata.status||'');
-   if(st==='cooldown'||isOnCooldown(adata.cooldownUntil)){
+   if(isDayLimitCooldown(adata)||st==='spamblock'||st==='frozen'){
     return reply({
      ok:false,
      skipped:true,
@@ -2460,7 +2465,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   let rotatedAccount=false;
   // Для уже открытой переписки держим тот же аккаунт (чужой peer → invalid Peer)
   const keepConversationAccount=!!lead.conversationOpen||(Array.isArray(lead.replies)&&lead.replies.some((x:any)=>x&&x.from==='us'&&x.ok));
-  const currentOk=adata&&isAccountUsable(adata)&&!isOnCooldown(adata.cooldownUntil)&&hasMessageQuota(adata);
+  const currentOk=adata&&isAccountUsable(adata)&&hasMessageQuota(adata);
   const currentAlive=adata&&canPollDmInbox(adata);
   if(!currentOk&&mode==='dm'&&!(keepConversationAccount&&currentAlive)){
    const farm=await listMessageFarmCandidates(owner);
@@ -2473,7 +2478,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    }
   }
   if(!adata)return reply({error:'Аккаунт не найден'},404);
-  if(isOnCooldown(adata.cooldownUntil)&&!(keepConversationAccount&&currentAlive)){
+  if(!isAccountUsable(adata)&&!(keepConversationAccount&&currentAlive)){
    return reply({error:'Аккаунт на отлежке — отправка недоступна',cooldown:true},429);
   }
   if(!hasMessageQuota(adata)&&!(keepConversationAccount&&currentAlive)){
@@ -3102,6 +3107,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     .map(aid=>{
      const a=accMap.get(aid);
      if(!a)return 0;
+     if(!(isDayLimitCooldown(a)||String(a.status||'')==='spamblock'))return 0;
      const t=Date.parse(String(a.cooldownUntil||''));
      return Number.isFinite(t)&&t>Date.now()?t:0;
     })
@@ -3460,7 +3466,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     const a=accMap.get(aid);
     const label=String(a?.name||a?.phone||aid).slice(0,28);
     const st=String(a?.status||'missing');
-    const cool=isOnCooldown(a?.cooldownUntil);
+    const cool=isDayLimitCooldown(a)||st==='spamblock'||st==='frozen';
     const ok=isAccountUsable(a);
     if(ok)liveN++;
     lines.push(`${ok?'✓':'✗'} ${label}: ${st}${cool?' · отлёжка':''}`);
@@ -3579,6 +3585,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const a=accMap.get(aid);
    return String(a?.name||a?.username||a?.phone||aid).slice(0,40);
   };
+  const mailingMode=(data.deliveryMode||'dm') as 'dm'|'chat';
   const dead=accountIds.filter(aid=>{
    const a=accMap.get(aid);
    if(!a)return true;
@@ -3588,7 +3595,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const liveIds=accountIds.filter(aid=>{
    const a=accMap.get(aid);
    if(!isAccountUsable(a))return false;
-   return hasMessageQuota(a);
+   return mailingMode==='chat'?hasChatQuota(a):hasMessageQuota(a);
   });
   // Стоп по % — только если живых не осталось (раньше стопили при 30% даже с рабочими аккаунтами)
   if(!liveIds.length){
@@ -3609,11 +3616,14 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    }
    const quotaHit=accountIds.filter(aid=>{
     const a=accMap.get(aid);
-    return isAccountUsable(a)&&!hasMessageQuota(a);
+    if(!isAccountUsable(a))return false;
+    return mailingMode==='chat'?!hasChatQuota(a):!hasMessageQuota(a);
    }).length;
    const ends=accountIds.map(aid=>{
     const a=accMap.get(aid);
     if(!a)return 0;
+    // Таймер учитываем только для реальной отлёжки / спамблока.
+    if(!(isDayLimitCooldown(a)||String(a.status||'')==='spamblock'))return 0;
     const t=Date.parse(String(a.cooldownUntil||''));
     return Number.isFinite(t)&&t>Date.now()?t:0;
    }).filter(t=>t>0).sort((a,b)=>a-b);
@@ -3842,8 +3852,12 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      result.status==='spamblock'||
      isPeerFloodMailingError(errRaw)||
      errRaw.includes('PEER_FLOOD');
+    const accountFrozen=
+     result.status==='frozen'||
+     /FROZEN|заморожен/i.test(errRaw);
     const rateLimited=
      !peerFlood&&
+     !accountFrozen&&
      (result.status==='flood'||
       !!result.flood||
       Number(result.waitSec)>0||
@@ -3855,22 +3869,35 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       Number(result.waitSec)||0,
       parseMailingFloodWaitSec(errRaw,900),
      );
-     // FloodWait / Too many requests — пауза фермы, без статуса «Отлежка».
-     accountWentCooldown=true;
+     // FloodWait / Too many requests — пауза тика/получателя, аккаунт НЕ в «Отлёжку».
      deferredUntil[cand.key]=new Date(Date.now()+waitSec*1000).toISOString();
-     cooldownUntil=deferredUntil[cand.key];
      if(data.contentMode==='ai'&&text){
       aiPool.unshift(text);
       aiPoolUsed=Math.max(0,aiPoolUsed-1);
      }
      logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)}: лимит Telegram · пауза ${waitSec}с`});
      logEntries.push({level:'info',text:`Получатель отложен на ${Math.ceil(waitSec/60)} мин (Too many requests)`});
-     // Аккаунт остаётся active — только задача ждёт waitSec / смена слота.
+     // Меняем слот фермы; статус аккаунта не трогаем.
+     break;
     }
-    if(peerFlood){
+    if(accountFrozen){
+     accountWentCooldown=true;
+     if(data.contentMode==='ai'&&text){
+      aiPool.unshift(text);
+      aiPoolUsed=Math.max(0,aiPoolUsed-1);
+     }
+     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} заморожен Telegram`});
+     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
+     if(arow){
+      const adata=JSON.parse(arow.data);
+      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(
+       withFrozenStatus(adata,errRaw||'Аккаунт заморожен Telegram'),
+      ),owner,accountId,'account').run();
+     }
+    }else if(peerFlood){
      cooldownUntil=cooldownHoursFromNow(24);
      accountWentCooldown=true;
-     if(data.contentMode==='ai'&&text&&!rateLimited){
+     if(data.contentMode==='ai'&&text){
       aiPool.unshift(text);
       aiPoolUsed=Math.max(0,aiPoolUsed-1);
      }
@@ -3962,9 +3989,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
        }
       }catch{/* */}
      }
-    }else if(rateLimited||peerFlood){
-     // Лимит / write-ban аккаунта — получателя не списываем навсегда
-     if(peerFlood&&!rateLimited){
+    }else if(rateLimited||peerFlood||accountFrozen){
+     // FloodWait / spam / freeze — получателя не списываем навсегда
+     if((peerFlood||accountFrozen)&&!rateLimited){
       deferredUntil[cand.key]=cooldownUntil||cooldownHoursFromNow(1);
      }
     }else{
@@ -3990,7 +4017,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       }
      }
     }
-    if(ok||(!rateLimited&&!peerFlood)){
+    if(ok||(!rateLimited&&!peerFlood&&!accountFrozen)){
      const entry:MailingDelivery={
       at:new Date().toISOString(),
       key:cand.key,
@@ -4033,7 +4060,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const stillLive=liveIds.filter(aid=>{
     if(aid!==accountId)return true;
     if(accountWentCooldown)return false;
-    return hasMessageQuota(accMap.get(accountId));
+    const a=accMap.get(accountId);
+    return deliveryMode==='chat'?hasChatQuota(a):hasMessageQuota(a);
    });
    let pause=randomPauseSec(data.pauseFromSec,data.pauseToSec);
    if(data.pauseBetweenAccounts&&prevAccountId&&prevAccountId!==accountId){

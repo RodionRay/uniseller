@@ -7,6 +7,7 @@ import {
   canPollDmInbox,
   cooldownRemainingShort,
   isAccountUsable,
+  isDayLimitCooldown,
   relativeTimeRu,
   withDayLimitCooldown,
   withFrozenStatus,
@@ -73,6 +74,7 @@ describe("менеджер аккаунтов · helpers", () => {
     const future = new Date(Date.now() + 3600_000).toISOString();
     // Старый фейл коннекта: active + cooldownUntil — аккаунт рабочий
     expect(isAccountUsable({ status: "active", cooldownUntil: future })).toBe(true);
+    expect(isDayLimitCooldown({ status: "active", cooldownUntil: future })).toBe(false);
     expect(isAccountUsable({ status: "disconnected", cooldownUntil: future })).toBe(false);
 
     const limited = withDayLimitCooldown(
@@ -81,6 +83,7 @@ describe("менеджер аккаунтов · helpers", () => {
     );
     expect(limited.status).toBe("cooldown");
     expect(limited.cooldownReason).toBe("day_invite");
+    expect(isDayLimitCooldown(limited)).toBe(true);
     expect(isAccountUsable(limited)).toBe(false);
 
     const spam = withSpamblockStatus({ status: "active" }, "PEER_FLOOD");
@@ -108,5 +111,44 @@ describe("менеджер аккаунтов · helpers", () => {
     });
     expect(out.status).toBe("cooldown");
     expect(String(out.error)).toMatch(/вступлений/);
+  });
+
+  it("сбрасывает осиротевший cooldownUntil без status=cooldown", () => {
+    const future = new Date(Date.now() + 3600_000).toISOString();
+    const out = applyQuotaCooldownIfExhausted({
+      status: "active",
+      cooldownUntil: future,
+      cooldownReason: "legacy_flood",
+      limits: { invite: 40, message: 40, chat: 40, memberInvite: 40 },
+    });
+    expect(out.status).toBe("active");
+    expect(out.cooldownUntil).toBe("");
+    expect(isAccountUsable(out)).toBe(true);
+  });
+
+  it("отлёжка по комментариям и инвайтам рассылки", () => {
+    const day = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Moscow",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+    const chat = applyQuotaCooldownIfExhausted({
+      status: "active",
+      limits: { invite: 40, message: 40, chat: 2, memberInvite: 40 },
+      chatsToday: 2,
+      chatsDay: day,
+    });
+    expect(chat.status).toBe("cooldown");
+    expect(String(chat.cooldownReason)).toBe("day_chat");
+
+    const invites = applyQuotaCooldownIfExhausted({
+      status: "active",
+      limits: { invite: 40, message: 40, chat: 40, memberInvite: 3 },
+      memberInvitesToday: 3,
+      memberInviteDay: day,
+    });
+    expect(invites.status).toBe("cooldown");
+    expect(String(invites.cooldownReason)).toBe("day_memberInvite");
   });
 });

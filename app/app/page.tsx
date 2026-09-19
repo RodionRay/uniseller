@@ -376,13 +376,11 @@ function statusBadge(status:string,kind?:Kind){
 }
 
 function accountRowStatus(data:any){
-  // Отлёжка в UI — только явный статус cooldown с живым таймером, либо spamblock с таймером.
+  // Отлёжка в UI — только status=cooldown (дневной лимит) или spamblock/frozen.
   if(data.status==='spamblock')return 'spamblock';
   if(data.status==='frozen')return 'frozen';
   if(data.status==='cooldown'&&isOnCooldown(data.cooldownUntil))return 'cooldown';
   if(data.status==='cooldown'&&!isOnCooldown(data.cooldownUntil))return 'active';
-  // Старый cooldownUntil без статуса cooldown (ошибка коннекта) — не показываем как Отлежку.
-  if(isOnCooldown(data.cooldownUntil)&&data.cooldownReason)return 'cooldown';
   return data.status||'setup';
 }
 
@@ -738,7 +736,7 @@ function WorkspaceHome(){
     const mailingBusy=list('mailing_task').filter(r=>r.data.status==='running'||r.data.status==='scheduled'||r.data.status==='error').length;
     const accounts=list('account').filter(r=>{
       const st=String(r.data.status||'');
-      return PROBLEM_ACCOUNT.has(st)||isOnCooldown(r.data.cooldownUntil);
+      return PROBLEM_ACCOUNT.has(st);
     }).length;
     const proxies=list('proxy').filter(r=>r.data.status!=='active').length;
     const badges:Partial<Record<NavName,number>>={
@@ -1913,7 +1911,8 @@ function WorkspaceHome(){
         ...defaults.account,
         ...item.data,
         cooldownUntil:hours===null?'':cooldownHoursFromNow(hours),
-        status:hours===null?(item.data.status==='cooldown'?'active':item.data.status):'cooldown',
+        cooldownReason:hours===null?'':(item.data.cooldownReason||'manual'),
+        status:hours===null?(item.data.status==='cooldown'||item.data.status==='spamblock'?'active':item.data.status):'cooldown',
         error:hours===null&&(item.data.error==='PEER_FLOOD'||/too many requests/i.test(String(item.data.error||'')))?'':item.data.error,
       };
       await api({action:'save',kind:'account',id:item.id,data});
@@ -1939,7 +1938,8 @@ function WorkspaceHome(){
             ...defaults.account,
             ...item.data,
             cooldownUntil:hours===null?'':cooldownHoursFromNow(hours),
-            status:hours===null?(item.data.status==='cooldown'?'active':item.data.status):'cooldown',
+            cooldownReason:hours===null?'':(item.data.cooldownReason||'manual'),
+            status:hours===null?(item.data.status==='cooldown'||item.data.status==='spamblock'?'active':item.data.status):'cooldown',
             error:hours===null?'':item.data.error,
           };
           await api({action:'save',kind:'account',id:item.id,data});
@@ -2655,7 +2655,13 @@ function WorkspaceHome(){
       if(key==='phone')return r.data.phone||'';
       if(key==='proxy')return records.find(x=>x.id===r.data.proxyId)?.data.name||'';
       if(key==='status')return accountRowStatus(r.data);
-      if(key==='cooldown')return isOnCooldown(r.data.cooldownUntil)?r.data.cooldownUntil:'';
+      if(key==='cooldown'){
+        const st=String(r.data.status||'');
+        if(st==='cooldown'||st==='spamblock'){
+          return isOnCooldown(r.data.cooldownUntil)?r.data.cooldownUntil:'';
+        }
+        return '';
+      }
       if(key==='updated')return accountUpdatedAt(r.data,r.created);
     }
     if(currentKind==='proxy'){

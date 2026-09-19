@@ -409,7 +409,7 @@ async function runProxyCheck(owner:string,id:string){
    error:workerDown
     ?(/AbortError|timeout/i.test(msg)
       ?'Таймаут проверки прокси. Повторите или смените прокси.'
-      :'Telegram-воркер недоступен для проверки прокси. Запустите: npm run tg:worker')
+      :'Telegram-воркер недоступен для проверки прокси. Запустите: npm run dev')
     :msg.slice(0,400),
   };
  }
@@ -417,7 +417,7 @@ async function runProxyCheck(owner:string,id:string){
   result={
    ...result,
    ok:false,
-   error:'Сбой проверки в среде кабинета. Нужен tg-worker (npm run tg:worker) и верный логин/пароль прокси.',
+   error:'Сбой проверки в среде кабинета. Нужен Telegram-воркер (он стартует с npm run dev) и верный логин/пароль прокси.',
   };
  }
  const next={
@@ -811,7 +811,7 @@ async function runAccountCheck(owner:string,id:string,opts?:{
     ...data,
     status:msg.includes('воркер')||msg.includes('fetch')||isTimeout?'disconnected':'unauthorized',
     error:msg.includes('ECONNREFUSED')||msg.includes('fetch failed')
-     ?'Telegram-воркер недоступен. Запустите: npm run tg:worker'
+     ?'Telegram-воркер недоступен. Запустите: npm run dev'
      :(isTimeout?'Таймаут проверки — смените прокси или повторите':msg.slice(0,500)),
     checkingAt:'',
     ...(proxyRotated?{proxyId:proxyRotated}:{}),

@@ -835,7 +835,7 @@ function WorkspaceHome(){
   },[telegramConnected]);
 
   async function startAudienceTask(id:string){
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     if(busyRef.current)return;
     pausedTasksRef.current.delete(id);
     setBusy(true);busyRef.current=true;
@@ -876,7 +876,7 @@ function WorkspaceHome(){
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
   async function startInviteTask(id:string){
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     if(busyRef.current)return;
     pausedTasksRef.current.delete(id);
     setBusy(true);busyRef.current=true;
@@ -904,7 +904,7 @@ function WorkspaceHome(){
     }finally{setBusy(false);busyRef.current=false}
   }
   async function startMailingTask(id:string){
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     if(busyRef.current)return;
     pausedTasksRef.current.delete(id);
     setBusy(true);busyRef.current=true;
@@ -1014,7 +1014,7 @@ function WorkspaceHome(){
     if(!items.length)return;
     try{await api({action:'heal_group_join_state'})}catch{/* */}
     if(!telegramConnected){
-      toast.error('Запустите: npm run tg:worker');
+      toast.error('Запустите: npm run dev');
       return;
     }
     let toAdd=items.filter(i=>{
@@ -1290,7 +1290,7 @@ function WorkspaceHome(){
 
   /** Вступление + скан лидов по сохранённой группе. */
   async function onboardGroup(id:string,name?:string){
-    if(!telegramConnected)throw new Error('Запустите: npm run tg:worker');
+    if(!telegramConnected)throw new Error('Запустите: npm run dev');
     const join=await joinGroupPaced(id,name);
     if(join.result?.join==='requested'){
       return {joined:'requested' as const,scanned:0,matched:0,added:0,aiUsed:false,title:''};
@@ -1499,7 +1499,7 @@ function WorkspaceHome(){
 
   async function sendLeadReply(){
     if(!detail||!chatText.trim())return;
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     setBusy(true);
     try{
       const r=await api({action:'send_lead_message',id:detail.id,mode:chatMode,text:chatText.trim()});
@@ -2161,7 +2161,7 @@ function WorkspaceHome(){
   async function checkAccounts(mode:'all'|'problem'){
     const targets=list('account').filter(r=>mode==='all'||r.data.status!=='active');
     if(!targets.length){toast.message(mode==='problem'?'Нет проблемных аккаунтов':'Нет аккаунтов');return}
-    if(!telegramConnected){toast.error('Сначала запустите Telegram-воркер: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Сначала запустите: npm run dev');return}
     const queue=targets.slice(0,40);
     let done=0,active=0,rotated=0,refreshed=0;
     setAccountCheckProgress({done:0,total:queue.length,active:0});
@@ -2286,7 +2286,7 @@ function WorkspaceHome(){
       fixGroupUrl(item);
       return;
     }
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     void startBackgroundJoins([{id:item.id,name:item.data.name||'Группа'}]);
   }
 
@@ -2297,7 +2297,7 @@ function WorkspaceHome(){
       fixGroupUrl(item);
       return;
     }
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     setBusy(true);
     try{
       const res=await api({action:'scan_group',id:item.id});
@@ -2375,7 +2375,7 @@ function WorkspaceHome(){
     const parsed=parseGroupUrlLines(groupImportText);
     if(!parsed.length){setFormError('Не нашёл ни одной ссылки t.me / @username');return}
     if(groupImportJoin&&!groupImportAccountId){setFormError('Выберите аккаунт для вступления');return}
-    if(groupImportJoin&&!telegramConnected){setFormError('Запустите: npm run tg:worker');return}
+    if(groupImportJoin&&!telegramConnected){setFormError('Запустите: npm run dev');return}
     setBusy(true);
     setFormError('');
     try{
@@ -2473,7 +2473,7 @@ function WorkspaceHome(){
     const doJoin=!!opts?.join;
     if(doJoin){
       if(!catalogAccountId){toast.error('Сначала выберите аккаунт слева/сверху');return}
-      if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+      if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     }
     if(!ready.length){
       toast.message('Нет чатов со ссылкой');
@@ -2579,7 +2579,7 @@ function WorkspaceHome(){
   /** Клик по чату в каталоге = сразу вступить (без отдельной кнопки на карточке группы). */
   function joinCatalogNow(catalogId:string){
     if(!catalogAccountId){toast.error('Выберите аккаунт для вступления');return}
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     void addCatalogGroups([catalogId]);
   }
 
@@ -3449,7 +3449,7 @@ function WorkspaceHome(){
             )}
             {currentKind==='lead'&&(
               <div className="status-note">
-                «Собрать лиды» — принудительный обход. Автообход круглосуточно через tg-worker (каждые {settings?.data.autoRescanMinutes||30} мин на группу), кабинет открывать не нужно
+                «Собрать лиды» — принудительный обход. Автообход круглосуточно через Telegram-воркер из npm run dev (каждые {settings?.data.autoRescanMinutes||30} мин на группу)
                 {settings?.data.lastAutoRescanAt?` · последний ${new Date(settings.data.lastAutoRescanAt).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}`:''}
                 {autoRescanRunning?' · идёт…':''}.
               </div>
@@ -5338,7 +5338,7 @@ function WorkspaceHome(){
             </div>
             <p className="small-note">
               Цель: {accountSelected.length?`${accountSelected.length} выбранных`:`все ${list('account').length} аккаунтов`}.
-              Нужен запущенный tg:worker для записи в Telegram.
+              Нужен запущенный Telegram-воркер (идёт вместе с npm run dev).
             </p>
             <div className="flex flex-wrap gap-2">
               <Button disabled={busy||!list('account').length} onClick={()=>applyFarmProfiles(accountSelected.length?accountSelected:list('account').map(r=>r.id),true)}>

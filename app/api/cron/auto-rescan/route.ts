@@ -353,7 +353,7 @@ async function tickOwner(
       stoppedEarly ||
       due > ids.length ||
       extraReassigned > 0 ||
-      (pendingJoins.size > 0 && joined > 0);
+      pendingJoins.size > 0;
     return {
       ok: true,
       scanned,

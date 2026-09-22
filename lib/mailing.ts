@@ -294,21 +294,27 @@ export function parseMailingFloodWaitSec(error: string, fallback = 900): number 
 /** Ошибка получателя, которую бессмысленно ретраить на других аккаунтах. */
 export function isPermanentMailingRecipientError(error: string): boolean {
   const e = String(error || "").toLowerCase();
+  // Peer/session-bound ошибки — НЕ permanent (другой слот / свой access_hash могут пройти)
+  if (
+    e.includes("нет access_hash") ||
+    e.includes("не удалось открыть пользователя") ||
+    e.includes("could not find the input entity") ||
+    e.includes("cannot find any entity") ||
+    e.includes("peer_id_invalid") ||
+    e.includes("invalid peer") ||
+    e.includes("no user has") ||
+    e.includes("nobody is using this username") ||
+    e.includes("username_not_occupied")
+  ) {
+    return false;
+  }
   return (
     e.includes("privacy") ||
     e.includes("ограничил") ||
     e.includes("запретил") ||
-    e.includes("username_not_occupied") ||
     e.includes("username_invalid") ||
-    e.includes("no user has") ||
-    e.includes("nobody is using this username") ||
     e.includes("user_deactivated") ||
     e.includes("input_user_deactivated") ||
-    e.includes("peer_id_invalid") ||
-    e.includes("could not find the input entity") ||
-    e.includes("cannot find any entity") ||
-    e.includes("нет access_hash") ||
-    e.includes("не удалось открыть пользователя") ||
     e.includes("каналом/чатом") ||
     e.includes("не пользователем") ||
     e.includes("это бот") ||

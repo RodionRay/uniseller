@@ -46,11 +46,12 @@ describe('рассылка · flood / лог / очередь',()=>{
     expect(mailingOkText('dana','1','','')).toBe('Доставлено @dana');
   });
 
-  it('понятно объясняет ошибку input entity / access_hash',()=>{
+  it('peer/access_hash ошибки — не permanent (другой слот может пройти)',()=>{
     const raw='Could not find the input entity for PeerUser(user_id=342560478)';
-    expect(isPermanentMailingRecipientError(raw)).toBe(true);
+    expect(isPermanentMailingRecipientError(raw)).toBe(false);
     expect(mailingFailText('timosha_07','342560478',raw)).toContain('access_hash');
-    expect(isPermanentMailingRecipientError('Не удалось открыть пользователя (нет access_hash)')).toBe(true);
+    expect(isPermanentMailingRecipientError('Не удалось открыть пользователя (нет access_hash)')).toBe(false);
+    expect(isPermanentMailingRecipientError('USER_PRIVACY_RESTRICTED')).toBe(true);
   });
 
   it('бан на запись в супергруппы → spamblock аккаунта, не FloodWait',()=>{

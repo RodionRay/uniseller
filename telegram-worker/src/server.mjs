@@ -140,11 +140,12 @@ function scheduleCatchUp() {
 
 async function tickAutoRescan(force = false) {
   if (autoRescanBusy) {
-    if (Date.now() - autoRescanBusyAt < BUSY_STALE_MS) {
-      return { skipped: true, reason: "busy" };
+    // Не снимаем busy вручную — иначе параллельный fetch. Только catch-up.
+    if (Date.now() - autoRescanBusyAt >= BUSY_STALE_MS) {
+      console.warn("[auto-rescan] busy долго — ставлю catch-up, не форсю второй тик");
+      scheduleCatchUp();
     }
-    console.warn("[auto-rescan] снимаю залипший busy-lock");
-    autoRescanBusy = false;
+    return { skipped: true, reason: "busy" };
   }
   if (!CRON_SECRET) {
     console.warn(

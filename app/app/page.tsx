@@ -300,8 +300,6 @@ function groupAlreadyIn(item:RecordItem){
   if(d.membership==='joined'||d.membership==='pending')return true;
   if(d.status==='pending')return true;
   if(d.joinedAt)return true;
-  if(Number(d.leadsTotal)>0||Number(d.leadsHot)>0||Number(d.leadsWarm)>0||Number(d.scanMatched)>0)return true;
-  if(Array.isArray(d.scanLog)&&d.scanLog.length>0)return true;
   return false;
 }
 
@@ -780,7 +778,8 @@ function WorkspaceHome(){
   useEffect(()=>{
     if(!telegramConnected)return;
     const tick=async()=>{
-      if(taskPollLock.current||busyRef.current||joinRunnerLock.current||autoRescanLock.current)return;
+      if(taskPollLock.current)return;
+      // autoRescan/join не стопят тики задач — иначе сбор/инвайт простаивают минутами
       const snap=recordsRef.current;
       const runningAudience=snap.filter(r=>r.kind==='audience_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
       const runningInvite=snap.filter(r=>r.kind==='invite_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
@@ -791,30 +790,33 @@ function WorkspaceHome(){
         for(const t of runningAudience){
           try{
             const r=await api({action:'tick_audience',id:t.id});
+            if(r.busy||r.skipped)continue;
             applyTickTask(t.id,r.task);
             if(r.joined)toast.message(`${displayTgHandle(t.data.url||'')}: вступили в источник`);
             if(r.task?.status==='completed')toast.success(`Сбор завершён: ${displayTgHandle(t.data.url||'')} · ${r.task.collected||0}`);
-          }catch{/* */}
+            if(r.task?.status==='paused'&&r.task?.error)toast.error(String(r.task.error).slice(0,120));
+          }catch(e){toast.error(`Сбор: ${String((e as Error).message||e).slice(0,100)}`)}
         }
         for(const t of runningInvite){
           try{
             const r=await api({action:'tick_invite',id:t.id});
+            if(r.busy||r.skipped||r.waiting)continue;
             applyTickTask(t.id,r.task);
             if(r.completed)toast.success(`Инвайт завершён: ${displayTgHandle(t.data.targetUrl||'')}`);
-          }catch{/* */}
+          }catch(e){toast.error(`Инвайт: ${String((e as Error).message||e).slice(0,100)}`)}
         }
         for(const t of runningMailing){
           try{
             const r=await api({action:'tick_mailing',id:t.id});
             // skipped/busy — не затираем локальный running устаревшим paused
-            if(r.skipped||r.busy)continue;
+            if(r.skipped||r.busy||r.waiting)continue;
             applyTickTask(t.id,r.task);
             if(r.stopped){
               toast.error(r.task?.error||`Рассылка остановлена: ${t.data.name||''}`);
             }else if(r.completed){
               toast.success(`Рассылка завершена: ${t.data.name||''} · ${r.task?.sentTotal||0}`);
             }
-          }catch{/* */}
+          }catch(e){toast.error(`Рассылка: ${String((e as Error).message||e).slice(0,100)}`)}
         }
         }
         try{
@@ -1127,8 +1129,8 @@ function WorkspaceHome(){
               scan=await scanAfterJoin(g.id,g.name);
             }catch(scanErr){
               const scanData=(scanErr as Error & {data?:any})?.data;
-              // Soft need_join после успешного join: membership сохраняем, не в авто-rejoin
-              const keepJoined=!!scanData?.soft||!!scanData?.preserved||!!scanData?.needJoin;
+              // Soft need_join только при soft/preserved от API (не любой needJoin)
+              const keepJoined=!!scanData?.soft||!!scanData?.preserved;
               void persistJoinState(g.id,'');
               if(keepJoined){
                 patchGroupLocal(g.id,{
@@ -1140,11 +1142,22 @@ function WorkspaceHome(){
                   joinStateError:'',
                   error:'',
                 });
+                setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
+                toast.message(`${g.name}: вступили, скан подхватит автообход`);
+                onboarded++;
+              }else{
+                patchGroupLocal(g.id,{
+                  status:'setup',
+                  membership:'none',
+                  joinedAt:'',
+                  joinState:'queued',
+                  joinStateAt:new Date().toISOString(),
+                  joinStateError:String(scanData?.error||(scanErr as Error).message||'').slice(0,200),
+                  error:String(scanData?.error||(scanErr as Error).message||'').slice(0,200),
+                });
+                setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'error',error:String(scanData?.error||'нужно вступить снова').slice(0,120)}:q));
+                toast.message(`${g.name}: скан не подтвердил членство — снова в очередь`);
               }
-              setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
-              toast.message(`${g.name}: вступили, скан подхватит автообход`);
-              // Не ставим autoRescanPending→rejoin: иначе снова в очередь
-              onboarded++;
               await refresh();
               continue;
             }

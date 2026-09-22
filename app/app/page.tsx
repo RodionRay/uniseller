@@ -80,6 +80,7 @@ import {
   DEFAULT_AUDIENCE_TASK,
   DEFAULT_INVITE_TASK,
   displayTgHandle,
+  normalizeStatusFilters,
   normalizeTgRef,
   parseGroupUrlLines,
   telegramMessageLink,
@@ -140,7 +141,7 @@ AI будет использовать этот текст для отбора �
   invite_task:{...DEFAULT_INVITE_TASK},
   mailing_task:{...DEFAULT_MAILING_TASK},
 };
-const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов и черновики: менеджер подключается здесь. Уведомление уходит в Telegram-бота.','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
+const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов: откройте диалог — он уйдёт в «Просмотренные». Новый ответ клиента снова в «Новые».','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
 
 async function api(body?:unknown){
   const r=await fetch('/api/workspace',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});
@@ -374,13 +375,11 @@ function statusBadge(status:string,kind?:Kind){
 }
 
 function accountRowStatus(data:any){
-  // Отлёжка в UI — только явный статус cooldown с живым таймером, либо spamblock с таймером.
+  // Отлёжка в UI — только status=cooldown (дневной лимит) или spamblock/frozen.
   if(data.status==='spamblock')return 'spamblock';
   if(data.status==='frozen')return 'frozen';
   if(data.status==='cooldown'&&isOnCooldown(data.cooldownUntil))return 'cooldown';
   if(data.status==='cooldown'&&!isOnCooldown(data.cooldownUntil))return 'active';
-  // Старый cooldownUntil без статуса cooldown (ошибка коннекта) — не показываем как Отлежку.
-  if(isOnCooldown(data.cooldownUntil)&&data.cooldownReason)return 'cooldown';
   return data.status||'setup';
 }
 
@@ -657,7 +656,13 @@ function WorkspaceHome(){
   const openTask=(kind:'audience_task'|'invite_task'|'mailing_task',item?:RecordItem)=>{
     setInviteWizardStep(item?2:1);
     setModal({kind,item});
-    setForm({...defaults[kind],...item?.data});
+    const data={...defaults[kind],...item?.data};
+    if(kind==='audience_task'){
+      const statusFilters=normalizeStatusFilters(data.statusFilters,data.statusFilter);
+      data.statusFilters=statusFilters;
+      data.statusFilter=statusFilters.length===1?statusFilters[0]:'all';
+    }
+    setForm(data);
     setFormError('');
   };
   const goLeads=(opts?:{groupId?:string;filter?:string})=>{
@@ -705,6 +710,9 @@ function WorkspaceHome(){
   const freshLeads=list('lead').filter(r=>!r.data.viewed&&!r.data.excludeFromTraining);
   const viewedLeads=list('lead').filter(r=>!!r.data.viewed&&!r.data.excludeFromTraining);
   const excludedLeads=list('lead').filter(r=>!!r.data.excludeFromTraining);
+  const chatLeads=list('lead').filter(r=>(!!r.data.draft||!!r.data.conversationOpen)&&!r.data.excludeFromTraining);
+  const freshChats=chatLeads.filter(r=>!r.data.viewed);
+  const viewedChats=chatLeads.filter(r=>!!r.data.viewed);
 
   const allowedNav=useMemo(()=>{
     if(!workspaceMeta||workspaceMeta.isOwner)return null;
@@ -726,6 +734,7 @@ function WorkspaceHome(){
 
   const navBadges=useMemo(()=>{
     // Только непрочитанные ответы клиента — не все открытые переписки
+    // Бейдж «Переписки» — только needsManager (непрочитанный ответ клиента)
     const needManager=list('lead').filter(r=>!!r.data.needsManager&&!r.data.excludeFromTraining).length;
     const groups=list('group').filter(r=>{
       const d=r.data||{};
@@ -736,7 +745,7 @@ function WorkspaceHome(){
     const mailingBusy=list('mailing_task').filter(r=>r.data.status==='running'||r.data.status==='scheduled'||r.data.status==='error').length;
     const accounts=list('account').filter(r=>{
       const st=String(r.data.status||'');
-      return PROBLEM_ACCOUNT.has(st)||isOnCooldown(r.data.cooldownUntil);
+      return PROBLEM_ACCOUNT.has(st);
     }).length;
     const proxies=list('proxy').filter(r=>r.data.status!=='active').length;
     const badges:Partial<Record<NavName,number>>={
@@ -839,7 +848,7 @@ function WorkspaceHome(){
   },[telegramConnected]);
 
   async function startAudienceTask(id:string){
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     if(busyRef.current)return;
     pausedTasksRef.current.delete(id);
     setBusy(true);busyRef.current=true;
@@ -880,7 +889,7 @@ function WorkspaceHome(){
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
   async function startInviteTask(id:string){
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     if(busyRef.current)return;
     pausedTasksRef.current.delete(id);
     setBusy(true);busyRef.current=true;
@@ -908,7 +917,7 @@ function WorkspaceHome(){
     }finally{setBusy(false);busyRef.current=false}
   }
   async function startMailingTask(id:string){
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     if(busyRef.current)return;
     pausedTasksRef.current.delete(id);
     setBusy(true);busyRef.current=true;
@@ -1018,7 +1027,7 @@ function WorkspaceHome(){
     if(!items.length)return;
     try{await api({action:'heal_group_join_state'})}catch{/* */}
     if(!telegramConnected){
-      toast.error('Запустите: npm run tg:worker');
+      toast.error('Запустите: npm run dev');
       return;
     }
     let toAdd=items.filter(i=>{
@@ -1305,7 +1314,7 @@ function WorkspaceHome(){
 
   /** Вступление + скан лидов по сохранённой группе. */
   async function onboardGroup(id:string,name?:string){
-    if(!telegramConnected)throw new Error('Запустите: npm run tg:worker');
+    if(!telegramConnected)throw new Error('Запустите: npm run dev');
     const join=await joinGroupPaced(id,name);
     if(join.result?.join==='requested'){
       return {joined:'requested' as const,scanned:0,matched:0,added:0,aiUsed:false,title:''};
@@ -1367,6 +1376,9 @@ function WorkspaceHome(){
       if(modal.kind==='audience_task'){
         payload.url=normalizeTgRef(payload.url||'');
         payload.name=payload.name||displayTgHandle(payload.url);
+        const statusFilters=normalizeStatusFilters(payload.statusFilters,payload.statusFilter);
+        payload.statusFilters=statusFilters;
+        payload.statusFilter=statusFilters.length===1?statusFilters[0]:'all';
         if(!modal.item)payload.status=autoStartAudience?'scheduled':'draft';
         // Журнал на сервере; с формы не гоняем 100+ строк (ломало save: «Проверьте поля: log»).
         if(modal.item)delete payload.log;
@@ -1503,12 +1515,12 @@ function WorkspaceHome(){
     setDetail(item);
     setChatMode('dm');
     setChatText(item.data.draft||'');
-    // Просмотр = просмотрена + снять «нужен менеджер» (Переписки)
-    if(item.data.viewed&&!item.data.needsManager)return;
-    const viewedAt=new Date().toISOString();
-    const patch={viewed:true,viewedAt,needsManager:false};
-    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,...patch}}:r));
-    setDetail(d=>d&&d.id===item.id?{...d,data:{...d.data,...patch}}:d);
+    const alreadyViewed=!!item.data.viewed;
+    const needsManager=!!item.data.needsManager;
+    if(alreadyViewed&&!needsManager)return;
+    const viewedAt=item.data.viewedAt||new Date().toISOString();
+    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,viewed:true,viewedAt,needsManager:false}}:r));
+    setDetail(d=>d&&d.id===item.id?{...d,data:{...d.data,viewed:true,viewedAt,needsManager:false}}:d);
     try{
       await api({action:'mark_lead_viewed',id:item.id});
     }catch{/* не блокируем просмотр */}
@@ -1516,7 +1528,7 @@ function WorkspaceHome(){
 
   async function sendLeadReply(){
     if(!detail||!chatText.trim())return;
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     setBusy(true);
     try{
       const r=await api({action:'send_lead_message',id:detail.id,mode:chatMode,text:chatText.trim()});
@@ -1945,7 +1957,8 @@ function WorkspaceHome(){
         ...defaults.account,
         ...item.data,
         cooldownUntil:hours===null?'':cooldownHoursFromNow(hours),
-        status:hours===null?(item.data.status==='cooldown'?'active':item.data.status):'cooldown',
+        cooldownReason:hours===null?'':(item.data.cooldownReason||'manual'),
+        status:hours===null?(item.data.status==='cooldown'||item.data.status==='spamblock'?'active':item.data.status):'cooldown',
         error:hours===null&&(item.data.error==='PEER_FLOOD'||/too many requests/i.test(String(item.data.error||'')))?'':item.data.error,
       };
       await api({action:'save',kind:'account',id:item.id,data});
@@ -1971,7 +1984,8 @@ function WorkspaceHome(){
             ...defaults.account,
             ...item.data,
             cooldownUntil:hours===null?'':cooldownHoursFromNow(hours),
-            status:hours===null?(item.data.status==='cooldown'?'active':item.data.status):'cooldown',
+            cooldownReason:hours===null?'':(item.data.cooldownReason||'manual'),
+            status:hours===null?(item.data.status==='cooldown'||item.data.status==='spamblock'?'active':item.data.status):'cooldown',
             error:hours===null?'':item.data.error,
           };
           await api({action:'save',kind:'account',id:item.id,data});
@@ -2193,7 +2207,7 @@ function WorkspaceHome(){
   async function checkAccounts(mode:'all'|'problem'){
     const targets=list('account').filter(r=>mode==='all'||r.data.status!=='active');
     if(!targets.length){toast.message(mode==='problem'?'Нет проблемных аккаунтов':'Нет аккаунтов');return}
-    if(!telegramConnected){toast.error('Сначала запустите Telegram-воркер: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Сначала запустите: npm run dev');return}
     const queue=targets.slice(0,40);
     let done=0,active=0,rotated=0,refreshed=0;
     setAccountCheckProgress({done:0,total:queue.length,active:0});
@@ -2318,7 +2332,7 @@ function WorkspaceHome(){
       fixGroupUrl(item);
       return;
     }
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     void startBackgroundJoins([{id:item.id,name:item.data.name||'Группа'}]);
   }
 
@@ -2329,7 +2343,7 @@ function WorkspaceHome(){
       fixGroupUrl(item);
       return;
     }
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     setBusy(true);
     try{
       const res=await api({action:'scan_group',id:item.id});
@@ -2355,30 +2369,37 @@ function WorkspaceHome(){
     }finally{setBusy(false)}
   }
 
-  function openCatalog(){
-    const s=list('settings')[0]?.data||defaults.settings;
-    const auto=nichesFromProjectText(s.product,s.audience,s.keywords,s.leadCriteria,s.name,s.pains,s.valueProps,s.hotSignals);
-    // По умолчанию — вся база; если AI подсказал ниши — узкий рынок, но «все ниши» внутри.
-    let marketId='all';
-    let niche:GroupNiche|null=null;
-    if(auto.length){
-      let best={id:'all',score:0};
-      for(const m of MARKET_SECTIONS){
-        if(!m.niches.length)continue;
-        const score=m.niches.filter(n=>auto.includes(n)).length;
-        if(score>best.score)best={id:m.id,score};
-      }
-      if(best.score>0)marketId=best.id;
-    }
+  function openCatalog(preferredMarket?:string){
+    // Полная база / «В базе» — без сужения AI в «Маркетплейсы».
+    const hasDb=list('group').length>0;
+    const marketId=preferredMarket||(hasDb?'db':'all');
     setCatalogMarket(marketId);
-    setCatalogNiche(niche);
+    setCatalogNiche(null);
     setCatalogHideAdded(false);
     setCatalogTab('links');
     setCatalogQuery('');
     setCatalogSelected([]);
     setCatalogAccountId(list('account').filter(a=>isAccountWorkable(a.data))[0]?.id||'');
     setCatalogOpen(true);
+    setCatalogSearching(true);
     setCatalogSearchTick(t=>t+1);
+  }
+
+  /** Одним запросом залить весь каталог в «Группы и каналы» текущего кабинета. */
+  async function importFullCatalogToDb(){
+    setBusy(true);
+    try{
+      const accountId=catalogAccountId||list('account').filter(a=>isAccountWorkable(a.data))[0]?.id||'';
+      const r=await api({action:'import_catalog',accountId:accountId||undefined});
+      await refresh();
+      const added=Number(r.added)||0;
+      const skipped=Number(r.skipped)||0;
+      toast.success(added?`В базу добавлено ${added} чатов`:`Уже в базе · ${skipped} чатов`);
+      setCatalogOpen(false);
+      navigate('Группы и каналы');
+      setGroupFilter('all');
+    }catch(e){toast.error((e as Error).message)}
+    finally{setBusy(false)}
   }
 
   function openManualGroup(){
@@ -2400,7 +2421,7 @@ function WorkspaceHome(){
     const parsed=parseGroupUrlLines(groupImportText);
     if(!parsed.length){setFormError('Не нашёл ни одной ссылки t.me / @username');return}
     if(groupImportJoin&&!groupImportAccountId){setFormError('Выберите аккаунт для вступления');return}
-    if(groupImportJoin&&!telegramConnected){setFormError('Запустите: npm run tg:worker');return}
+    if(groupImportJoin&&!telegramConnected){setFormError('Запустите: npm run dev');return}
     setBusy(true);
     setFormError('');
     try{
@@ -2498,7 +2519,7 @@ function WorkspaceHome(){
     const doJoin=!!opts?.join;
     if(doJoin){
       if(!catalogAccountId){toast.error('Сначала выберите аккаунт слева/сверху');return}
-      if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+      if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     }
     if(!ready.length){
       toast.message('Нет чатов со ссылкой');
@@ -2604,7 +2625,7 @@ function WorkspaceHome(){
   /** Клик по чату в каталоге = сразу вступить (без отдельной кнопки на карточке группы). */
   function joinCatalogNow(catalogId:string){
     if(!catalogAccountId){toast.error('Выберите аккаунт для вступления');return}
-    if(!telegramConnected){toast.error('Запустите: npm run tg:worker');return}
+    if(!telegramConnected){toast.error('Запустите: npm run dev');return}
     void addCatalogGroups([catalogId]);
   }
 
@@ -2612,7 +2633,7 @@ function WorkspaceHome(){
   const displayed=records.filter(r=>{
     if(r.kind!==(currentKind||'lead'))return false;
     if(view==='Переписки'&&!r.data.draft&&!r.data.conversationOpen)return false;
-    if(currentKind==='lead'&&view==='Лиды'){
+    if(currentKind==='lead'&&(view==='Лиды'||view==='Переписки')){
       if(filter==='ignored'){
         if(!r.data.excludeFromTraining)return false;
       }else if(r.data.excludeFromTraining){
@@ -2622,7 +2643,7 @@ function WorkspaceHome(){
       }else if(r.data.viewed){
         return false;
       }
-      if(leadGroupFilter!=='all'&&r.data.groupId!==leadGroupFilter)return false;
+      if(view==='Лиды'&&leadGroupFilter!=='all'&&r.data.groupId!==leadGroupFilter)return false;
     }
     if(filter!=='all'&&filter!=='viewed'&&filter!=='ignored'){
       if(currentKind==='lead'){
@@ -2687,7 +2708,13 @@ function WorkspaceHome(){
       if(key==='phone')return r.data.phone||'';
       if(key==='proxy')return records.find(x=>x.id===r.data.proxyId)?.data.name||'';
       if(key==='status')return accountRowStatus(r.data);
-      if(key==='cooldown')return isOnCooldown(r.data.cooldownUntil)?r.data.cooldownUntil:'';
+      if(key==='cooldown'){
+        const st=String(r.data.status||'');
+        if(st==='cooldown'||st==='spamblock'){
+          return isOnCooldown(r.data.cooldownUntil)?r.data.cooldownUntil:'';
+        }
+        return '';
+      }
       if(key==='updated')return accountUpdatedAt(r.data,r.created);
     }
     if(currentKind==='proxy'){
@@ -2714,6 +2741,37 @@ function WorkspaceHome(){
     if(!catalogOpen)return;
     setCatalogSearching(true);
     const handle=window.setTimeout(()=>{
+      if(catalogMarket==='db'){
+        const q=catalogQuery.trim().toLowerCase();
+        const groups=list('group');
+        const hits=groups
+          .map(r=>{
+            const url=String(r.data.url||'');
+            const name=String(r.data.name||'Без названия');
+            const hay=`${name} ${url}`.toLowerCase();
+            const matched=!q||hay.includes(q);
+            const joined=r.data.membership==='joined'||!!r.data.joinedAt;
+            return {
+              id:`db:${r.id}`,
+              name,
+              url,
+              verified:!!url&&!isCatalogPlaceholderUrl(url),
+              description:joined?'В кабинете · можно сканировать лиды':'В кабинете · нужно вступить',
+              audience:String(r.data.source||'workspace'),
+              niches:[] as GroupNiche[],
+              searchHint:url||'Нет ссылки',
+              score:joined?20:10,
+              matched,
+              overlap:0,
+              recordId:r.id,
+            };
+          })
+          .filter(h=>h.matched)
+          .sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name,'ru'));
+        setCatalogHits(hits as any);
+        setCatalogSearching(false);
+        return;
+      }
       const section=MARKET_SECTIONS.find(m=>m.id===catalogMarket);
       const niches=catalogNiche
         ?[catalogNiche]
@@ -2728,11 +2786,12 @@ function WorkspaceHome(){
       setCatalogSearching(false);
     },220);
     return()=>window.clearTimeout(handle);
-  },[catalogOpen,catalogQuery,catalogNiche,catalogMarket,catalogSearchTick]);
+  },[catalogOpen,catalogQuery,catalogNiche,catalogMarket,catalogSearchTick,records]);
 
   const existingGroupUrlSet=new Set(list('group').map(r=>telegramEntityKey(r.data.url)).filter(Boolean));
   const catalogMarketNiches=MARKET_SECTIONS.find(m=>m.id===catalogMarket)?.niches||[];
   const catalogBaseHits=catalogHits.filter(h=>{
+    if(catalogMarket==='db')return true;
     if(!catalogHideAdded)return true;
     if(!h.url)return true;
     return !existingGroupUrlSet.has(telegramEntityKey(h.url));
@@ -2748,10 +2807,22 @@ function WorkspaceHome(){
     <Empty className="empty-state border-0">
       <EmptyHeader>
         <div className="icon-box mx-auto mb-3"><Search size={22}/></div>
-        <EmptyTitle>Пока нет подходящих запросов</EmptyTitle>
-        <EmptyDescription>Добавьте тематические группы или внесите первый лид вручную.</EmptyDescription>
+        <EmptyTitle>
+          {view==='Переписки'
+            ?(filter==='viewed'?'Пока нет просмотренных диалогов':'Нет новых диалогов')
+            :'Пока нет подходящих запросов'}
+        </EmptyTitle>
+        <EmptyDescription>
+          {view==='Переписки'
+            ?(filter==='viewed'
+              ?'Откройте диалог во вкладке «Новые» — он появится здесь.'
+              :'Когда клиент ответит или появится черновик — диалог будет здесь. Открытие переносит в «Просмотренные».')
+            :'Добавьте тематические группы или внесите первый лид вручную.'}
+        </EmptyDescription>
       </EmptyHeader>
-      <Button variant="outline" onClick={()=>open('lead')}><Plus size={16}/>Добавить лид</Button>
+      {view!=='Переписки'&&(
+        <Button variant="outline" onClick={()=>open('lead')}><Plus size={16}/>Добавить лид</Button>
+      )}
     </Empty>
   );
 
@@ -2837,13 +2908,17 @@ function WorkspaceHome(){
       return (
         <Empty className="border-0 py-10">
           <EmptyHeader>
-            <EmptyTitle>Пока пусто</EmptyTitle>
-            <EmptyDescription>Найдите чаты по темам или добавьте ссылку — затем нажмите «Вступить».</EmptyDescription>
+            <EmptyTitle>В кабинете пока нет групп</EmptyTitle>
+            <EmptyDescription>
+              Залейте полный каталог ({catalogStats().uniqueUrls} чатов со ссылкой) — затем вступайте и собирайте лиды.
+            </EmptyDescription>
           </EmptyHeader>
           <div className="flex flex-wrap gap-2 justify-center">
-            <Button onClick={openCatalog}><Search size={16}/>Найти темы</Button>
+            <Button disabled={busy} onClick={()=>void importFullCatalogToDb()}>
+              <Database size={16}/>Залить все в базу ({catalogStats().uniqueUrls})
+            </Button>
+            <Button variant="outline" onClick={()=>openCatalog('all')}><Search size={16}/>Открыть каталог</Button>
             <Button variant="outline" onClick={openManualGroup}><Plus size={16}/>Ссылка</Button>
-            <Button variant="outline" onClick={openMassGroups}><Upload size={16}/>Массово</Button>
           </div>
         </Empty>
       );
@@ -3091,10 +3166,7 @@ function WorkspaceHome(){
                   <Button
                     variant="outline"
                     disabled={busy}
-                    onClick={()=>{
-                      const ids=GROUP_CATALOG.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url)).map(g=>g.id);
-                      void saveCatalogGroupsToDb(ids,{join:false});
-                    }}
+                    onClick={()=>void importFullCatalogToDb()}
                   >Залить каталог ({catalogStats().uniqueUrls})</Button>
                   <Button onClick={openCatalog}><Search size={16}/>Поиск по темам</Button>
                 </>
@@ -3302,7 +3374,17 @@ function WorkspaceHome(){
                 <Search className="absolute left-3 top-2.5 text-[var(--spike-muted)]" size={16}/>
                 <Input className="pl-9" placeholder="Поиск по списку…" aria-label="Поиск по списку" value={query} onChange={e=>setQuery(e.target.value)}/>
               </div>
-              {currentKind==='lead'?(
+              {view==='Переписки'?(
+                <div className="flex flex-wrap items-center gap-3">
+                  <Tabs value={filter==='viewed'?'viewed':'all'} onValueChange={(v)=>{setFilter(v);setLeadSelected([])}}>
+                    <TabsList>
+                      <TabsTrigger value="all">Новые{freshChats.length?` (${freshChats.length})`:''}</TabsTrigger>
+                      <TabsTrigger value="viewed">Просмотренные{viewedChats.length?` (${viewedChats.length})`:''}</TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                  <span className="badge neutral">{chatLeads.length} диалогов</span>
+                </div>
+              ):currentKind==='lead'?(
                 <div className="flex flex-wrap items-center gap-3">
                   <Button
                     disabled={busy||!telegramConnected||autoRescanRunning}
@@ -3435,7 +3517,7 @@ function WorkspaceHome(){
             )}
             {currentKind==='lead'&&(
               <div className="status-note">
-                «Собрать лиды» — принудительный обход. Автообход круглосуточно через tg-worker (каждые {settings?.data.autoRescanMinutes||30} мин на группу), кабинет открывать не нужно
+                «Собрать лиды» — принудительный обход. Автообход круглосуточно через Telegram-воркер из npm run dev (каждые {settings?.data.autoRescanMinutes||30} мин на группу)
                 {settings?.data.lastAutoRescanAt?` · последний ${new Date(settings.data.lastAutoRescanAt).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}`:''}
                 {autoRescanRunning?' · идёт…':''}.
               </div>
@@ -4705,7 +4787,7 @@ function WorkspaceHome(){
           <DialogHeader className="px-6 pt-5 pb-4 border-b border-[var(--spike-border)] shrink-0">
             <DialogTitle>Найти чаты с клиентами</DialogTitle>
             <DialogDescription>
-              Рынок «Все чаты» — полная база ({catalogStats().uniqueUrls} ссылок). «Залить в базу» добавит их в «Группы и каналы»; «Вступить» — фоновое вступление с паузой.
+              «В базе» — ваши группы для сбора лидов. «Все чаты» — полный каталог ({catalogStats().uniqueUrls} ссылок). «Залить в базу» добавит их в «Группы и каналы».
             </DialogDescription>
           </DialogHeader>
 
@@ -4720,12 +4802,14 @@ function WorkspaceHome(){
                     className={`catalog-side-item ${catalogMarket===m.id?'active':''}`}
                     onClick={()=>selectMarket(m.id)}
                   >
-                    <strong>{m.title} <em className="opacity-70 font-normal">· {marketVerifiedCount(m.id)}</em></strong>
+                    <strong>{m.title} <em className="opacity-70 font-normal">· {m.id==='db'?list('group').length:marketVerifiedCount(m.id)}</em></strong>
                     <span>{m.hint}</span>
                   </button>
                 ))}
               </div>
 
+              {catalogMarket!=='db'&&(
+              <>
               <p className="catalog-step-label mt-4">Ниша</p>
               <div className="catalog-side-list catalog-niche-list">
                 <button
@@ -4765,6 +4849,17 @@ function WorkspaceHome(){
                   setCatalogSearchTick(t=>t+1);
                 }}
               ><Sparkles size={14}/>Подобрать по AI</Button>
+              </>
+              )}
+              {catalogMarket==='db'&&(
+                <Button
+                  type="button"
+                  size="sm"
+                  className="mt-3 w-full"
+                  disabled={busy}
+                  onClick={()=>void importFullCatalogToDb()}
+                ><Database size={14}/>Дозалить каталог ({catalogStats().uniqueUrls})</Button>
+              )}
             </aside>
 
             <div className="catalog-main">
@@ -4780,7 +4875,11 @@ function WorkspaceHome(){
                   {catalogSearching&&<Loader2 className="absolute right-3 top-2.5 animate-spin text-[var(--spike-primary)]" size={16}/>}
                 </div>
                 <label className="catalog-toggle">
-                  <Checkbox checked={catalogHideAdded} onCheckedChange={v=>setCatalogHideAdded(v===true)}/>
+                  <Checkbox
+                    checked={catalogHideAdded}
+                    disabled={catalogMarket==='db'}
+                    onCheckedChange={v=>setCatalogHideAdded(v===true)}
+                  />
                   Скрыть добавленные
                 </label>
               </div>
@@ -4788,17 +4887,19 @@ function WorkspaceHome(){
               <div className="catalog-params">
                 <span className="catalog-param">{catalogActiveMarket?.title||'—'}</span>
                 <span className="catalog-param-sep">/</span>
-                <span className="catalog-param accent">{catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Все ниши'}</span>
+                <span className="catalog-param accent">{catalogMarket==='db'?'Ваш кабинет':(catalogNiche?GROUP_NICHE_LABELS[catalogNiche]:'Все ниши')}</span>
                 <span className="small-note ml-auto">{catalogSearching?'Ищем…':`${catalogVisibleHits.length} результатов · база ${catalogStats().uniqueUrls}`}</span>
               </div>
 
               <div className="catalog-tabs">
                 <button type="button" className={catalogTab==='links'?'active':''} onClick={()=>{setCatalogTab('links');setCatalogSelected([])}}>
-                  Со ссылкой <em>{catalogLinkHits.length}</em>
+                  {catalogMarket==='db'?'Группы':'Со ссылкой'} <em>{catalogLinkHits.length}</em>
                 </button>
+                {catalogMarket!=='db'&&(
                 <button type="button" className={catalogTab==='topics'?'active':''} onClick={()=>{setCatalogTab('topics');setCatalogSelected([])}}>
                   Темы без ссылки <em>{catalogTopicHits.length}</em>
                 </button>
+                )}
               </div>
 
               {catalogTab==='topics'&&catalogVisibleHits.length>0&&(
@@ -4833,6 +4934,9 @@ function WorkspaceHome(){
                 ):catalogVisibleHits.length?catalogVisibleHits.map(g=>{
                   const canJoin=g.verified&&!!g.url&&!isCatalogPlaceholderUrl(g.url);
                   const checked=catalogSelected.includes(g.id);
+                  const dbId=catalogMarket==='db'&&String(g.id).startsWith('db:')?String(g.id).slice(3):'';
+                  const dbRec=dbId?list('group').find(x=>x.id===dbId):undefined;
+                  const dbJoined=!!(dbRec&&(dbRec.data.membership==='joined'||dbRec.data.joinedAt));
                   return (
                     <div key={g.id} className={`catalog-card ${checked?'is-checked':''} ${canJoin?'has-link':''}`}>
                       {catalogTab==='topics'?(
@@ -4847,12 +4951,27 @@ function WorkspaceHome(){
                         <span className="catalog-card-title">
                           {g.name}
                           {canJoin?<span className="badge success">t.me</span>:<span className="badge neutral">нужен инвайт</span>}
+                          {dbJoined&&<span className="badge success">вступили</span>}
                         </span>
                         <span className="text-sm muted block mt-1">{g.description}</span>
                         <span className="small-note block mt-1">{g.audience}</span>
                         <span className="small-note block mt-1 font-medium text-[var(--spike-primary)]">{canJoin?g.url:g.searchHint}</span>
                       </span>
-                      {canJoin?(
+                      {catalogMarket==='db'&&dbRec?(
+                        dbJoined?(
+                          <Button
+                            size="sm"
+                            disabled={busy||!telegramConnected}
+                            onClick={()=>{setCatalogOpen(false);void scanGroup(dbRec)}}
+                          >Скан лидов</Button>
+                        ):(
+                          <Button
+                            size="sm"
+                            disabled={busy||!telegramConnected||!dbRec.data.accountId}
+                            onClick={()=>{setCatalogOpen(false);void joinGroup(dbRec)}}
+                          >Вступить</Button>
+                        )
+                      ):canJoin?(
                         <Button
                           size="sm"
                           disabled={busy||!catalogAccountId}
@@ -4876,7 +4995,9 @@ function WorkspaceHome(){
                   );
                 }):(
                   <p className="muted text-sm py-6">
-                    {catalogTab==='links'&&catalogTopicHits.length
+                    {catalogMarket==='db'
+                      ? 'В кабинете пока нет групп — нажмите «Дозалить каталог» или откройте «Все чаты».'
+                      : catalogTab==='links'&&catalogTopicHits.length
                       ? 'Нет готовых ссылок в этой нише — откройте «Темы без ссылки» или смените нишу.'
                       : catalogHiddenAdded&&catalogHideAdded
                         ? 'В этой нише всё уже добавлено. Снимите «Скрыть добавленные» или выберите другую нишу.'
@@ -4888,13 +5009,36 @@ function WorkspaceHome(){
           </div>
 
           <div className="px-6 py-4 border-t border-[var(--spike-border)] flex flex-wrap gap-2 shrink-0">
-            {catalogTab==='links'?(
+            {catalogMarket==='db'?(
+              <>
+                <Button
+                  disabled={busy||!telegramConnected||!list('group').filter(g=>g.data.membership==='joined'||g.data.joinedAt).length}
+                  onClick={()=>{
+                    setCatalogOpen(false);
+                    navigate('Группы и каналы');
+                    void (async()=>{
+                      setBusy(true);
+                      try{
+                        const r=await api({action:'rescan_groups',force:true});
+                        toast.message(`Переобход: ${r.queued||0} групп`);
+                        await refresh();
+                      }catch(e){toast.error((e as Error).message)}
+                      finally{setBusy(false)}
+                    })();
+                  }}
+                >Собрать лиды со вступивших</Button>
+                <Button variant="outline" disabled={busy} onClick={()=>void importFullCatalogToDb()}>
+                  Дозалить каталог ({catalogStats().uniqueUrls})
+                </Button>
+                <Button variant="ghost" onClick={()=>selectMarket('all')}>Все чаты каталога</Button>
+              </>
+            ):catalogTab==='links'?(
               <>
                 <Button
                   disabled={busy||!catalogReadyCount}
                   variant="default"
-                  onClick={()=>saveCatalogGroupsToDb(catalogLinkHits.map(g=>g.id),{join:false})}
-                >{busy?'Сохраняем…':`Залить в базу (${catalogReadyCount})`}</Button>
+                  onClick={()=>catalogMarket==='all'?void importFullCatalogToDb():saveCatalogGroupsToDb(catalogLinkHits.map(g=>g.id),{join:false})}
+                >{busy?'Сохраняем…':catalogMarket==='all'?`Залить весь каталог (${catalogStats().uniqueUrls})`:`Залить в базу (${catalogReadyCount})`}</Button>
                 <Button
                   disabled={busy||!catalogReadyCount||!catalogAccountId}
                   variant="outline"
@@ -5266,7 +5410,7 @@ function WorkspaceHome(){
             </div>
             <p className="small-note">
               Цель: {accountSelected.length?`${accountSelected.length} выбранных`:`все ${list('account').length} аккаунтов`}.
-              Нужен запущенный tg:worker для записи в Telegram.
+              Нужен запущенный Telegram-воркер (идёт вместе с npm run dev).
             </p>
             <div className="flex flex-wrap gap-2">
               <Button disabled={busy||!list('account').length} onClick={()=>applyFarmProfiles(accountSelected.length?accountSelected:list('account').map(r=>r.id),true)}>

@@ -3,11 +3,13 @@ import {
   isPeerFloodMailingError,
   isPermanentMailingRecipientError,
   isRateLimitMailingError,
+  isTransientPeerResolveError,
   mailingEmptyBatchDecision,
   mailingFailText,
   mailingOkText,
   mailingTextPreview,
   parseMailingFloodWaitSec,
+  pickMailingSendAccountId,
 } from '@/lib/mailing';
 
 describe('рассылка · flood / лог / очередь',()=>{
@@ -46,12 +48,21 @@ describe('рассылка · flood / лог / очередь',()=>{
     expect(mailingOkText('dana','1','','')).toBe('Доставлено @dana');
   });
 
-  it('peer/access_hash ошибки — не permanent (другой слот может пройти)',()=>{
+  it('peer/entity miss — transient, не permanent (ретрай другим слотом)',()=>{
     const raw='Could not find the input entity for PeerUser(user_id=342560478)';
+    expect(isTransientPeerResolveError(raw)).toBe(true);
     expect(isPermanentMailingRecipientError(raw)).toBe(false);
-    expect(mailingFailText('timosha_07','342560478',raw)).toContain('access_hash');
-    expect(isPermanentMailingRecipientError('Не удалось открыть пользователя (нет access_hash)')).toBe(false);
-    expect(isPermanentMailingRecipientError('USER_PRIVACY_RESTRICTED')).toBe(true);
+    expect(mailingFailText('timosha_07','342560478',raw)).toMatch(/сессия не видит peer|@username|групп/i);
+    expect(isTransientPeerResolveError('Не удалось открыть пользователя')).toBe(true);
+    expect(isPermanentMailingRecipientError('Не удалось открыть пользователя')).toBe(false);
+    expect(isPermanentMailingRecipientError('UserPrivacyRestrictedError')).toBe(true);
+  });
+
+  it('sticky: предпочитает аккаунт, который видел peer',()=>{
+    const live=['a','b','c'];
+    expect(pickMailingSendAccountId(live,['b'],0)).toBe('b');
+    expect(pickMailingSendAccountId(live,['x','c'],1)).toBe('c');
+    expect(pickMailingSendAccountId(live,[''],2)).toBe('c');
   });
 
   it('бан на запись в супергруппы → spamblock аккаунта, не FloodWait',()=>{

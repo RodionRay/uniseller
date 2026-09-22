@@ -213,9 +213,10 @@ export function mailingFailText(username: string, userId: string, error: string)
     e.includes("could not find the input entity") ||
     e.includes("cannot find any entity") ||
     e.includes("нет access_hash") ||
-    e.includes("не удалось открыть пользователя")
+    e.includes("не удалось открыть пользователя") ||
+    e.includes("неверный peer")
   ) {
-    return `${label}: Telegram не видит пользователя (нет access_hash). Нужен @username или аккаунт из той же группы`;
+    return `${label}: сессия не видит peer — нужен @username, аккаунт из той же группы или повтор другим слотом фермы`;
   }
   if (
     e.includes("no user has") ||
@@ -294,20 +295,8 @@ export function parseMailingFloodWaitSec(error: string, fallback = 900): number 
 /** Ошибка получателя, которую бессмысленно ретраить на других аккаунтах. */
 export function isPermanentMailingRecipientError(error: string): boolean {
   const e = String(error || "").toLowerCase();
-  // Peer/session-bound ошибки — НЕ permanent (другой слот / свой access_hash могут пройти)
-  if (
-    e.includes("нет access_hash") ||
-    e.includes("не удалось открыть пользователя") ||
-    e.includes("could not find the input entity") ||
-    e.includes("cannot find any entity") ||
-    e.includes("peer_id_invalid") ||
-    e.includes("invalid peer") ||
-    e.includes("no user has") ||
-    e.includes("nobody is using this username") ||
-    e.includes("username_not_occupied")
-  ) {
-    return false;
-  }
+  // Peer/entity miss — НЕ permanent: другой слот фермы или @username часто спасают.
+  if (isTransientPeerResolveError(e)) return false;
   return (
     e.includes("privacy") ||
     e.includes("ограничил") ||
@@ -321,6 +310,54 @@ export function isPermanentMailingRecipientError(error: string): boolean {
     e.includes("no such user") ||
     e.includes("user not found")
   );
+}
+
+/**
+ * Не удалось открыть peer на ЭТОЙ сессии — имеет смысл сменить слот фермы / отложить.
+ * Не путать с privacy / мёртвым username.
+ */
+export function isTransientPeerResolveError(error: string): boolean {
+  const e = String(error || "").toLowerCase();
+  if (
+    e.includes("privacy") ||
+    e.includes("ограничил") ||
+    e.includes("запретил") ||
+    e.includes("username_not_occupied") ||
+    e.includes("username_invalid") ||
+    e.includes("nobody is using this username") ||
+    (e.includes("username @") && e.includes("не существует")) ||
+    e.includes("это бот") ||
+    e.includes("каналом/чатом") ||
+    e.includes("не пользователем")
+  ) {
+    return false;
+  }
+  return (
+    e.includes("could not find the input entity") ||
+    e.includes("cannot find any entity") ||
+    e.includes("нет access_hash") ||
+    e.includes("не удалось открыть пользователя") ||
+    e.includes("неверный peer") ||
+    e.includes("invalid peer") ||
+    e.includes("нужен @username") ||
+    e.includes("аккаунт из той же группы") ||
+    e.includes("тот же аккаунт фермы")
+  );
+}
+
+/** Предпочесть аккаунт, который уже видел peer (скан/сбор), иначе ротация. */
+export function pickMailingSendAccountId(
+  liveIds: string[],
+  preferredIds: Array<string | null | undefined>,
+  rotateIndex = 0,
+): string {
+  const live = new Set(liveIds);
+  for (const id of preferredIds) {
+    const s = String(id || "");
+    if (s && live.has(s)) return s;
+  }
+  if (!liveIds.length) return "";
+  return liveIds[Math.abs(rotateIndex) % liveIds.length];
 }
 
 /** Сессия/tdata мёртвая — аккаунт надо снять с фермы, а не крутить того же получателя. */

@@ -1124,7 +1124,7 @@ def _serialize_audience_user(user, *, is_admin: bool = False) -> dict[str, Any] 
         "premium": bool(getattr(user, "premium", False)),
         "isAdmin": bool(is_admin),
         "status": _user_status_bucket(user),
-        # Привязан к сессии сборщика — чужой слот фермы его не примет
+        # access_hash этой сессии — чужой слот фермы его не примет
         "accessHash": str(getattr(user, "access_hash", "") or ""),
     }
 
@@ -1324,7 +1324,17 @@ async def collect_audience(client, payload: dict[str, Any]) -> dict[str, Any]:
     period_days = max(1, min(365, int(payload.get("periodDays") or 30)))
     audience_scope = str(payload.get("audienceScope") or "no_admins")
     premium_filter = str(payload.get("premiumFilter") or "all")
-    status_filter = str(payload.get("statusFilter") or "all")
+    status_filter = payload.get("statusFilters")
+    if status_filter is None:
+        status_filter = payload.get("statusFilter") or "all"
+    if isinstance(status_filter, str):
+        status_allowed = set() if status_filter in ("", "all") else {status_filter}
+    else:
+        status_allowed = {
+            str(x)
+            for x in (status_filter or [])
+            if x and str(x) != "all"
+        }
     batch_size = max(20, min(200, int(payload.get("batchSize") or 80)))
     cursor = str(payload.get("cursor") or "")
     seen_ids = set(str(x) for x in (payload.get("seenIds") or []) if x)
@@ -1362,7 +1372,7 @@ async def collect_audience(client, payload: dict[str, Any]) -> dict[str, Any]:
                 return False
             if premium_filter == "exclude" and u["premium"]:
                 return False
-            if status_filter != "all" and u["status"] != status_filter:
+            if status_allowed and u["status"] not in status_allowed:
                 return False
             return True
 

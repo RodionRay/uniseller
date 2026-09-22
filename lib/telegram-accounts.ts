@@ -83,6 +83,18 @@ export function isOnCooldown(cooldownUntil?: string | null): boolean {
   return Number.isFinite(t) && t > Date.now();
 }
 
+/**
+ * Дневная отлёжка: только явный status=cooldown + живой таймер.
+ * Голый cooldownUntil (старый FloodWait/коннект) — НЕ отлёжка.
+ */
+export function isDayLimitCooldown(data: {
+  status?: string | null;
+  cooldownUntil?: string | null;
+} | null | undefined): boolean {
+  if (!data) return false;
+  return String(data.status || "") === "cooldown" && isOnCooldown(data.cooldownUntil);
+}
+
 /** Можно ли ставить в работу (рассылка / инвайт / сбор / группы). */
 export function isAccountUsable(data: {
   status?: string | null;
@@ -259,11 +271,11 @@ export function bumpChatCounters<T extends Record<string, unknown>>(
 export function applyQuotaCooldownIfExhausted<T extends Record<string, unknown>>(
   data: T,
 ): T {
-  if (isOnCooldown(String((data as { cooldownUntil?: string }).cooldownUntil || ""))) {
-    return data;
-  }
   const st = String((data as { status?: string }).status || "");
   if (st === "spamblock" || st === "frozen") return data;
+  if (isDayLimitCooldown(data as { status?: string; cooldownUntil?: string })) {
+    return data;
+  }
 
   if (!hasInviteQuota(data as Parameters<typeof hasInviteQuota>[0])) {
     return withDayLimitCooldown(data, "invite");
@@ -276,6 +288,17 @@ export function applyQuotaCooldownIfExhausted<T extends Record<string, unknown>>
   }
   if (!hasChatQuota(data as Parameters<typeof hasChatQuota>[0])) {
     return withDayLimitCooldown(data, "chat");
+  }
+  // Сброс «осиротевшего» таймера от старых FloodWait/коннект-фейлов.
+  if (
+    st !== "cooldown" &&
+    isOnCooldown(String((data as { cooldownUntil?: string }).cooldownUntil || ""))
+  ) {
+    return {
+      ...data,
+      cooldownUntil: "",
+      cooldownReason: "",
+    };
   }
   return data;
 }

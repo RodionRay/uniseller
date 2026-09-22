@@ -22,7 +22,10 @@ Telegram authorization / tdata import, joining groups, proxy connectivity checks
 3. `npm run build`
 4. Apply D1 migration once (local wrangler state):
    `node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --persist-to .wrangler/state --config dist/server/wrangler.json --file drizzle/0000_even_hydra.sql`
-5. `npm run dev -- --host 127.0.0.1 --port 5173`
+5. One command for кабинет + Telegram-воркер:
+   `npm run dev`
+   (воркер сам перезапускается при падении; отдельно `tg:worker` не нужен)
+   Только UI без воркера: `npm run dev:web`
 6. Open http://localhost:5173/login
 
 Runtime DB is Cloudflare D1 (local file under `.wrangler/state`). `better-sqlite3` is only for optional Node scripts (`npm run db:migrate`).

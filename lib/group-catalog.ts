@@ -539,6 +539,7 @@ export const GROUP_CATALOG: CatalogGroup[] = [
 
 /** Рынки: где искать клиентов (группы ниш для UI). niches=[] = показать весь каталог. */
 export const MARKET_SECTIONS: {id: string; title: string; hint: string; niches: GroupNiche[]}[] = [
+  {id: "db", title: "В базе", hint: "Группы вашего кабинета — сбор лидов", niches: []},
   {id: "all", title: "Все чаты", hint: "Полная база каталога со ссылками", niches: []},
   {id: "blogs", title: "Блоги TGStat", hint: "Каналы из категории «Блоги» и бизнес-медиа", niches: ["blogs", "business", "marketing", "content", "startup"]},
   {id: "mp", title: "Маркетплейсы", hint: "Селлеры WB/Ozon/ЯМ ищут сервисы", niches: ["marketplaces", "wildberries", "ozon", "yandex_market", "megamarket", "ecommerce", "analytics", "pricing", "inventory", "reviews", "fulfillment", "certificates"]},
@@ -549,8 +550,9 @@ export const MARKET_SECTIONS: {id: string; title: string; hint: string; niches: 
   {id: "growth", title: "Стартапы и рост", hint: "Пилоты, нетворкинг, PR", niches: ["startup", "networking", "marketing", "leadgen", "saas"]},
 ];
 
-/** Число verified-ссылок в рынке (для UI). */
+/** Число verified-ссылок в рынке (для UI). id=db считает вызывающая сторона. */
 export function marketVerifiedCount(marketId: string): number {
+  if (marketId === "db") return 0;
   const section = MARKET_SECTIONS.find((m) => m.id === marketId);
   if (!section) return 0;
   if (!section.niches.length) {

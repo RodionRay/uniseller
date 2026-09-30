@@ -4,6 +4,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { computeWorkerVersion } from "../telegram-worker/src/version.mjs";
 import { writeFakePython } from "./worker-fake-python";
 
 const SERVER = join(__dirname, "../telegram-worker/src/server.mjs");
@@ -32,21 +33,19 @@ async function startWorker(env: Record<string, string> = {}, port?: number): Pro
   const fake = writeFakePython();
   const tmp = mkdtempSync(join(tmpdir(), "worker-srv-"));
   const p = port ?? (await freePort());
-  const child = spawn(process.execPath, [SERVER], {
-    env: {
-      PATH: process.env.PATH ?? "",
-      TMPDIR: tmp,
-      TG_WORKER_PORT: String(p),
-      TG_WORKER_SKIP_DOTENV: "1",
-      TG_WORKER_AUTO_RESCAN: "0",
-      TG_WORKER_PYTHON: process.execPath,
-      TG_WORKER_SCRIPT: fake.script,
-      ...env,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const childEnv = {
+    PATH: process.env.PATH ?? "",
+    TMPDIR: tmp,
+    TG_WORKER_PORT: String(p),
+    TG_WORKER_SKIP_DOTENV: "1",
+    TG_WORKER_AUTO_RESCAN: "0",
+    TG_WORKER_PYTHON: process.execPath,
+    TG_WORKER_SCRIPT: fake.script,
+    ...env,
+  } as unknown as NodeJS.ProcessEnv;
+  const child = spawn(process.execPath, [SERVER], { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
   running.push(child);
-  const exit = new Promise<number | null>((r) => child.on("exit", (code) => r(code)));
+  const exit = new Promise<number | null>((r) => child.on("exit", (code: number | null) => r(code)));
   return { port: p, tmp, child, exit };
 }
 
@@ -129,11 +128,11 @@ describe("tg-worker server", () => {
     expect(String(r.body.error)).toMatch(/байт/);
   });
 
-  it("exposes version and appUrl in /health", async () => {
+  it("exposes the version dev-local computes and appUrl in /health", async () => {
     const w = await startWorker({ APP_URL: "http://app.test/" });
     const h = await waitHealthy(w.port);
     expect(h).toMatchObject({ service: "uniseller-tg-worker", appUrl: "http://app.test" });
-    expect(String(h.version)).toMatch(/^[0-9a-f]{12}$/);
+    expect(h.version).toBe(computeWorkerVersion(join(__dirname, "../telegram-worker/src")));
   });
 });
 

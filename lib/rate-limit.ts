@@ -9,6 +9,8 @@ export type RateRule = { max: number; windowMs: number };
 
 /** 10 failed logins per IP+email per 15 minutes, then 429 until the window ends. */
 export const LOGIN_FAILURE_RULE: RateRule = { max: 10, windowMs: 15 * 60_000 };
+/** 30 login attempts per email per hour from any IP: caps password guessing via IP rotation. */
+export const LOGIN_EMAIL_RULE: RateRule = { max: 30, windowMs: 60 * 60_000 };
 /** 5 contact-form submissions per IP per 10 minutes. */
 export const CONTACT_SUBMIT_RULE: RateRule = { max: 5, windowMs: 10 * 60_000 };
 

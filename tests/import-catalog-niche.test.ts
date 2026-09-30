@@ -1,10 +1,10 @@
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
-import {OWNER,SETTINGS_ID,login,postRequest,resetWorkspace,testDb} from './helpers/workspace-harness';
+import {OWNER,SETTINGS_ID,login,postRequest,resetWorkspace,testDb} from './helpers/workspace-api-harness';
 
-vi.mock('cloudflare:workers',async()=>(await import('./helpers/workspace-harness')).cfModule);
+vi.mock('cloudflare:workers',async()=>(await import('./helpers/workspace-api-harness')).cfModule);
 vi.mock('@/lib/auth',async(importOriginal)=>({
   ...await importOriginal<typeof import('@/lib/auth')>(),
-  getSessionUser:async()=>(await import('./helpers/workspace-harness')).authState.user,
+  getSessionUser:async()=>(await import('./helpers/workspace-api-harness')).authState.user,
 }));
 
 import {POST} from '@/app/api/workspace/route';

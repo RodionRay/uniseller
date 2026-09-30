@@ -1,14 +1,13 @@
 import vinext from "vinext";
 import { defineConfig } from "vite";
-import { readExecutionProfile } from "./scripts/execution-profile.mjs";
 
 // Local-only D1: the id only names the sqlite file under the persist dir
-// (.wrangler/state locally, /data/wrangler in Docker). Changing it orphans data.
+// (.wrangler/state locally, /data/wrangler in Docker). Changing it orphans data;
+// database_name is not part of the file name (miniflare keys the object by the id).
 const LOCAL_D1_DATABASE_ID = "00000000-0000-4000-8000-000000000000";
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
-const managedLinux = readExecutionProfile() === "managed-linux";
 
 const localBindingConfig = {
   main: "vinext/server/fetch-handler",
@@ -16,7 +15,7 @@ const localBindingConfig = {
   d1_databases: [
     {
       binding: "DB",
-      database_name: "site-creator-d1",
+      database_name: "uniseller-d1",
       database_id: LOCAL_D1_DATABASE_ID,
       // Consumed only by `wrangler d1 migrations apply --config dist/server/wrangler.json`,
       // which resolves it relative to that file: dist/server/../../drizzle = drizzle-kit output.
@@ -42,7 +41,6 @@ export default defineConfig(async () => {
 
   return {
     server: {
-      ...(managedLinux ? { host: "0.0.0.0", allowedHosts: ["terminal.local"] } : {}),
       ...(isCodexSeatbeltSandbox ? { watch: { useFsEvents: false, usePolling: true } } : {}),
     },
     plugins: [

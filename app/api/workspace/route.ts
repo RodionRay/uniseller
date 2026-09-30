@@ -6,6 +6,7 @@ import {patchRecordData,writeRecordDiff} from '@/lib/processes/record-patch';
 import {canRunWorkspaceAction} from '@/lib/processes/workspace-access';
 import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
 import {mergeRefreshedSession,stripSessionMaterial} from '@/lib/processes/session-refresh';
+import {appTimeoutForWorker} from '@/lib/processes/worker-timeouts';
 import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
 import {sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
@@ -419,7 +420,7 @@ async function runProxyCheck(owner:string,id:string){
  // Только через tg-worker: в vinext/CF исходящий TCP к прокси даёт jsg.Error
  let result:{ok:boolean;latencyMs:number;exitIp?:string;error?:string;telegramOk?:boolean;protocol?:string;warning?:string};
  try{
-  const wr=await workerPost('/check-proxy',input,15_000);
+  const wr=await workerPost('/check-proxy',input);
   result={
    ok:!!wr.ok,
    latencyMs:Number(wr.latencyMs)||0,
@@ -531,7 +532,7 @@ async function loadAccountSessionPayload(owner:string,accountId:string){
  };
 }
 
-async function workerPost(path:string,body:unknown,timeoutMs=120_000){
+async function workerPost(path:string,body:unknown,timeoutMs=appTimeoutForWorker(path)){
  const headers:Record<string,string>={'Content-Type':'application/json'};
  const token=workerToken();
  if(token)headers.Authorization=`Bearer ${token}`;
@@ -615,16 +616,22 @@ async function applyFloodCooldown(owner:string,accountId:string,result:any){
  * workerPost for an account session, under the per-account lease. Throws AccountBusyError.
  * `accountId` lets the worker queue calls per account instead of hashing the archive.
  */
-async function accountWorkerPost(owner:string,accountId:string,path:string,body:Record<string,unknown>,timeoutMs=120_000){
- const lease=await holdAccountLease(owner,accountId,timeoutMs+ACCOUNT_LEASE_MARGIN_MS);
+async function accountWorkerPost(owner:string,accountId:string,path:string,body:Record<string,unknown>,timeoutMs=appTimeoutForWorker(path)){
+ // The lease covers the worker's own timeout even when the caller waits less (inbox budget).
+ const lease=await holdAccountLease(owner,accountId,Math.max(timeoutMs,appTimeoutForWorker(path))+ACCOUNT_LEASE_MARGIN_MS);
+ let workerStillRunning=false;
  try{
   const result=await workerPost(path,{...body,accountId},timeoutMs);
   await persistRefreshedSession(owner,accountId,result);
   await applyFloodCooldown(owner,accountId,result);
   // Callers echo the result to the browser: session material stops here, once persisted.
   return stripSessionMaterial(result);
+ }catch(e){
+  // We gave up but the worker job may still hold the session: let the lease expire instead.
+  workerStillRunning=(e as Error)?.name==='TimeoutError';
+  throw e;
  }finally{
-  await releaseQuietly(owner,lease);
+  if(!workerStillRunning)await releaseQuietly(owner,lease);
  }
 }
 
@@ -708,7 +715,7 @@ function isSessionDeadError(status:string,error:string){
 
 const CONNECT_MAX_ATTEMPTS=3;
 const CONNECT_RETRY_PAUSE_MS=400;
-const ACCOUNT_CHECK_TIMEOUT_MS=22_000;
+const ACCOUNT_CHECK_TIMEOUT_MS=appTimeoutForWorker('/check-account');
 const ACCOUNT_CHECK_CONCURRENCY=3;
 /** Lock TTLs outlive the slowest path of the guarded operation; release happens in finally. */
 const SCAN_LOCK_TTL_MS=10*60_000;
@@ -3188,7 +3195,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     batchSize:80,
     cursor:data.cursor||'',
     seenIds:seenIds.slice(-5000),
-   },180_000);
+   });
    if(result.join==='need_join'){
     const joinRes=await accountWorkerPost(owner,accountId,'/join-group',{...payload,url:data.url});
     if(!joinRes.ok){
@@ -3510,7 +3517,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     sourceUrl,
     mode:data.mode||'ordinary',
     users:batch.map(x=>({userId:x.userId,username:x.username})),
-   },180_000);
+   });
 
    // PEER_FLOOD / spamblock / frozen → статус аккаунта. FloodWait — только пауза тика.
    let accountWentCooldown=false;
@@ -4220,7 +4227,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
      silent:!!data.silent,
      // Удаление диалога ломает входящие ответы → «Переписки»
      deleteDialog:false,
-    },120_000);
+    });
 
     // Чужой access_hash → retry без hash (username/группа/кэш)
     if(
@@ -4241,7 +4248,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
       senderAccessHash:'',
       silent:!!data.silent,
       deleteDialog:false,
-     },120_000);
+     });
     }
     }catch(e){
      if(!isAccountBusy(e))throw e;

@@ -28,20 +28,16 @@ describe("round-robin cursor", () => {
 describe("refreshed session merge", () => {
   const stored = { kind: "tdata", zipBase64: "OLD", twoFA: "pw", apiId: 1, apiHash: "h" };
 
-  it("accepts a bare string as new zip material", () => {
-    expect(mergeRefreshedSession(stored, "NEW")).toEqual({ ...stored, zipBase64: "NEW" });
-  });
-
-  it("merges known fields from an object and maps format to kind", () => {
+  it("replaces only zipBase64 and keeps kind and credentials", () => {
     expect(
-      mergeRefreshedSession(stored, { zipBase64: "NEW", format: "session", evil: "x" }),
-    ).toEqual({ ...stored, zipBase64: "NEW", kind: "session" });
+      mergeRefreshedSession(stored, { zipBase64: "NEW", apiId: 2040, apiHash: "tdesk" }),
+    ).toEqual({ ...stored, zipBase64: "NEW" });
   });
 
   it("ignores absent or unusable payloads", () => {
     expect(mergeRefreshedSession(stored, undefined)).toBeNull();
-    expect(mergeRefreshedSession(stored, "")).toBeNull();
-    expect(mergeRefreshedSession(stored, { kind: "session" })).toBeNull();
-    expect(mergeRefreshedSession(stored, 42)).toBeNull();
+    expect(mergeRefreshedSession(stored, "NEW")).toBeNull();
+    expect(mergeRefreshedSession(stored, { zipBase64: "" })).toBeNull();
+    expect(mergeRefreshedSession(stored, { apiId: 2040 })).toBeNull();
   });
 });

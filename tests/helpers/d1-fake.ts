@@ -33,14 +33,22 @@ function toSqlValue(value: unknown): unknown {
   return value;
 }
 
-export function createD1Fake(): { db: FakeD1; sqlite: Database.Database } {
+/** Real D1 answers after a network hop; `latencyMs` lets tests interleave requests. */
+export type FakeD1Options = { latencyMs?: number };
+
+export function createD1Fake(
+  opts: FakeD1Options = {},
+): { db: FakeD1; sqlite: Database.Database } {
   const sqlite = new Database(":memory:");
   sqlite.exec(RECORDS_DDL);
+  const hop = () =>
+    opts.latencyMs ? new Promise((r) => setTimeout(r, opts.latencyMs)) : Promise.resolve();
 
   const statement = (sql: string, raw: unknown[]): FakeStatement => {
     const values = raw.map(toSqlValue);
     return {
       async all() {
+        await hop();
         const s = sqlite.prepare(sql);
         if (!s.reader) {
           s.run(...values);
@@ -49,6 +57,7 @@ export function createD1Fake(): { db: FakeD1; sqlite: Database.Database } {
         return { results: s.all(...values) as Record<string, unknown>[] };
       },
       async first<T>() {
+        await hop();
         const s = sqlite.prepare(sql);
         if (!s.reader) {
           s.run(...values);
@@ -57,6 +66,7 @@ export function createD1Fake(): { db: FakeD1; sqlite: Database.Database } {
         return (s.get(...values) as T | undefined) ?? null;
       },
       async run() {
+        await hop();
         const s = sqlite.prepare(sql);
         if (s.reader) {
           s.all(...values);

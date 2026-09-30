@@ -1,4 +1,10 @@
 import {getSessionUser} from '@/lib/auth';
+import {CRM_ACCESS_KEYS,resolveWorkspaceContext,type WorkspaceContext} from '@/lib/staff';
+import {acquireLock,releaseLock,type LockHandle} from '@/lib/locks';
+import {patchRecordData,writeRecordDiff} from '@/lib/processes/record-patch';
+import {canRunWorkspaceAction} from '@/lib/processes/workspace-access';
+import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
+import {mergeRefreshedSession} from '@/lib/processes/session-refresh';
 import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
 import {sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
@@ -357,17 +363,30 @@ const schemas={
  }),
 };
 function reply(data:unknown,status=200){return Response.json(data,{status,headers:{'Cache-Control':'no-store'}})}
-async function readOwner(){
-  const u=await getSessionUser();
-  if(!u?.userId)return;
-  try{
-    const {resolveWorkspaceContext}=await import('@/lib/staff');
-    const ctx=await resolveWorkspaceContext(u.userId);
-    return ctx.ownerId;
-  }catch{
-    return u.userId;
-  }
+
+function errorStack(e:unknown){
+ return e instanceof Error?(e.stack||e.message):String(e);
 }
+
+/** One log line per failure at the API boundary: which action, whose workspace, full stack. */
+function logActionError(action:string,owner:string,e:unknown){
+ console.error('[workspace]',{action,owner,err:errorStack(e)});
+}
+
+type WorkspaceLookup={kind:'anonymous'}|{kind:'unavailable'}|{kind:'ok';ctx:WorkspaceContext};
+
+/** Staff lookup failure must not fall back to the caller's own id (they would see an empty cabinet). */
+async function lookupWorkspace(userId:string|undefined):Promise<WorkspaceLookup>{
+ if(!userId)return {kind:'anonymous'};
+ try{
+  return {kind:'ok',ctx:await resolveWorkspaceContext(userId)};
+ }catch(e){
+  logActionError('workspace_lookup',userId,e);
+  return {kind:'unavailable'};
+ }
+}
+
+const WORKSPACE_UNAVAILABLE='Кабинет временно недоступен. Повторите попытку через минуту.';
 
 function workerUrl(){
  const fromEnv=(env as unknown as {TELEGRAM_WORKER_URL?:string}).TELEGRAM_WORKER_URL||process.env.TELEGRAM_WORKER_URL;
@@ -445,9 +464,15 @@ async function runProxyCheck(owner:string,id:string){
  return {id,ok:result.ok,exitIp:next.exitIp,latencyMs:result.latencyMs,error:result.error||result.warning,telegramOk:next.telegramOk,protocol:next.protocol,status:next.status as string};
 }
 
+/**
+ * Heal passes run on every GET: prefilter in SQL so the common case (nothing to heal)
+ * returns zero rows. CASE guards json_extract from rows whose data is not valid JSON.
+ */
+const STATUS_CHECKING_SQL="CASE WHEN json_valid(data) THEN json_extract(data,'$.status') END='checking'";
+
 async function healStuckProxyChecks(owner:string,maxAgeMs=45_000){
  const db=database();
- const rows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='proxy'").bind(owner).all();
+ const rows=await db.prepare(`SELECT id,data FROM records WHERE owner=? AND kind='proxy' AND ${STATUS_CHECKING_SQL}`).bind(owner).all();
  let fixed=0;
  const now=Date.now();
  for(const row of rows.results){
@@ -515,9 +540,96 @@ async function workerPost(path:string,body:unknown,timeoutMs=120_000){
  return data;
 }
 
+/** Lease TTL must outlive the worker call it guards (worker timeout + this margin). */
+const ACCOUNT_LEASE_MARGIN_MS=15_000;
+const ACCOUNT_BUSY_WAIT_SEC=30;
+
+class AccountBusyError extends Error{
+ constructor(readonly accountId:string){
+  super('Аккаунт занят другой операцией Telegram — повторите позже');
+  this.name='AccountBusyError';
+ }
+}
+
+function isAccountBusy(e:unknown):e is AccountBusyError{
+ return e instanceof AccountBusyError;
+}
+
+function accountLeaseKey(accountId:string){
+ return `account:${accountId}`;
+}
+
+/**
+ * One Telegram session per account at a time: cron, browser poller and a second tab
+ * opening the same session concurrently trigger AUTH_KEY_DUPLICATED.
+ */
+async function holdAccountLease(owner:string,accountId:string,ttlMs:number):Promise<LockHandle>{
+ const lease=await acquireLock(database(),{owner,key:accountLeaseKey(accountId),ttlMs});
+ if(!lease)throw new AccountBusyError(accountId);
+ return lease;
+}
+
+async function releaseQuietly(owner:string,handle:LockHandle){
+ try{await releaseLock(database(),handle)}catch(e){logActionError('lock_release',owner,e)}
+}
+
+/**
+ * Re-seal session material the worker rebuilt (CreateNewSession) exactly like the import
+ * path: same seal(), AAD = owner. Returns true only when the new archive was stored.
+ */
+async function persistRefreshedSession(owner:string,accountId:string,result:any){
+ if(result?.sessionRefreshError){
+  console.error('[workspace] worker could not rebuild session',{owner,accountId,err:String(result.sessionRefreshError).slice(0,500)});
+ }
+ const refreshed=result?.refreshedSession;
+ if(refreshed==null)return false;
+ try{
+  const db=database();
+  const row:any=await db.prepare('SELECT secret FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
+  if(!row?.secret)return false;
+  const stored=JSON.parse(await unseal(String(row.secret),owner));
+  const merged=mergeRefreshedSession(stored,refreshed);
+  if(!merged)return false;
+  await db.prepare('UPDATE records SET secret=? WHERE owner=? AND id=? AND kind=?').bind(await seal(JSON.stringify(merged),owner),owner,accountId,'account').run();
+  return true;
+ }catch(e){
+  logActionError('persist_refreshed_session',owner,e);
+  return false;
+ }
+}
+
+/** Worker reports FloodWait as status 'flood' + waitSec: pause the account, never mark it dead. */
+async function applyFloodCooldown(owner:string,accountId:string,result:any){
+ if(result?.status!=='flood')return;
+ const waitSec=Math.max(1,Math.round(Number(result.waitSec)||0));
+ if(!waitSec)return;
+ try{
+  await patchRecordData(database(),{owner,kind:'account',id:accountId},{
+   cooldownUntil:new Date(Date.now()+waitSec*1000).toISOString(),
+   cooldownReason:'flood',
+  });
+ }catch(e){logActionError('apply_flood_cooldown',owner,e)}
+}
+
+/**
+ * workerPost for an account session, under the per-account lease. Throws AccountBusyError.
+ * `accountId` lets the worker queue calls per account instead of hashing the archive.
+ */
+async function accountWorkerPost(owner:string,accountId:string,path:string,body:Record<string,unknown>,timeoutMs=120_000){
+ const lease=await holdAccountLease(owner,accountId,timeoutMs+ACCOUNT_LEASE_MARGIN_MS);
+ try{
+  const result=await workerPost(path,{...body,accountId},timeoutMs);
+  await persistRefreshedSession(owner,accountId,result);
+  await applyFloodCooldown(owner,accountId,result);
+  return result;
+ }finally{
+  await releaseQuietly(owner,lease);
+ }
+}
+
 async function healStuckAccountChecks(owner:string,maxAgeMs=180_000){
  const db=database();
- const rows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='account'").bind(owner).all();
+ const rows=await db.prepare(`SELECT id,data FROM records WHERE owner=? AND kind='account' AND ${STATUS_CHECKING_SQL}`).bind(owner).all();
  let fixed=0;
  const now=Date.now();
  for(const row of rows.results){
@@ -597,15 +709,31 @@ const CONNECT_MAX_ATTEMPTS=3;
 const CONNECT_RETRY_PAUSE_MS=400;
 const ACCOUNT_CHECK_TIMEOUT_MS=22_000;
 const ACCOUNT_CHECK_CONCURRENCY=3;
+/** Lock TTLs outlive the slowest path of the guarded operation; release happens in finally. */
+const SCAN_LOCK_TTL_MS=10*60_000;
+const AUDIENCE_TICK_LOCK_MS=8*60_000;
+const INVITE_TICK_LOCK_MS=10*60_000;
+const MAILING_TICK_LOCK_MS=15*60_000;
+/** Mailing stops taking new recipients after this, so the lock TTL is never reached. */
+const MAILING_TICK_BUDGET_MS=10*60_000;
+const TICK_BUSY_WAIT_SEC=15;
+/** poll_dm_replies: at most this many sessions per call, inside one time budget (REQ-B8). */
+const POLL_DM_MAX_ACCOUNTS=2;
+const POLL_DM_DEFAULT_BUDGET_MS=45_000;
+const POLL_DM_MAX_BUDGET_MS=90_000;
+const POLL_DM_MIN_CALL_MS=10_000;
+const INBOX_CALL_TIMEOUT_MS=90_000;
 
 /** Ошибка коннекта/прокси — статус disconnected/proxy_error, БЕЗ отлёжки. */
-async function putAccountConnectFailed(owner:string,id:string,data:any,opts:{
+/** Writes the account blob as a diff against what this check last persisted. */
+type AccountSave=(next:Record<string,unknown>)=>Promise<void>;
+
+async function putAccountConnectFailed(save:AccountSave,id:string,data:any,opts:{
  attempts:number;
  lastError:string;
  proxyRotated?:string;
  status?:'disconnected'|'proxy_error';
 }){
- const db=database();
  const tip=
   `Не удалось подключить за ${opts.attempts} попыток${opts.proxyRotated?' со сменой прокси':''}. `+
   `Проверьте прокси и свежий tdata/session. `+
@@ -620,7 +748,7 @@ async function putAccountConnectFailed(owner:string,id:string,data:any,opts:{
   error:tip.slice(0,500),
   ...(opts.proxyRotated?{proxyId:opts.proxyRotated}:{}),
  };
- await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'account').run();
+ await save(next);
  return {
   id,
   ok:false,
@@ -630,11 +758,10 @@ async function putAccountConnectFailed(owner:string,id:string,data:any,opts:{
  };
 }
 
-async function putAccountUnauthorized(owner:string,id:string,data:any,opts:{
+async function putAccountUnauthorized(save:AccountSave,id:string,data:any,opts:{
  lastError:string;
  proxyRotated?:string;
 }){
- const db=database();
  const tip=
   `Сессия недействительна (смена прокси не помогла). `+
   `Перелогиньтесь в Telegram Desktop и заново загрузите tdata/session. `+
@@ -647,7 +774,7 @@ async function putAccountUnauthorized(owner:string,id:string,data:any,opts:{
   error:tip.slice(0,500),
   ...(opts.proxyRotated?{proxyId:opts.proxyRotated}:{}),
  };
- await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'account').run();
+ await save(next);
  return {
   id,
   ok:false,
@@ -657,12 +784,32 @@ async function putAccountUnauthorized(owner:string,id:string,data:any,opts:{
  };
 }
 
-async function runAccountCheck(owner:string,id:string,opts?:{
+type AccountCheckOptions={
  checkRestrictions?:boolean;
  ensureUsername?:boolean;
  forceUsername?:boolean;
  rotateProxy?:boolean;
-}){
+};
+
+/** Holds the account lease for all attempts; a busy account is reported, never touched. */
+async function runAccountCheck(owner:string,id:string,opts?:AccountCheckOptions){
+ const attempts=opts?.rotateProxy!==false?CONNECT_MAX_ATTEMPTS:1;
+ const ttlMs=attempts*(ACCOUNT_CHECK_TIMEOUT_MS+CONNECT_RETRY_PAUSE_MS)+ACCOUNT_LEASE_MARGIN_MS;
+ const lease=await acquireLock(database(),{owner,key:accountLeaseKey(id),ttlMs});
+ if(!lease){
+  const row:any=await database().prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'account').first();
+  let status='setup';
+  try{status=String(JSON.parse(String(row?.data)).status||'setup')}catch{/* нет строки / битые данные — нейтральный статус */}
+  return {id,ok:false,busy:true,status,error:new AccountBusyError(id).message};
+ }
+ try{
+  return await runAccountCheckLeased(owner,id,opts);
+ }finally{
+  await releaseQuietly(owner,lease);
+ }
+}
+
+async function runAccountCheckLeased(owner:string,id:string,opts?:AccountCheckOptions){
  const db=database();
  const checkRestrictions=opts?.checkRestrictions===true;
  const ensureUsername=opts?.ensureUsername!==false;
@@ -671,8 +818,14 @@ async function runAccountCheck(owner:string,id:string,opts?:{
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'account').first();
  if(!row)return {id,ok:false,status:'unauthorized',error:'Аккаунт не найден'};
  let data=JSON.parse(row.data);
+ let persisted:Record<string,unknown>=data;
+ const ref={owner,kind:'account',id};
+ const save:AccountSave=async(next)=>{
+  await writeRecordDiff(db,ref,persisted,next);
+  persisted=next;
+ };
  const checkingAt=new Date().toISOString();
- await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...data,status:'checking',error:'',checkingAt}),owner,id,'account').run();
+ await save({...data,status:'checking',error:'',checkingAt});
 
  const triedProxies=new Set<string>(data.proxyId?[String(data.proxyId)]:[]);
  let proxyRotated='';
@@ -689,11 +842,28 @@ async function runAccountCheck(owner:string,id:string,opts?:{
    const {payload}=await loadAccountSessionPayload(owner,id);
    const workerResult=await workerPost('/check-account',{
     ...payload,
+    accountId:id,
     checkRestrictions,
     ensureUsername,
     forceUsername,
     desiredUsername:String(data.username||'').replace(/^@/,'').trim(),
    },ACCOUNT_CHECK_TIMEOUT_MS);
+   const sessionRefreshed=await persistRefreshedSession(owner,id,workerResult);
+   if(workerResult.status==='flood'){
+    // FloodWait: сессия жива — пауза через cooldownUntil, аккаунт не «мёртвый».
+    const waitSec=Math.max(1,Math.round(Number(workerResult.waitSec)||60));
+    const flooded={
+     ...data,
+     status:'active',
+     checkingAt:'',
+     cooldownUntil:new Date(Date.now()+waitSec*1000).toISOString(),
+     cooldownReason:'flood',
+     error:`FloodWait ${waitSec} с — Telegram просит паузу, сессия жива`,
+     ...(proxyRotated?{proxyId:proxyRotated}:{}),
+    };
+    await save(flooded);
+    return {id,ok:false,status:'active',flood:true,waitSec,error:flooded.error,proxyRotated:proxyRotated||undefined};
+   }
    const status=ACCOUNT_STATUSES.includes(workerResult.status)?workerResult.status:(workerResult.ok?'active':'disconnected');
    const profile=workerResult.profile||{};
    const err=(workerResult.error||'').slice(0,500);
@@ -715,25 +885,25 @@ async function runAccountCheck(owner:string,id:string,opts?:{
 
    if(workerResult.ok||status==='active'){
     const okNext={...next,status:'active',cooldownUntil:'',cooldownReason:'',error:''};
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(okNext),owner,id,'account').run();
+    await save(okNext);
     return {
      id,ok:true,status:'active',error:'',profile,
      proxyRotated:proxyRotated||undefined,
-     sessionRefreshed:!!workerResult.sessionRefreshed,
+     sessionRefreshed,
     };
    }
 
    const sessionDead=isSessionDeadError(status,err);
    if(sessionDead){
     // Без кручения прокси — быстрее и безопаснее
-    return putAccountUnauthorized(owner,id,data,{
+    return putAccountUnauthorized(save,id,data,{
      lastError:err||status,
      proxyRotated:proxyRotated||undefined,
     });
    }
 
    if(status==='frozen'||status==='spamblock'){
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'account').run();
+    await save(next);
     return {id,ok:false,status:next.status,error:next.error,profile,proxyRotated:proxyRotated||undefined};
    }
 
@@ -753,25 +923,25 @@ async function runAccountCheck(owner:string,id:string,opts?:{
      triedProxies.add(nextProxy);
      proxyRotated=nextProxy;
      data={...data,proxyId:nextProxy};
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
+     await save({
       ...data,
       status:'checking',
       checkingAt:new Date().toISOString(),
       error:`Смена прокси · попытка ${attempt+2}/${maxAttempts}…`,
-     }),owner,id,'account').run();
+     });
      continue;
     }
    }
 
    if(rotateProxy&&(status==='proxy_error'||status==='disconnected'||status==='unauthorized')){
-    return putAccountConnectFailed(owner,id,data,{
+    return putAccountConnectFailed(save,id,data,{
      attempts:attempt+1,
      lastError:err||status,
      proxyRotated:proxyRotated||undefined,
     });
    }
 
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'account').run();
+   await save(next);
    return {id,ok:false,status:next.status,error:next.error,profile,proxyRotated:proxyRotated||undefined};
   }catch(e){
    const msg=String((e as Error).message||e);
@@ -781,7 +951,7 @@ async function runAccountCheck(owner:string,id:string,opts?:{
    const looksProxy=/proxy|socks|ECONN|connection to telegram|прокси/i.test(msg);
    const sessionish=/сессия больше не действительн|session.*(revoked|invalid)|unauthorized|authkey/i.test(msg);
    if(sessionish){
-    return putAccountUnauthorized(owner,id,data,{
+    return putAccountUnauthorized(save,id,data,{
      lastError:msg,
      proxyRotated:proxyRotated||undefined,
     });
@@ -798,19 +968,19 @@ async function runAccountCheck(owner:string,id:string,opts?:{
      triedProxies.add(nextProxy);
      proxyRotated=nextProxy;
      data={...data,proxyId:nextProxy};
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
+     await save({
       ...data,
       status:'checking',
       checkingAt:new Date().toISOString(),
       error:isTimeout
        ?`Таймаут · попытка ${attempt+2}/${maxAttempts}, смена прокси…`
        :`Сеть · попытка ${attempt+2}/${maxAttempts}, смена прокси…`,
-     }),owner,id,'account').run();
+     });
      continue;
     }
    }
    if(rotateProxy){
-    return putAccountConnectFailed(owner,id,data,{
+    return putAccountConnectFailed(save,id,data,{
      attempts:attempt+1,
      lastError:msg,
      proxyRotated:proxyRotated||undefined,
@@ -825,12 +995,12 @@ async function runAccountCheck(owner:string,id:string,opts?:{
     checkingAt:'',
     ...(proxyRotated?{proxyId:proxyRotated}:{}),
    };
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(failed),owner,id,'account').run();
+   await save(failed);
    return {id,ok:false,status:failed.status,error:failed.error,proxyRotated:proxyRotated||undefined};
   }
  }
 
- return putAccountConnectFailed(owner,id,data,{
+ return putAccountConnectFailed(save,id,data,{
   attempts:maxAttempts,
   lastError:lastError||lastStatus,
   proxyRotated:proxyRotated||undefined,
@@ -939,9 +1109,17 @@ function isHardDeadAccountStatus(status:string){
 /** Нормализация joinStateError — см. lib/processes/join-flow.sanitizeJoinStateError */
 
 /** Починить группы после бага set_group_join_state (Zod-объект в JSON). */
+/** SQL prefilter mirroring badErr/badState below; the JS check stays authoritative. */
+const CORRUPT_JOIN_FIELDS_SQL=`CASE WHEN json_valid(data) THEN (
+ json_type(data,'$.joinStateError') IN ('object','array')
+ OR (json_type(data,'$.joinStateError')='text' AND length(json_extract(data,'$.joinStateError'))>500)
+ OR (json_type(data,'$.joinState') IS NOT NULL AND json_type(data,'$.joinState')!='null'
+  AND CAST(json_extract(data,'$.joinState') AS TEXT) NOT IN ('','queued','waiting','joining','scanning'))
+) ELSE 0 END`;
+
 async function healCorruptGroupJoinFields(owner:string){
  const db=database();
- const groups=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='group'").bind(owner).all();
+ const groups=await db.prepare(`SELECT id,data FROM records WHERE owner=? AND kind='group' AND ${CORRUPT_JOIN_FIELDS_SQL}`).bind(owner).all();
  let fixed=0;
  for(const row of groups.results){
   try{
@@ -962,11 +1140,6 @@ async function healCorruptGroupJoinFields(owner:string){
   }catch{/* */}
  }
  return fixed;
-}
-
-/** Нельзя использовать прямо сейчас (hard-dead или отлёжка). */
-function isDeadAccountStatus(status:string,cooldownUntil?:string|null){
- return !isAccountUsable({status,cooldownUntil});
 }
 
 function groupAlreadyMember(d:any){
@@ -1268,13 +1441,9 @@ function workerLooksDeadAccount(result:any){
 async function rotateGroupOffDeadAccount(owner:string,gid:string,gdata:any,deadAccountId:string,accountPatch:Record<string,unknown>){
  const db=database();
  if(deadAccountId){
-  const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,deadAccountId,'account').first();
-  if(arow){
-   try{
-    const adata=JSON.parse(arow.data);
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,...accountPatch}),owner,deadAccountId,'account').run();
-   }catch{/* */}
-  }
+  try{
+   await patchRecordData(db,{owner,kind:'account',id:deadAccountId},accountPatch);
+  }catch(e){logActionError('rotate_group_account_patch',owner,e)}
  }
  const live=(await listLiveAccountIds(owner)).filter(aid=>aid!==deadAccountId);
  if(!live.length)return {ok:false as const,gdata};
@@ -1295,16 +1464,37 @@ async function rotateGroupOffDeadAccount(owner:string,gid:string,gdata:any,deadA
  return {ok:true as const,gdata:next,rejoinItem:{id:gid,name:String(next.name||gdata.name||'Группа')}};
 }
 
+/** Appends to settings.rescanLog only (json_set) — never rewrites the rest of settings. */
 async function appendGlobalRescanLog(owner:string,level:'info'|'ok'|'warn'|'error',text:string){
  const db=database();
- const config:any=await db.prepare('SELECT * FROM records WHERE owner=? AND kind=? LIMIT 1').bind(owner,'settings').first();
+ const config:any=await db.prepare("SELECT id,json_extract(data,'$.rescanLog') AS rescanLog FROM records WHERE owner=? AND kind=? AND json_valid(data) LIMIT 1").bind(owner,'settings').first();
  if(!config)return;
  try{
-  const current=JSON.parse(config.data);
-  const next={...current,rescanLog:pushTaskLog(current.rescanLog,level,text,120)};
-  // Не через settingsSchema — чтобы не сбрасывать прочие поля при частичном апдейте
-  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,config.id,'settings').run();
- }catch{/* */}
+  const current=config.rescanLog?JSON.parse(String(config.rescanLog)):[];
+  await patchRecordData(db,{owner,kind:'settings',id:String(config.id)},{rescanLog:pushTaskLog(current,level,text,120)});
+ }catch(e){logActionError('append_rescan_log',owner,e)}
+}
+
+/**
+ * Inserts a scanned lead unless the same Telegram message of the same group is already
+ * stored — single statement, so a concurrent scan cannot slip a duplicate in between.
+ */
+async function insertLeadOnce(db:ReturnType<typeof database>,owner:string,lead:Record<string,unknown>){
+ const groupId=String(lead.groupId||'');
+ const tgMsgId=String(lead.tgMsgId||'');
+ const id=crypto.randomUUID();
+ const created=new Date().toISOString();
+ const data=JSON.stringify(lead);
+ if(!groupId||!tgMsgId){
+  await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)').bind(id,owner,'lead',data,null,created).run();
+  return true;
+ }
+ const res=await db.prepare(`INSERT INTO records(id,owner,kind,data,secret,created)
+  SELECT ?,?,'lead',?,NULL,? WHERE NOT EXISTS (
+   SELECT 1 FROM records WHERE owner=? AND kind='lead'
+    AND CASE WHEN json_valid(data) THEN json_extract(data,'$.groupId')=? AND json_extract(data,'$.tgMsgId')=? ELSE 0 END
+  )`).bind(id,owner,data,created,owner,groupId,tgMsgId).run();
+ return res.meta.changes===1;
 }
 
 async function notifyNewLeadsTelegram(settings:any,leads:{name:string;message:string;temperature:string;source:string}[]){
@@ -1380,39 +1570,65 @@ function sameMailingPeer(lead:any,msg:any){
  return !!(a&&b&&a===b);
 }
 
+/** Another tick of the same task holds the lock: report busy with the current task, touch nothing. */
+async function tickBusyReply(db:ReturnType<typeof database>,owner:string,id:string,kind:string){
+ const row:any=await db.prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,kind).first();
+ let task:unknown;
+ try{task=row?JSON.parse(String(row.data)):undefined}catch{task=undefined}
+ return {ok:true,busy:true,skipped:true,waitSec:TICK_BUSY_WAIT_SEC,task};
+}
+
+/** Heal failures must not block the cabinet, but they must be visible in logs. */
+async function runHealPass(owner:string,name:string,pass:()=>Promise<unknown>){
+ try{await pass()}catch(e){logActionError(name,owner,e)}
+}
+
+/** One corrupt row is skipped and logged instead of failing the whole cabinet. */
+function parseRecordRows(owner:string,rows:Record<string,unknown>[],envKey:boolean){
+ const out:Record<string,unknown>[]=[];
+ for(const r of rows){
+  try{
+   out.push({
+    ...r,
+    data:JSON.parse(String(r.data)),
+    hasSecret:r.kind==='settings'?!!(r.hasSecret||envKey):!!r.hasSecret,
+   });
+  }catch(e){
+   console.error('[workspace] corrupt record skipped',{owner,id:r.id,kind:r.kind,err:errorStack(e)});
+  }
+ }
+ return out;
+}
+
+/** Internal bookkeeping kinds never reach the client list. */
+const HIDDEN_RECORD_KINDS_SQL="kind NOT IN ('ai_guard','audience_user','lock','cron_state')";
+
 export async function GET(){const session=await getSessionUser();if(!session?.userId)return reply({error:'Войдите в рабочее пространство'},401);
- let owner=session.userId;
- let workspace:{ownerId:string;isOwner:boolean;role:string;access:Record<string,boolean>}={ownerId:session.userId,isOwner:true,role:'owner',access:{}};
- try{
-  const {resolveWorkspaceContext,CRM_ACCESS_KEYS}=await import('@/lib/staff');
-  const ctx=await resolveWorkspaceContext(session.userId);
-  owner=ctx.ownerId;
-  workspace={ownerId:ctx.ownerId,isOwner:ctx.isOwner,role:ctx.role,access:ctx.access};
-  for(const k of CRM_ACCESS_KEYS){if(workspace.access[k]==null)workspace.access[k]=ctx.isOwner}
- }catch{/* */}
+ const lookup=await lookupWorkspace(session.userId);
+ if(lookup.kind!=='ok')return reply({error:WORKSPACE_UNAVAILABLE},503);
+ const ctx=lookup.ctx;
+ const owner=ctx.ownerId;
+ const workspace:{ownerId:string;isOwner:boolean;role:string;access:Record<string,boolean>}={ownerId:ctx.ownerId,isOwner:ctx.isOwner,role:ctx.role,access:{...ctx.access}};
+ for(const k of CRM_ACCESS_KEYS){if(workspace.access[k]==null)workspace.access[k]=ctx.isOwner}
  try{
  // Снять залипшие «Проверяется», чтобы UI не блокировался
- try{await healStuckAccountChecks(owner,180_000)}catch{/* */}
- try{await healStuckProxyChecks(owner,45_000)}catch{/* */}
- try{await healCorruptGroupJoinFields(owner)}catch{/* */}
+ await runHealPass(owner,'heal_account_checks',()=>healStuckAccountChecks(owner,180_000));
+ await runHealPass(owner,'heal_proxy_checks',()=>healStuckProxyChecks(owner,45_000));
+ await runHealPass(owner,'heal_group_join_fields',()=>healCorruptGroupJoinFields(owner));
  // audience_user не отдаём в список кабинета (тысячи строк) — только задачи и остальное
- const result=await database().prepare("SELECT id,kind,data,created,secret IS NOT NULL AS hasSecret FROM records WHERE owner=? AND kind!='ai_guard' AND kind!='audience_user' ORDER BY created DESC").bind(owner).all();
+ const result=await database().prepare(`SELECT id,kind,data,created,secret IS NOT NULL AS hasSecret FROM records WHERE owner=? AND ${HIDDEN_RECORD_KINDS_SQL} ORDER BY created DESC`).bind(owner).all();
  let telegramConnected=false;
  try{const h=await fetch(workerUrl()+'/health',{signal:AbortSignal.timeout(1500)});telegramConnected=h.ok}catch{telegramConnected=false}
  const envKey=!!envAiApiKey();
  return reply({
-  records:result.results.map((r:any)=>({
-   ...r,
-   data:JSON.parse(r.data),
-   hasSecret:r.kind==='settings'?!!(r.hasSecret||envKey):!!r.hasSecret,
-  })),
+  records:parseRecordRows(owner,result.results,envKey),
   telegramConnected,
   ai:{provider:process.env.AI_PROVIDER||'deepseek',hasEnvKey:envKey},
   workspace,
   me:{userId:session.userId,email:session.email,name:session.displayName},
  });
-}catch{return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
-export async function POST(req:Request){const owner=await readOwner();if(!owner)return reply({error:'Войдите в рабочее пространство'},401);const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);const db=database();
+}catch(e){logActionError('GET',owner,e);return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
+export async function POST(req:Request){const session=await getSessionUser();const lookup=await lookupWorkspace(session?.userId);if(lookup.kind==='anonymous')return reply({error:'Войдите в рабочее пространство'},401);if(lookup.kind==='unavailable')return reply({error:WORKSPACE_UNAVAILABLE},503);const ctx=lookup.ctx;const owner=ctx.ownerId;const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);let action='';try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'Некорректный запрос'},400);action=String(b.action||'');if(!canRunWorkspaceAction(ctx,b))return reply({error:'Недостаточно прав для этого действия. Обратитесь к владельцу кабинета.',forbidden:true},403);const db=database();
  if(b.action==='draft'){
   const id=z.string().uuid().parse(b.id);
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();
@@ -1570,7 +1786,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     }else{
      try{
       const {payload}=await loadAccountSessionPayload(owner,id);
-      const wr=await workerPost('/update-profile',{
+      const wr=await accountWorkerPost(owner,id,'/update-profile',{
        ...payload,
        ...(about!=null?{about}:{}),
        ...(firstName!=null?{firstName}:{}),
@@ -1590,7 +1806,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      }
     }
    }
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'account').run();
+   await writeRecordDiff(db,{owner,kind:'account',id},data,next);
    results.push({id,ok:tgOk||!pushToTelegram,tgOk,error:tgError,about:next.about,firstName:next.firstName,lastName:next.lastName});
    if(pushToTelegram)await new Promise(r=>setTimeout(r,1200));
   }
@@ -1604,18 +1820,15 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'account').first();
    if(!row){results.push({id,ok:false,error:'Не найден'});continue}
    if(!row.secret){results.push({id,ok:false,error:'Нет сессии'});continue}
-   const data=JSON.parse(row.data);
    try{
     const {payload}=await loadAccountSessionPayload(owner,id);
-    const wr=await workerPost('/upload-photo',{...payload,photoBase64});
+    const wr=await accountWorkerPost(owner,id,'/upload-photo',{...payload,photoBase64});
     if(wr.ok){
-     const next={...data,hasPhoto:true};
-     if(wr.status==='frozen')next.status='frozen';
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'account').run();
+     await patchRecordData(db,{owner,kind:'account',id},{hasPhoto:true,...(wr.status==='frozen'?{status:'frozen'}:{})});
      results.push({id,ok:true});
     }else{
      if(wr.status==='frozen'){
-      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...data,status:'frozen'}),owner,id,'account').run();
+      await patchRecordData(db,{owner,kind:'account',id},{status:'frozen'});
      }
      results.push({id,ok:false,error:wr.error||'Ошибка фото'});
     }
@@ -1703,9 +1916,14 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     group:gdata,
    },429);
   }
+  // Базы для diff-записи: пишем только поля, которые меняет вступление (REQ-B3).
+  const groupBase=gdata;
+  const accountBase=adata;
+  const groupRef={owner,kind:'group',id};
+  const accountRef={owner,kind:'account',id:String(gdata.accountId)};
   try{
    const {payload}=await loadAccountSessionPayload(owner,gdata.accountId);
-   const result=await workerPost('/join-group',{...payload,url:gdata.url});
+   const result=await accountWorkerPost(owner,gdata.accountId,'/join-group',{...payload,url:gdata.url});
    const frozen=result.status==='frozen'||result.join==='frozen'||/FROZEN|заморожен/i.test(String(result.error||''));
    const flood=result.join==='flood'||/FloodWait/i.test(String(result.error||''));
    const joinedOk=!!result.ok||result.join==='already'||result.join==='requested';
@@ -1723,10 +1941,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     joinStateError:reallyJoined||result.join==='requested'?'':(result.error||'').slice(0,500),
     name:result.title&&(!gdata.name||gdata.name.startsWith('http')||gdata.name==='Группа')?result.title:gdata.name,
    };
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'group').run();
+   await writeRecordDiff(db,groupRef,groupBase,next);
    if(joinedOk){
     const bumped=applyQuotaCooldownIfExhausted({...adata,...bumpJoinCounters(adata)});
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,gdata.accountId,'account').run();
+    await writeRecordDiff(db,accountRef,accountBase,bumped);
    }
    if(flood){
     const m=/FloodWait\s+(\d+)/i.exec(String(result.error||''));
@@ -1737,12 +1955,12 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      lastJoinAt:new Date().toISOString(),
      error:(result.error||'').slice(0,500),
     };
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(paced),owner,gdata.accountId,'account').run();
+    await writeRecordDiff(db,accountRef,accountBase,paced);
     return reply({ok:false,result,error:result.error,waitSec:sec,flood:true,pace:true},429);
    }
    if(frozen){
     const cooled=withFrozenStatus(adata,result.error||'Аккаунт заморожен Telegram');
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(cooled),owner,gdata.accountId,'account').run();
+    await writeRecordDiff(db,accountRef,accountBase,cooled);
     const rotated=await rotateGroupOffDeadAccount(owner,id,gdata,gdata.accountId,{status:'frozen',error:(result.error||'Аккаунт заморожен Telegram').slice(0,500)});
     if(rotated.ok){
      return reply({ok:false,accountFrozen:true,reassigned:true,needJoin:true,rejoinItem:rotated.rejoinItem,group:rotated.gdata,result:{...result,status:'error'},error:'Аккаунт заморожен — группа переназначена на живой аккаунт',joinGapSec:JOIN_GAP_DEFAULT_SEC});
@@ -1750,6 +1968,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    }
    return reply({ok:reallyJoined||result.join==='requested',result:{...result,status,membership:next.membership,joinedAt:next.joinedAt},group:next,accountFrozen:frozen,rotatedAccount,joinGapSec:JOIN_GAP_DEFAULT_SEC});
   }catch(e){
+   if(isAccountBusy(e)){
+    // Клиент и cron понимают 429 + waitSec + pace как «подождать и повторить».
+    return reply({error:e.message,busy:true,pace:true,waitSec:ACCOUNT_BUSY_WAIT_SEC},429);
+   }
+   logActionError('join_group',owner,e);
    const msg=String((e as Error).message||e);
    const frozen=workerLooksFrozen(null,msg);
    if(frozen){
@@ -1759,9 +1982,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     }
    }
    const next={...gdata,status:'error',error:msg.slice(0,500),joinState:'',joinStateAt:'',joinStateError:msg.slice(0,500)};
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'group').run();
+   await writeRecordDiff(db,groupRef,groupBase,next);
    if(frozen){
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,status:'frozen',error:msg.slice(0,500)}),owner,gdata.accountId,'account').run();
+    await patchRecordData(db,accountRef,{status:'frozen',error:msg.slice(0,500)});
    }
    return reply({error:next.error,accountFrozen:frozen},frozen?400:503);
   }
@@ -1769,6 +1992,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
  if(b.action==='scan_group'){
   const id=z.string().uuid().parse(b.id);
   const force=b.force===true;
+  // Один скан группы за раз: иначе параллельный скан вставляет те же лиды (REQ-B2).
+  const scanLock=await acquireLock(db,{owner,key:`scan:group:${id}`,ttlMs:SCAN_LOCK_TTL_MS});
+  if(!scanLock)return reply({ok:true,skipped:true,busy:true,waitSec:TICK_BUSY_WAIT_SEC,scanned:0,matched:0,added:0,message:'Скан этой группы уже идёт'});
+  try{
   const grow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'group').first();
   if(!grow)return reply({error:'Группа не найдена'},404);
   let gdata=JSON.parse(grow.data);
@@ -1852,9 +2079,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const keywords=workerKeywordsFromSettings(coreSettings).join(', ')||String(settings.keywords||'');
   const scanDepthDays=Math.max(1,Math.min(90,Number(settings.scanDepthDays)||7));
   const scanLimit=scanLimitFromDays(scanDepthDays);
+  const groupBase=gdata;
+  const groupRef={owner,kind:'group',id};
   try{
    const {payload}=await loadAccountSessionPayload(owner,gdata.accountId);
-   const result=await workerPost('/scan-group',{...payload,url:gdata.url,keywords,minusKeywords,limit:scanLimit,days:scanDepthDays});
+   const result=await accountWorkerPost(owner,gdata.accountId,'/scan-group',{...payload,url:gdata.url,keywords,minusKeywords,limit:scanLimit,days:scanDepthDays});
    if(!result.ok){
     if(workerLooksDeadAccount(result)){
      const frozen=workerLooksFrozen(result);
@@ -1899,7 +2128,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
           :errMsg),
       };
       if(discussionOnly||recentlyJoined||gdata.membership==='joined'||gdata.membership==='pending'||gdata.joinedAt){
-       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(soft),owner,id,'group').run();
+       await writeRecordDiff(db,groupRef,groupBase,soft);
       }
       return reply({
        error:soft.error||errMsg,
@@ -1922,7 +2151,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       joinStateAt:new Date().toISOString(),
       joinStateError:sanitizeJoinStateError(errMsg),
      };
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(healed),owner,id,'group').run();
+     await writeRecordDiff(db,groupRef,groupBase,healed);
      return reply({
       error:errMsg,
       needJoin:true,
@@ -2065,7 +2294,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      coreScore:Number(msg._core?.score)||0,
      accountId:String(gdata.joinedAccountId||gdata.accountId||''),
     };
-    await db.prepare('INSERT INTO records(id,owner,kind,data,secret,created) VALUES(?,?,?,?,?,?)').bind(crypto.randomUUID(),owner,'lead',JSON.stringify(lead),null,new Date().toISOString()).run();
+    if(!(await insertLeadOnce(db,owner,lead)))continue;
     added++;
     notifyBatch.push({name:lead.name,message:lead.message,temperature,source:lead.source});
    }
@@ -2114,7 +2343,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      50,
     ),
    };
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(groupNext),owner,id,'group').run();
+   await writeRecordDiff(db,groupRef,groupBase,groupNext);
    await appendGlobalRescanLog(
     owner,
     added?'ok':'info',
@@ -2136,6 +2365,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     taskLog:groupNext.scanLog,
    });
   }catch(e){
+   if(isAccountBusy(e)){
+    return reply({ok:true,skipped:true,busy:true,waitSec:ACCOUNT_BUSY_WAIT_SEC,scanned:0,matched:0,added:0,message:e.message});
+   }
+   logActionError('scan_group',owner,e);
    const errMsg=String((e as Error).message||e).slice(0,500);
    if(workerLooksFrozen(null,errMsg)){
     const rotated=await rotateGroupOffDeadAccount(owner,id,gdata,gdata.accountId,{status:'frozen',error:errMsg});
@@ -2149,10 +2382,13 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      ...gdata,
      scanLog:pushTaskLog(gdata.scanLog,'error',`Ошибка переобхода: ${errMsg.slice(0,200)}`,50),
     };
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(failNext),owner,id,'group').run();
+    await writeRecordDiff(db,groupRef,groupBase,failNext);
     await appendGlobalRescanLog(owner,'error',`${gdata.name||'Группа'}: ${errMsg.slice(0,160)}`);
-   }catch{/* */}
+   }catch(logErr){logActionError('scan_group_fail_log',owner,logErr)}
    return reply({error:errMsg},503);
+  }
+  }finally{
+   await releaseQuietly(owner,scanLock);
   }
  }
  if(b.action==='mark_lead_viewed'){
@@ -2450,7 +2686,6 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const mode=z.enum(['dm','chat']).parse(b.mode||'dm');
   const text=z.string().trim().min(1).max(4000).parse(b.text);
   const silent=b.silent===true;
-  const deleteDialog=b.deleteDialog===true;
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();
   if(!row)return reply({error:'Лид не найден'},404);
   const lead=JSON.parse(row.data);
@@ -2513,8 +2748,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if((!senderId||senderId.startsWith('100'))&&replyPeers[0])senderId=replyPeers[0];
    // access_hash чужого аккаунта ломает SendMessage → invalid Peer
    const sameAccount=String(lead.accountId||'')===String(sendAccountId);
-   let accessHash=sameAccount?String(lead.senderAccessHash||''):'';
-   const result=await workerPost('/send-message',{
+   const accessHash=sameAccount?String(lead.senderAccessHash||''):'';
+   const result=await accountWorkerPost(owner,sendAccountId,'/send-message',{
     ...payload,
     mode,
     text,
@@ -2530,7 +2765,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    // Повтор без access_hash, если peer битый
    let finalResult=result;
    if(!result.ok&&/invalid peer/i.test(String(result.error||''))&&accessHash){
-    finalResult=await workerPost('/send-message',{
+    finalResult=await accountWorkerPost(owner,sendAccountId,'/send-message',{
      ...payload,
      mode,
      text,
@@ -2572,7 +2807,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     senderUsername:String(finalResult.chatUsername||lead.senderUsername||'').slice(0,64),
     senderAccessHash:String(finalResult.senderAccessHash||(finalResult.ok?accessHash:lead.senderAccessHash)||'').slice(0,40),
    };
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'lead').run();
+   await writeRecordDiff(db,{owner,kind:'lead',id},lead,next);
    if(finalResult.flood||finalResult.status==='flood'){
     const sec=Number(finalResult.waitSec)||900;
     // FloodWait на ЛС — пауза ответа, аккаунт не уводим в «Отлежка».
@@ -2583,10 +2818,12 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if(accRow){
     const acc=JSON.parse(accRow.data);
     const bumped=applyQuotaCooldownIfExhausted({...acc,...bumpMessageCounters(acc,1)});
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,sendAccountId,'account').run();
+    await writeRecordDiff(db,{owner,kind:'account',id:sendAccountId},acc,bumped);
    }
    return reply({ok:true,lead:next,mode,link,messageId,rotatedAccount,accountId:sendAccountId});
   }catch(e){
+   if(isAccountBusy(e))return reply({error:e.message,busy:true,waitSec:ACCOUNT_BUSY_WAIT_SEC},429);
+   logActionError('send_lead_message',owner,e);
    return reply({error:String((e as Error).message||e).slice(0,500)},503);
   }
  }
@@ -2688,12 +2925,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   if(!config)return reply({ok:true,skipped:true});
   const current=JSON.parse(config.data);
   const at=new Date().toISOString();
-  const next={
-   ...current,
+  await patchRecordData(db,{owner,kind:'settings',id:String(config.id)},{
    lastAutoRescanAt:at,
    rescanLog:pushTaskLog(current.rescanLog,'info','Автообход групп выполнен',120),
-  };
-  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,config.id,'settings').run();
+  });
   return reply({ok:true,lastAutoRescanAt:at});
  }
  if(b.action==='enqueue_joins'){
@@ -2879,6 +3114,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
  }
  if(b.action==='tick_audience'){
   const id=z.string().uuid().parse(b.id);
+  const tickLock=await acquireLock(db,{owner,key:`tick:audience_task:${id}`,ttlMs:AUDIENCE_TICK_LOCK_MS});
+  if(!tickLock)return reply(await tickBusyReply(db,owner,id,'audience_task'));
+  try{
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'audience_task').first();
   if(!row)return reply({error:'Задача сбора не найдена'},404);
   let data=JSON.parse(row.data);
@@ -2919,6 +3157,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    return reply({ok:false,error:next.error,task:next});
   }
   const accountId=liveIds[0];
+  // Пишем diff к прочитанному: пауза, нажатая во время сбора, не затирается (REQ-B3).
+  const taskBase=JSON.parse(row.data);
+  const taskRef={owner,kind:'audience_task',id};
   try{
    const {payload}=await loadAccountSessionPayload(owner,accountId);
    // Недавние userId задачи задачи — чтобы батч не дублировал
@@ -2930,7 +3171,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      if(u.taskId===id&&u.userId)seenIds.push(String(u.userId));
     }catch{/* */}
    }
-   const result=await workerPost('/collect-audience',{
+   const result=await accountWorkerPost(owner,accountId,'/collect-audience',{
     ...payload,
     url:data.url,
     collectMode:data.collectMode,
@@ -2948,20 +3189,20 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     seenIds:seenIds.slice(-5000),
    },180_000);
    if(result.join==='need_join'){
-    const joinRes=await workerPost('/join-group',{...payload,url:data.url});
+    const joinRes=await accountWorkerPost(owner,accountId,'/join-group',{...payload,url:data.url});
     if(!joinRes.ok){
      const next={...data,status:'error',error:String(joinRes.error||'Не удалось вступить').slice(0,500),log:pushTaskLog(data.log,'error',String(joinRes.error||'join failed'))};
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'audience_task').run();
+     await writeRecordDiff(db,taskRef,taskBase,next);
      return reply({ok:false,error:next.error,task:next,needJoin:true});
     }
     data={...data,log:pushTaskLog(data.log,'ok','Вступили в источник')};
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(data),owner,id,'audience_task').run();
+    await writeRecordDiff(db,taskRef,taskBase,data);
     return reply({ok:true,joined:true,task:data});
    }
    if(!result.ok){
     const errMsg=String(result.error||'Сбор не удался').slice(0,500);
     const next={...data,status:'error',error:errMsg,log:pushTaskLog(data.log,'error',errMsg)};
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'audience_task').run();
+    await writeRecordDiff(db,taskRef,taskBase,next);
     return reply({ok:false,error:errMsg,trace:result.trace||'',task:next});
    }
    const seen=new Set(seenIds);
@@ -3015,12 +3256,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       :`+${added} · всего ${collected}${result.mode?` · ${result.mode}`:''}`,
     ),
    };
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'audience_task').run();
+   await writeRecordDiff(db,taskRef,taskBase,next);
    return reply({ok:true,added,task:next});
   }catch(e){
+   if(isAccountBusy(e))return reply({ok:true,busy:true,skipped:true,waitSec:ACCOUNT_BUSY_WAIT_SEC,task:data});
+   logActionError('tick_audience',owner,e);
    const next={...data,status:'error',error:String((e as Error).message||e).slice(0,500),log:pushTaskLog(data.log,'error',String((e as Error).message||e))};
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'audience_task').run();
+   await writeRecordDiff(db,taskRef,taskBase,next);
    return reply({ok:false,error:next.error,task:next},503);
+  }
+  }finally{
+   await releaseQuietly(owner,tickLock);
   }
  }
  if(b.action==='export_audience'){
@@ -3092,6 +3338,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
  }
  if(b.action==='tick_invite'){
   const id=z.string().uuid().parse(b.id);
+  const tickLock=await acquireLock(db,{owner,key:`tick:invite_task:${id}`,ttlMs:INVITE_TICK_LOCK_MS});
+  if(!tickLock)return reply(await tickBusyReply(db,owner,id,'invite_task'));
+  try{
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'invite_task').first();
   if(!row)return reply({error:'Задача инвайта не найдена'},404);
   let data=JSON.parse(row.data);
@@ -3109,13 +3358,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const t=Date.parse(data.nextAt);
    if(Number.isFinite(t)&&t>Date.now())return reply({ok:true,waiting:true,waitSec:Math.ceil((t-Date.now())/1000),task:data});
   }
-  // Анти-гонка: параллельные tick_invite (кнопка ▶ + poller) затирали логи
-  if(data.tickLockUntil){
-   const lockT=Date.parse(data.tickLockUntil);
-   if(Number.isFinite(lockT)&&lockT>Date.now()){
-    return reply({ok:true,busy:true,waitSec:Math.ceil((lockT-Date.now())/1000),task:data});
-   }
-  }
+  // Анти-гонка: взаимоисключение — CAS lock-строка выше; tickLockUntil только для UI.
   const tickLockUntil=new Date(Date.now()+120_000).toISOString();
   data={...data,tickLockUntil,nextAt:''};
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(data),owner,id,'invite_task').run();
@@ -3245,7 +3488,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   };
   try{
    const {payload,account}=await loadAccountSessionPayload(owner,accountId);
-   const joinRes=await workerPost('/join-group',{...payload,url:data.targetUrl});
+   const joinRes=await accountWorkerPost(owner,accountId,'/join-group',{...payload,url:data.targetUrl});
    if(!joinRes.ok&&joinRes.join!=='already'&&!/уже|already/i.test(String(joinRes.error||''))){
     const pause=randomPauseSec(data.pauseFromSec,data.pauseToSec);
     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} не смог вступить в группу: ${String(joinRes.error||'').slice(0,120)}`});
@@ -3258,9 +3501,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     return reply({ok:true,needJoin:true,task:next});
    }
    if(sourceUrl){
-    try{await workerPost('/join-group',{...payload,url:sourceUrl})}catch{/* источник опционален */}
+    try{await accountWorkerPost(owner,accountId,'/join-group',{...payload,url:sourceUrl})}catch(e){if(!isAccountBusy(e))logActionError('tick_invite_source_join',owner,e)}
    }
-   const result=await workerPost('/invite-users',{
+   const result=await accountWorkerPost(owner,accountId,'/invite-users',{
     ...payload,
     targetUrl:data.targetUrl,
     sourceUrl,
@@ -3313,8 +3556,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      if(hit){
       const urow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,hit.id,'audience_user').first();
       if(urow){
-       const ud=JSON.parse(urow.data);
-       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...ud,invited:true,skipReason:''}),owner,hit.id,'audience_user').run();
+       await patchRecordData(db,{owner,kind:'audience_user',id:hit.id},{invited:true,skipReason:''});
       }
      }
     }else{
@@ -3323,8 +3565,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      if(hit){
       const urow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,hit.id,'audience_user').first();
       if(urow){
-       const ud=JSON.parse(urow.data);
-       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...ud,invited:true,skipReason:reason}),owner,hit.id,'audience_user').run();
+       await patchRecordData(db,{owner,kind:'audience_user',id:hit.id},{invited:true,skipReason:reason});
       }
      }
     }
@@ -3379,6 +3620,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    },logEntries);
    return reply({ok:true,invited:okN,task:next,accountId,results:result.results||[],account:account.name});
   }catch(e){
+   if(isAccountBusy(e)){
+    const next=await persistInviteTask({
+     nextAt:new Date(Date.now()+ACCOUNT_BUSY_WAIT_SEC*1000).toISOString(),
+     status:'running',
+    },[
+     ...logEntries,
+     {level:'info',text:`Аккаунт ${bracketLabel(accountLabel)} занят другой операцией — повтор через ${ACCOUNT_BUSY_WAIT_SEC} с`},
+    ]);
+    return reply({ok:true,busy:true,waitSec:ACCOUNT_BUSY_WAIT_SEC,task:next});
+   }
+   logActionError('tick_invite',owner,e);
    const next=await persistInviteTask({
     status:'error',
     error:String((e as Error).message||e).slice(0,500),
@@ -3387,6 +3639,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     {level:'error',text:String((e as Error).message||e).slice(0,300)},
    ]);
    return reply({ok:false,error:next.error,task:next},503);
+  }
+  }finally{
+   await releaseQuietly(owner,tickLock);
   }
  }
 
@@ -3592,6 +3847,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
 
  if(b.action==='tick_mailing'){
   const id=z.string().uuid().parse(b.id);
+  // Лок до чтения задачи: иначе второй тик берёт устаревшие deliveredKeys и шлёт повторно.
+  const tickLock=await acquireLock(db,{owner,key:`tick:mailing_task:${id}`,ttlMs:MAILING_TICK_LOCK_MS});
+  if(!tickLock)return reply(await tickBusyReply(db,owner,id,'mailing_task'));
+  try{
+  const tickStartedAt=Date.now();
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'mailing_task').first();
   if(!row)return reply({error:'Задача рассылки не найдена'},404);
   let data=JSON.parse(row.data);
@@ -3607,12 +3867,6 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   if(data.nextAt){
    const t=Date.parse(data.nextAt);
    if(Number.isFinite(t)&&t>Date.now())return reply({ok:true,waiting:true,waitSec:Math.ceil((t-Date.now())/1000),task:data});
-  }
-  if(data.tickLockUntil){
-   const lockT=Date.parse(data.tickLockUntil);
-   if(Number.isFinite(lockT)&&lockT>Date.now()){
-    return reply({ok:true,busy:true,waitSec:Math.ceil((lockT-Date.now())/1000),task:data});
-   }
   }
   const tickLockUntil=new Date(Date.now()+120_000).toISOString();
   data={...data,tickLockUntil,nextAt:''};
@@ -3912,13 +4166,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    let failN=0;
    let accountWentCooldown=false;
    let cooldownUntil='';
-   let aiPool:string[]=Array.isArray(data.aiPool)?[...data.aiPool]:[];
+   const aiPool:string[]=Array.isArray(data.aiPool)?[...data.aiPool]:[];
    let aiPoolUsed=Number(data.aiPoolUsed)||0;
    let deliveries:MailingDelivery[]=Array.isArray(data.deliveries)?[...data.deliveries]:[];
    const newKeys:string[]=[...deliveredKeys];
    let nextAccountIndex=accountIndex;
 
    for(const cand of batch){
+    if(Date.now()-tickStartedAt>MAILING_TICK_BUDGET_MS){
+     logEntries.push({level:'info',text:'Время тика вышло — остальные получатели следующим тиком'});
+     break;
+    }
     let text='';
     if(data.contentMode==='ai'){
      text=String(aiPool.shift()||'').trim();
@@ -3946,7 +4204,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      }
     }
 
-    let result=await workerPost('/send-message',{
+    let result:any;
+    try{
+    result=await accountWorkerPost(owner,activeAccountId,'/send-message',{
      ...payload,
      mode:deliveryMode,
      text,
@@ -3968,7 +4228,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      cand.accessHash&&
      /invalid peer|неверный peer/i.test(String(result.error||''))
     ){
-     result=await workerPost('/send-message',{
+     result=await accountWorkerPost(owner,activeAccountId,'/send-message',{
       ...payload,
       mode:'dm',
       text,
@@ -3981,6 +4241,17 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       silent:!!data.silent,
       deleteDialog:false,
      },120_000);
+    }
+    }catch(e){
+     if(!isAccountBusy(e))throw e;
+     // Сессию держит другая операция: текст возвращаем в пул, получатель остаётся в очереди.
+     if(data.contentMode==='ai'&&text){
+      aiPool.unshift(text);
+      aiPoolUsed=Math.max(0,aiPoolUsed-1);
+     }
+     logEntries.push({level:'info',text:`Аккаунт ${bracketLabel(activeLabel)} занят другой операцией — повтор следующим тиком`});
+     nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
+     break;
     }
 
     const errRaw=String(result.error||'');
@@ -4303,6 +4574,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    },logEntries);
    return reply({ok:true,sent:okN,failed:failN,task:next,accountId});
   }catch(e){
+   logActionError('tick_mailing',owner,e);
    const next=await persistMailingTask({
     status:'error',
     error:String((e as Error).message||e).slice(0,500),
@@ -4311,6 +4583,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     {level:'error',text:String((e as Error).message||e).slice(0,300)},
    ]);
    return reply({ok:false,error:next.error,task:next},503);
+  }
+  }finally{
+   await releaseQuietly(owner,tickLock);
   }
  }
 
@@ -4368,29 +4643,31 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    return null;
   };
 
-  let settingsRow:any=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='settings' LIMIT 1").bind(owner).first();
-  let settingsData:any={};
-  let settingsId='';
-  if(settingsRow){
-   settingsId=String(settingsRow.id);
-   try{settingsData=JSON.parse(String(settingsRow.data))}catch{settingsData={}}
-  }
-  const cursor=Math.max(0,Number(settingsData.inboxPollCursor)||0);
+  // Только курсор: настройки целиком не перечитываем и не перезаписываем (REQ-B3).
+  const settingsRow:any=await db.prepare("SELECT id,CASE WHEN json_valid(data) THEN json_extract(data,'$.inboxPollCursor') END AS cursor FROM records WHERE owner=? AND kind='settings' LIMIT 1").bind(owner).first();
+  const settingsId=settingsRow?String(settingsRow.id):'';
+  const cursor=Number(settingsRow?.cursor)||0;
   const preferred=live.filter(a=>mailingAccountIds.has(a.id));
   const rest=live.filter(a=>!mailingAccountIds.has(a.id));
   const pool=(preferred.length?preferred.concat(rest):live);
-  const take=Math.min(4,Math.max(2,pool.length));
-  const slice=pool.slice(cursor%pool.length).concat(pool.slice(0,cursor%pool.length)).slice(0,take);
-  const nextCursor=(cursor+slice.length)%Math.max(1,pool.length);
+  const slice=rotateFrom(pool,cursor).slice(0,POLL_DM_MAX_ACCOUNTS);
+  const budgetMs=Math.min(POLL_DM_MAX_BUDGET_MS,Math.max(POLL_DM_MIN_CALL_MS,Number(b.budgetMs)||POLL_DM_DEFAULT_BUDGET_MS));
+  const pollStartedAt=Date.now();
+  let attempted=0;
 
   let opened=0;
   const names:string[]=[];
   for(const acc of slice){
+   const leftMs=budgetMs-(Date.now()-pollStartedAt);
+   if(leftMs<POLL_DM_MIN_CALL_MS)break;
+   attempted++;
    let result:any;
    try{
     const {payload}=await loadAccountSessionPayload(owner,acc.id);
-    result=await workerPost('/inbox-dms',{...payload,sinceTs:Number(acc.data.inboxSinceTs)||0,limitDialogs:30},90_000);
-   }catch{
+    result=await accountWorkerPost(owner,acc.id,'/inbox-dms',{...payload,sinceTs:Number(acc.data.inboxSinceTs)||0,limitDialogs:30},Math.min(INBOX_CALL_TIMEOUT_MS,leftMs));
+   }catch(e){
+    // Занятый аккаунт — просто следующий по кругу; прочие сбои видны в логах.
+    if(!isAccountBusy(e))logActionError('poll_dm_replies',owner,e);
     continue;
    }
    const msgs:any[]=Array.isArray(result?.messages)?result.messages:[];
@@ -4422,6 +4699,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      from:'client' as const,
     };
     if(leadRow){
+     // Лиды прочитаны до долгого вызова воркера — перечитываем и пишем только свои поля.
+     const freshLead:any=await db.prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,leadRow.id,'lead').first();
+     if(!freshLead)continue;
+     try{leadRow.data=JSON.parse(String(freshLead.data))}catch(e){logActionError('poll_dm_replies_lead',owner,e);continue}
+     const leadBefore=leadRow.data;
      const already=(Array.isArray(leadRow.data.replies)?leadRow.data.replies:[]).some((x:any)=>String(x.messageId||'')===mid&&mid);
      if(already)continue;
      const replies=[...(Array.isArray(leadRow.data.replies)?leadRow.data.replies:[]),incoming].slice(-40);
@@ -4441,7 +4723,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       mailingTaskId:leadRow.data.mailingTaskId||outreach.taskId,
       draft:leadRow.data.draft||'',
      };
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,leadRow.id,'lead').run();
+     await writeRecordDiff(db,{owner,kind:'lead',id:leadRow.id},leadBefore,next);
      leadRow.data=next;
      opened++;
      names.push(String(next.name||msg.name||msg.username||'Клиент'));
@@ -4482,19 +4764,16 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     }
    }
    if(maxSafeTs&&!unmatchedHit){
-    const fresh:any=await db.prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,acc.id,'account').first();
-    if(fresh){
-     try{
-      const adata=JSON.parse(String(fresh.data));
-      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,inboxSinceTs:maxSafeTs}),owner,acc.id,'account').run();
-     }catch{/* */}
-    }
+    try{
+     await patchRecordData(db,{owner,kind:'account',id:acc.id},{inboxSinceTs:maxSafeTs});
+    }catch(e){logActionError('poll_dm_replies_since',owner,e)}
    }
   }
+  const nextCursor=advanceCursor(cursor,attempted,pool.length);
   if(settingsId){
    try{
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...settingsData,inboxPollCursor:nextCursor}),owner,settingsId,'settings').run();
-   }catch{/* */}
+    await patchRecordData(db,{owner,kind:'settings',id:settingsId},{inboxPollCursor:nextCursor});
+   }catch(e){logActionError('poll_dm_replies_cursor',owner,e)}
   }
   return reply({ok:true,opened,names:names.slice(0,12),nextCursor});
  }
@@ -4649,4 +4928,4 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   }
  }
  return reply({ok:true,id,username:provision?.profile?.username||data.username||undefined,provision});
- }catch(e){if(e instanceof z.ZodError)return reply({error:'Проверьте поля: '+e.issues.map(i=>i.path.join('.')).join(', ')},400);if(e instanceof SyntaxError)return reply({error:'Некорректный запрос'},400);return reply({error:'Не удалось выполнить действие. Данные формы сохранены — повторите попытку.'},503)}}
+ }catch(e){if(e instanceof z.ZodError)return reply({error:'Проверьте поля: '+e.issues.map(i=>i.path.join('.')).join(', ')},400);if(e instanceof SyntaxError)return reply({error:'Некорректный запрос'},400);logActionError(action||'unknown',owner,e);return reply({error:'Не удалось выполнить действие. Данные формы сохранены — повторите попытку.'},503)}}

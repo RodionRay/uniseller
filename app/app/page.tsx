@@ -12,6 +12,7 @@ import {AudiencePanel,AudienceTaskFields} from '@/components/product/audience-pa
 import {InvitePanel,InviteModePicker,InviteTaskFields} from '@/components/product/invite-panel';
 import {MailingPanel,MailingTaskFields,MailingDeliveriesView} from '@/components/product/mailing-panel';
 import {TaskLogDialog} from '@/components/product/task-log-dialog';
+import {PanelErrorBoundary} from '@/components/product/error-fallback';
 import {EmployeesPanel} from '@/components/product/employees-panel';
 import {DEFAULT_DM_SOFT_CLOSE,DEFAULT_MAILING_TASK} from '@/lib/mailing';
 import {canAccessNav,type CrmAccess,type WorkspaceInvite,type WorkspaceMember} from '@/lib/staff-types';
@@ -3147,6 +3148,7 @@ function WorkspaceHome(){
             </div>
           )}
 
+          <PanelErrorBoundary key={view} section={view}>
           {view==='Уведомления'&&(
             <NotificationsPanel onOpenItem={(next)=>{if(next)navigate(next)}}/>
           )}
@@ -4242,6 +4244,7 @@ function WorkspaceHome(){
               </div>
             </div>
           )}
+          </PanelErrorBoundary>
 
           <footer className="app-footer">
             <span>UniLab · Тёплые заявки из Telegram</span>

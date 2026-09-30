@@ -28,7 +28,7 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(() => r(null)))));
 });
 
-async function listen(opts: {maxConcurrency?: number; maxQueue?: number; runPython?: (p: unknown, t: number) => Promise<unknown>} = {}) {
+async function listen(opts: {maxConcurrency?: number; maxQueue?: number; runPython?: (p: unknown, t: number, s?: AbortSignal) => Promise<unknown>} = {}) {
   const config = resolveConfig({
     TG_WORKER_TOKEN: TOKEN,
     TG_WORKER_PORT: '0',
@@ -228,6 +228,90 @@ describe('tg-worker HTTP guard', () => {
   });
 });
 
+describe('tg-worker queue admission and aborts', () => {
+  // Headers arrive at once, bodies later: admission must be decided (and reserved) per request.
+  function slowBodyPost(port: number, delayMs: number) {
+    return new Promise<number | string>(async (resolve) => {
+      const {request} = await import('node:http');
+      const req = request(
+        {host: '127.0.0.1', port, path: '/check-proxy', method: 'POST',
+          headers: {Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json', 'Content-Length': '2'}},
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode ?? 0));
+        },
+      );
+      req.on('error', (e: NodeJS.ErrnoException) => resolve(`err:${e.code}`));
+      req.flushHeaders();
+      setTimeout(() => req.end('{}'), delayMs);
+    });
+  }
+
+  function abortedPost(port: number) {
+    return import('node:http').then(({request}) => {
+      const req = request({host: '127.0.0.1', port, path: '/check-proxy', method: 'POST',
+        headers: {Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json'}});
+      req.on('error', () => {});
+      req.end('{}');
+      return req;
+    });
+  }
+
+  it('reserves queue places before reading bodies, so a slow-body flood gets 429', async () => {
+    let started = 0;
+    const {port} = await listen({maxConcurrency: 1, maxQueue: 1, runPython: async () => {
+      started += 1;
+      await new Promise((r) => setTimeout(r, 100));
+      return {ok: true};
+    }});
+    const codes = await Promise.all(Array.from({length: 10}, () => slowBodyPost(port, 100)));
+    expect(codes.filter((c) => c === 200)).toHaveLength(2);
+    expect(codes.filter((c) => c === 429)).toHaveLength(8);
+    expect(started).toBe(2);
+  });
+
+  it('drops a queued request whose client went away and frees its place', async () => {
+    let started = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const {base, port} = await listen({maxConcurrency: 1, maxQueue: 1, runPython: async () => {
+      started += 1;
+      if (started === 1) await gate;
+      return {ok: true};
+    }});
+    const first = post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    await new Promise((r) => setTimeout(r, 50));
+    const gone = await abortedPost(port);
+    await new Promise((r) => setTimeout(r, 50));
+    gone.destroy();
+    await new Promise((r) => setTimeout(r, 50));
+    // The aborted request no longer holds the only queue place.
+    const next = post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    await new Promise((r) => setTimeout(r, 50));
+    release();
+    expect((await first).status).toBe(200);
+    expect((await next).status).toBe(200);
+    expect(started).toBe(2);
+  });
+
+  it('signals the running job when its client goes away', async () => {
+    let signal: AbortSignal | undefined;
+    const {port, base} = await listen({maxConcurrency: 1, runPython: (_p, _t, s) => {
+      if (signal) return Promise.resolve({ok: true});
+      signal = s as AbortSignal;
+      return new Promise((resolve) => s?.addEventListener('abort', () => resolve({ok: false})));
+    }});
+    const gone = await abortedPost(port);
+    await new Promise((r) => setTimeout(r, 50));
+    gone.destroy();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(signal?.aborted).toBe(true);
+    // Slot came back exactly once: the next request runs.
+    const res = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    expect(res.status).toBe(200);
+  });
+});
+
 describe('tg-worker python runner', () => {
   function fakeScript(name: string, body: string) {
     const path = join(scratch, name);
@@ -258,6 +342,25 @@ describe('tg-worker python runner', () => {
     const result = (await run({action: 'check'}, 5000)) as {error: string};
     expect(result.error).not.toMatch(/secret|Traceback|\/Users/);
     await run.idle();
+    expect(readdirSync(tmpRoot)).toEqual([]);
+  });
+
+  it('kills the child and skips spawning when the job is aborted', async () => {
+    const tmpRoot = mkdtempSync(join(scratch, 'root-'));
+    const script = fakeScript('long.mjs', `setInterval(() => {}, 1000);`);
+    const run = createPythonRunner({python: process.execPath, script, tmpRoot, killGraceMs: 200});
+    const ac = new AbortController();
+    const t0 = Date.now();
+    const pending = run({action: 'check'}, 60_000, ac.signal);
+    setTimeout(() => ac.abort(), 200);
+    expect(await pending).toMatchObject({ok: false, status: 'disconnected'});
+    await run.idle();
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(readdirSync(tmpRoot)).toEqual([]);
+
+    const done = new AbortController();
+    done.abort();
+    expect(await run({action: 'check'}, 60_000, done.signal)).toMatchObject({ok: false});
     expect(readdirSync(tmpRoot)).toEqual([]);
   });
 

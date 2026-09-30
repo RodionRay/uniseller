@@ -13,7 +13,7 @@ import {
 import { findUserByEmail } from "@/lib/users";
 import { getDatabase } from "@/lib/db";
 import { isSameOriginRequest } from "@/lib/env";
-import { LOGIN_FAILURE_RULE, clientIp, createRateLimiter } from "@/lib/rate-limit";
+import { LOGIN_EMAIL_RULE, LOGIN_FAILURE_RULE, clientIp, createRateLimiter } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -43,22 +43,30 @@ export async function POST(req: Request) {
       return reply({ error: "Неверный email или пароль" }, 401);
     }
 
+    // Count the attempt atomically BEFORE the slow PBKDF2: a check-then-hit let parallel
+    // requests all pass the check while the first verification was still running.
     const limiter = createRateLimiter(getDatabase());
     const throttleKey = `login:${clientIp(req)}:${email}`;
-    if (await limiter.isLimited(throttleKey, LOGIN_FAILURE_RULE)) {
-      const retryAfter = await limiter.retryAfterSec(throttleKey, LOGIN_FAILURE_RULE);
+    const emailKey = `login-email:${email}`;
+    const attempts = await limiter.hit(throttleKey, LOGIN_FAILURE_RULE);
+    const emailAttempts = await limiter.hit(emailKey, LOGIN_EMAIL_RULE);
+    const blocked =
+      attempts > LOGIN_FAILURE_RULE.max
+        ? { key: throttleKey, rule: LOGIN_FAILURE_RULE }
+        : emailAttempts > LOGIN_EMAIL_RULE.max
+          ? { key: emailKey, rule: LOGIN_EMAIL_RULE }
+          : null;
+    if (blocked) {
+      const retryAfter = await limiter.retryAfterSec(blocked.key, blocked.rule);
       return NextResponse.json(
         { error: "Слишком много попыток входа. Попробуйте позже." },
         {
           status: 429,
-          headers: { "Cache-Control": "no-store", "Retry-After": String(retryAfter) },
+          headers: { "Cache-Control": "no-store", "Retry-After": String(Math.max(1, retryAfter)) },
         },
       );
     }
-    const rejectCredentials = async () => {
-      await limiter.hit(throttleKey, LOGIN_FAILURE_RULE);
-      return reply({ error: "Неверный email или пароль" }, 401);
-    };
+    const rejectCredentials = () => reply({ error: "Неверный email или пароль" }, 401);
 
     const dbUser = await findUserByEmail(email);
     if (dbUser?.passwordHash) {

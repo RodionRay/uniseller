@@ -53,6 +53,7 @@ export async function GET(
       provider,
       providerUserId: profile.providerUserId,
       email: profile.email,
+      emailVerified: profile.emailVerified,
       name: profile.name,
     });
     const token = await createSessionToken({

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestD1 } from "./platform-d1";
-import { LOGIN_FAILURE_RULE, createRateLimiter } from "@/lib/rate-limit";
+import { LOGIN_EMAIL_RULE, LOGIN_FAILURE_RULE, createRateLimiter } from "@/lib/rate-limit";
 
 const state = vi.hoisted(() => ({
   d1: null as unknown,
@@ -85,6 +85,27 @@ describe("POST /api/auth/login throttle", () => {
     );
     expect(ok.status).toBe(200);
     expect((await login(jsonRequest("/api/auth/login", wrong))).status).toBe(401);
+  });
+
+  it("parallel attempts from one IP+email: at most max reach password verification", async () => {
+    const n = LOGIN_FAILURE_RULE.max + 8;
+    const statuses = (
+      await Promise.all(Array.from({ length: n }, () => login(jsonRequest("/api/auth/login", wrong))))
+    ).map((r) => r.status);
+    expect(statuses.filter((s) => s === 401)).toHaveLength(LOGIN_FAILURE_RULE.max);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(n - LOGIN_FAILURE_RULE.max);
+  });
+
+  it("per-email limit holds against IP rotation", async () => {
+    let ip = 0;
+    const next = () => jsonRequest("/api/auth/login", wrong, `198.51.100.${++ip}`);
+    for (let i = 0; i < LOGIN_EMAIL_RULE.max; i++) expect((await login(next())).status).toBe(401);
+    const blocked = await login(
+      jsonRequest("/api/auth/login", { email: "owner@example.com", password: "correct-password" }, "192.0.2.1"),
+    );
+    expect(blocked.status).toBe(429);
+    const otherEmail = await login(jsonRequest("/api/auth/login", { ...wrong, email: "x@example.com" }, "192.0.2.1"));
+    expect(otherEmail.status).toBe(401);
   });
 });
 

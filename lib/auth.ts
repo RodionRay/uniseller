@@ -179,25 +179,25 @@ export async function verifyPasswordHash(
   return timingSafeEqualBytes(expected, actual);
 }
 
+const AUTH_PAGE_PATHS = new Set([LOGIN_PATH, "/register", LOGOUT_PATH, "/callback"]);
+
+/**
+ * Validates the *normalised* path too: "/.//evil.com" passes a raw prefix check but
+ * resolves to "//evil.com", which browsers read as another origin.
+ */
 export function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
+  if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/";
+  let url: URL;
   try {
-    const url = new URL(value, "https://app.local");
-    if (url.origin !== "https://app.local") return "/";
-    if (
-      url.pathname === LOGIN_PATH ||
-      url.pathname === "/register" ||
-      url.pathname === LOGOUT_PATH ||
-      url.pathname === "/signin-with-chatgpt" ||
-      url.pathname === "/signout-with-chatgpt" ||
-      url.pathname === "/callback"
-    ) {
-      return "/app";
-    }
-    return `${url.pathname}${url.search}${url.hash}`;
+    url = new URL(value, "https://app.local");
   } catch {
     return "/";
   }
+  if (url.origin !== "https://app.local") return "/";
+  const path = url.pathname;
+  if (!path.startsWith("/") || path.startsWith("//") || path.includes("\\")) return "/";
+  if (AUTH_PAGE_PATHS.has(path)) return "/app";
+  return `${path}${url.search}${url.hash}`;
 }
 
 async function sign(payload: string): Promise<string> {

@@ -2,6 +2,7 @@ import {
   readEnv,
   safeRelativeReturnPath,
   sessionCookieOptions,
+  timingSafeEqualBytes,
 } from "@/lib/auth";
 import { appOrigin, registrationOpen } from "@/lib/env";
 import {
@@ -142,8 +143,31 @@ export function makeOAuthState(provider: string, returnTo: string) {
 export type OAuthProfile = {
   providerUserId: string;
   email: string | null;
+  /** True only when the provider vouches the address belongs to this account. */
+  emailVerified: boolean;
   name: string;
 };
+
+/**
+ * Yandex documents no verification flag for default_email, and an external address
+ * there is not proven ours to trust. A mailbox on Yandex's own domains is the
+ * account's own login, so it is verified by construction.
+ */
+const YANDEX_MAILBOX_DOMAINS = new Set([
+  "yandex.ru",
+  "ya.ru",
+  "yandex.com",
+  "yandex.by",
+  "yandex.kz",
+  "yandex.ua",
+  "yandex.com.tr",
+  "narod.ru",
+]);
+
+function isYandexMailbox(email: string): boolean {
+  const domain = email.trim().toLowerCase().split("@")[1];
+  return domain !== undefined && YANDEX_MAILBOX_DOMAINS.has(domain);
+}
 
 export async function exchangeOAuthCode(
   origin: string,
@@ -172,12 +196,14 @@ export async function exchangeOAuthCode(
     const me = (await meRes.json()) as {
       sub?: string;
       email?: string;
+      email_verified?: unknown;
       name?: string;
     };
     if (!me.sub) throw new Error("Google не вернул профиль");
     return {
       providerUserId: me.sub,
       email: me.email || null,
+      emailVerified: Boolean(me.email) && me.email_verified === true,
       name: me.name || me.email || "Google",
     };
   }
@@ -207,6 +233,7 @@ export async function exchangeOAuthCode(
     return {
       providerUserId: String(me.id),
       email: me.default_email || null,
+      emailVerified: Boolean(me.default_email) && isYandexMailbox(me.default_email || ""),
       name: me.real_name || me.display_name || me.default_email || "Яндекс",
     };
   }
@@ -236,6 +263,8 @@ export async function exchangeOAuthCode(
   return {
     providerUserId: String(token.user_id),
     email: token.email || null,
+    // VK gives no verification guarantee for the email scope: link VK only by its own id.
+    emailVerified: false,
     name: name || `VK ${token.user_id}`,
   };
 }
@@ -268,8 +297,8 @@ export async function verifyTelegramAuth(
     key,
     new TextEncoder().encode(check),
   );
-  const hex = Buffer.from(mac).toString("hex");
-  if (hex !== hash) throw new Error("Неверная подпись Telegram");
+  const expected = Buffer.from(Buffer.from(mac).toString("hex"), "utf8");
+  if (!timingSafeEqualBytes(expected, Buffer.from(hash, "utf8"))) throw new Error("Неверная подпись Telegram");
   const authDate = Number(data.auth_date || 0);
   if (!authDate || Date.now() / 1000 - authDate > 86400) {
     throw new Error("Сессия Telegram устарела");
@@ -291,19 +320,28 @@ export class RegistrationClosedError extends Error {
 
 /**
  * Signs in an OAuth/Telegram identity. With registration closed only existing
- * users (linked identity or same email) get in; creating a user would be
- * self-registration through the back door.
+ * users (linked identity or same verified email) get in; creating a user would be
+ * self-registration through the back door. An unverified email is dropped before
+ * any lookup: linking by it would hand an existing account to whoever typed that
+ * address into their provider profile.
  */
 export async function signInOAuthUser(input: {
   provider: string;
   providerUserId: string;
   email: string | null;
+  emailVerified: boolean;
   name: string;
 }): Promise<DbUser> {
-  if (registrationOpen()) return upsertOAuthUser(input);
+  const email = input.emailVerified ? input.email?.trim().toLowerCase() || null : null;
+  const identity = {
+    provider: input.provider,
+    providerUserId: input.providerUserId,
+    email,
+    name: input.name,
+  };
+  if (registrationOpen()) return upsertOAuthUser(identity);
   const linked = await findOAuthUser(input.provider, input.providerUserId);
   if (linked) return linked;
-  const email = input.email?.trim().toLowerCase();
   const byEmail = email ? await findUserByEmail(email) : null;
   if (!byEmail) throw new RegistrationClosedError();
   await linkOAuth(byEmail.id, input.provider, input.providerUserId);

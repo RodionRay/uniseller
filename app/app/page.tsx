@@ -87,6 +87,8 @@ import {
 } from '@/lib/audience-invite';
 import {useTableSort} from '@/hooks/useTableSort';
 import type {SortValueType} from '@/lib/table-sort';
+import {ApiError,requestJson,timeoutForAction} from './api-client';
+import {createPollGate} from './poll-gate';
 
 type Kind='account'|'proxy'|'group'|'lead'|'settings'|'audience_task'|'invite_task'|'mailing_task';
 type RecordItem={id:string;kind:Kind;data:any;hasSecret:boolean;created:string};
@@ -143,16 +145,28 @@ AI будет использовать этот текст для отбора �
 };
 const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов: откройте диалог — он уйдёт в «Просмотренные». Новый ответ клиента снова в «Новые».','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
 
-async function api(body?:unknown){
-  const r=await fetch('/api/workspace',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});
-  const data:any=await r.json();
-  if(!r.ok){
-    const err=new Error(data.error||'Ошибка соединения') as Error & {status?:number;data?:any};
-    err.status=r.status;
-    err.data=data;
-    throw err;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- workspace payloads are untyped records across the cabinet
+async function api(body?:{action?:string}&Record<string,unknown>):Promise<any>{
+  const init:RequestInit=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'};
+  return requestJson('/api/workspace',init,{timeoutMs:timeoutForAction(body?.action)});
+}
+
+/** Сеть, таймаут или 5xx — повод для backoff поллера; 4xx/409 «занято» — обычный ответ. */
+function isTransportFailure(e:unknown){
+  return e instanceof ApiError&&(e.kind!=='http'||e.status>=500);
+}
+
+type StaffListResponse={members?:WorkspaceMember[];invites?:WorkspaceInvite[]};
+type StaffActionResponse={url?:string;removed?:number;members?:number;invites?:number};
+
+/** POST /api/staff; an HTTP error without a server message falls back to the action-specific text. */
+async function staffApi(body:{action:string}&Record<string,unknown>,fallbackError:string):Promise<StaffActionResponse>{
+  try{
+    return await requestJson<StaffActionResponse>('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  }catch(e){
+    if(e instanceof ApiError&&e.kind==='http'&&typeof e.data.error!=='string')throw new ApiError(fallbackError,'http',e.status,e.data);
+    throw e;
   }
-  return data;
 }
 
 /** Чистый payload группы: не тащим битый joinStateError из records в save. */
@@ -551,15 +565,12 @@ function WorkspaceHome(){
 
   const refreshStaff=useCallback(async()=>{
     try{
-      const r=await fetch('/api/staff',{cache:'no-store'});
-      if(!r.ok){
-        if(r.status===403){setStaffMembers([]);setStaffInvites([]);return}
-        return;
-      }
-      const data=await r.json();
+      const data=await requestJson<StaffListResponse>('/api/staff',{cache:'no-store'});
       setStaffMembers(data.members||[]);
       setStaffInvites(data.invites||[]);
-    }catch{/* */}
+    }catch(e){
+      if(e instanceof ApiError&&e.status===403){setStaffMembers([]);setStaffInvites([])}
+    }
   },[]);
 
   const refresh=useCallback(async()=>{
@@ -595,20 +606,20 @@ function WorkspaceHome(){
   useEffect(()=>{recordsRef.current=records},[records]);
   useEffect(()=>{busyRef.current=busy},[busy]);
 
-  function replaceTaskData(id:string,data:Record<string,unknown>){
+  const replaceTaskData=useCallback((id:string,data:Record<string,unknown>)=>{
     const apply=(prev:RecordItem[])=>prev.map(x=>x.id===id?{...x,data}:x);
     setRecords(apply);
     recordsRef.current=apply(recordsRef.current);
-  }
+  },[]);
 
-  function applyTickTask(id:string,task:Record<string,unknown>|undefined){
+  const applyTickTask=useCallback((id:string,task:Record<string,unknown>|undefined)=>{
     if(!task)return;
     const cur=recordsRef.current.find(x=>x.id===id);
     // Устаревший tick после паузы не должен вернуть «running» в UI
     if(cur?.data.status==='paused'&&task.status==='running')return;
     if(pausedTasksRef.current.has(id)&&task.status==='running')return;
     replaceTaskData(id,task);
-  }
+  },[replaceTaskData]);
 
   useEffect(()=>{joinQueueRef.current=joinQueue;saveJoinQueue(joinQueue,joinWorkRef.current)},[joinQueue]);
 
@@ -788,8 +799,14 @@ function WorkspaceHome(){
   /** Poller: сбор аудитории + инвайтинг пока кабинет открыт */
   useEffect(()=>{
     if(!telegramConnected)return;
+    // Не наслаиваем тики, притормаживаем в скрытой вкладке и отступаем при сбоях сети/сервера.
+    const gate=createPollGate({baseBackoffMs:10_000,maxBackoffMs:120_000,hiddenMinIntervalMs:30_000});
+    let failed=false;
+    const track=(e:unknown)=>{if(isTransportFailure(e))failed=true};
     const tick=async()=>{
       if(taskPollLock.current||busyRef.current||joinRunnerLock.current||autoRescanLock.current)return;
+      if(!gate.tryEnter(Date.now(),document.hidden))return;
+      failed=false;
       const snap=recordsRef.current;
       const runningAudience=snap.filter(r=>r.kind==='audience_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
       const runningInvite=snap.filter(r=>r.kind==='invite_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
@@ -803,14 +820,14 @@ function WorkspaceHome(){
             applyTickTask(t.id,r.task);
             if(r.joined)toast.message(`${displayTgHandle(t.data.url||'')}: вступили в источник`);
             if(r.task?.status==='completed')toast.success(`Сбор завершён: ${displayTgHandle(t.data.url||'')} · ${r.task.collected||0}`);
-          }catch{/* */}
+          }catch(e){track(e)}
         }
         for(const t of runningInvite){
           try{
             const r=await api({action:'tick_invite',id:t.id});
             applyTickTask(t.id,r.task);
             if(r.completed)toast.success(`Инвайт завершён: ${displayTgHandle(t.data.targetUrl||'')}`);
-          }catch{/* */}
+          }catch(e){track(e)}
         }
         for(const t of runningMailing){
           try{
@@ -823,11 +840,12 @@ function WorkspaceHome(){
             }else if(r.completed){
               toast.success(`Рассылка завершена: ${t.data.name||''} · ${r.task?.sentTotal||0}`);
             }
-          }catch{/* */}
+          }catch(e){track(e)}
         }
         }
         try{
-          if(Date.now()-lastInboxPollAt.current>15_000){
+          // В скрытой вкладке входящие собирает серверный cron — не дублируем.
+          if(!document.hidden&&Date.now()-lastInboxPollAt.current>15_000){
             lastInboxPollAt.current=Date.now();
             const inbox=await api({action:'poll_dm_replies'});
             if(inbox?.opened>0){
@@ -835,15 +853,16 @@ function WorkspaceHome(){
               await refresh();
             }
           }
-        }catch{/* */}
+        }catch(e){track(e)}
       }finally{
         taskPollLock.current=false;
+        gate.leave(Date.now(),!failed);
       }
     };
     const id=window.setInterval(()=>{void tick()},5_000);
     const first=window.setTimeout(()=>{void tick()},1_000);
     return()=>{window.clearInterval(id);window.clearTimeout(first)};
-  },[telegramConnected]);
+  },[telegramConnected,applyTickTask,refresh]);
 
   async function startAudienceTask(id:string){
     if(!telegramConnected){toast.error('Запустите: npm run dev');return}
@@ -1278,8 +1297,11 @@ function WorkspaceHome(){
   useEffect(()=>{
     if(!telegramConnected||loading)return;
     let cancelled=false;
+    const gate=createPollGate({baseBackoffMs:5*60_000,maxBackoffMs:30*60_000,hiddenMinIntervalMs:15*60_000});
     const heal=async()=>{
       if(joinRunnerLock.current||busyRef.current)return;
+      if(!gate.tryEnter(Date.now(),document.hidden))return;
+      let ok=true;
       try{
         const r=await api({action:'heal_dead_group_accounts'});
         if(cancelled)return;
@@ -1291,7 +1313,8 @@ function WorkspaceHome(){
           await refresh();
           void startBackgroundJoins(r.items.map((i:{id:string;name?:string})=>({id:i.id,name:i.name||'Группа'})));
         }
-      }catch{/* */}
+      }catch(e){ok=!isTransportFailure(e)}
+      finally{gate.leave(Date.now(),ok)}
     };
     const first=window.setTimeout(()=>{void heal()},8_000);
     const id=window.setInterval(()=>{void heal()},5*60_000);
@@ -3259,21 +3282,17 @@ function WorkspaceHome(){
                 onCreateInvite={async(input)=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'create_invite',...input})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось создать приглашение');
+                    const data=await staffApi({action:'create_invite',...input},'Не удалось создать приглашение');
                     await refreshStaff();
                     toast.success('Ссылка-приглашение создана');
-                    return data.url as string;
+                    return data.url||null;
                   }catch(e){toast.error((e as Error).message);return null}
                   finally{setBusy(false)}
                 }}
                 onRevokeInvite={(id)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'revoke_invite',id})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось отозвать');
+                    await staffApi({action:'revoke_invite',id},'Не удалось отозвать');
                     await refreshStaff();
                     toast.success('Приглашение отозвано');
                   }catch(e){toast.error((e as Error).message)}
@@ -3282,9 +3301,7 @@ function WorkspaceHome(){
                 onRevokeInvites={(ids)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'revoke_invites',ids})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось отозвать');
+                    const data=await staffApi({action:'revoke_invites',ids},'Не удалось отозвать');
                     await refreshStaff();
                     toast.success(`Отозвано: ${data.removed||ids.length}`);
                   }catch(e){toast.error((e as Error).message)}
@@ -3293,9 +3310,7 @@ function WorkspaceHome(){
                 onUpdateMember={(input)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update_member',...input})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось сохранить');
+                    await staffApi({action:'update_member',...input},'Не удалось сохранить');
                     await refreshStaff();
                     toast.success('Доступы обновлены');
                   }catch(e){toast.error((e as Error).message)}
@@ -3304,9 +3319,7 @@ function WorkspaceHome(){
                 onRemoveMember={(id)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove_member',id})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось удалить');
+                    await staffApi({action:'remove_member',id},'Не удалось удалить');
                     await refreshStaff();
                     toast.success('Сотрудник удалён');
                   }catch(e){toast.error((e as Error).message)}
@@ -3315,9 +3328,7 @@ function WorkspaceHome(){
                 onRemoveMembers={(ids)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove_members',ids})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось удалить');
+                    const data=await staffApi({action:'remove_members',ids},'Не удалось удалить');
                     await refreshStaff();
                     toast.success(`Удалено: ${data.removed||ids.length}`);
                   }catch(e){toast.error((e as Error).message)}
@@ -3326,9 +3337,7 @@ function WorkspaceHome(){
                 onClearAll={()=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear_all'})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось очистить');
+                    const data=await staffApi({action:'clear_all'},'Не удалось очистить');
                     await refreshStaff();
                     toast.success(`Удалено сотрудников: ${data.members||0}, приглашений: ${data.invites||0}`);
                   }catch(e){toast.error((e as Error).message)}

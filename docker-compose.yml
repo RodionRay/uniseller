@@ -8,6 +8,8 @@ services:
       - .env
     environment:
       DATA_DIR: /data
+      # "none" unless a proxy in front overwrites a client-IP header (see README).
+      TRUSTED_IP_HEADER: ${TRUSTED_IP_HEADER:-none}
     volumes:
       - uniseller-data:/data
     restart: unless-stopped

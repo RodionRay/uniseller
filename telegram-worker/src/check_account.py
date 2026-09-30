@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import io
 import json
+import os
 import random
 import re
 import shutil
@@ -19,7 +21,63 @@ TDESKTOP_API_ID = 2040
 TDESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
 
 
+REFRESHED_SESSION_NAME = "uniseller_refreshed.session"
+
+_FLOOD_CLASSES = frozenset({"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"})
+_FROZEN_CLASSES = frozenset({"FrozenMethodInvalidError", "UserDeactivatedBanError", "UserDeactivatedError"})
+_UNAUTHORIZED_CLASSES = frozenset(
+    {"AuthKeyUnregisteredError", "SessionRevokedError", "AuthKeyDuplicatedError", "SessionExpiredError"}
+)
+_FLOOD_TEXT = re.compile(r"flood_(?:premium_)?wait_(\d+)|a wait of (\d+) seconds", re.IGNORECASE)
+
+
+def _class_names(exc: BaseException) -> set[str]:
+    return {cls.__name__ for cls in type(exc).__mro__}
+
+
+def _rpc_message(exc: BaseException) -> str:
+    """Код ошибки Telegram (RPCError.message), напр. FROZEN_METHOD_INVALID / FLOOD_WAIT_X."""
+    return str(getattr(exc, "message", "") or "").upper()
+
+
+def is_flood_wait(exc: BaseException) -> bool:
+    if _class_names(exc) & _FLOOD_CLASSES:
+        return True
+    msg = _rpc_message(exc)
+    if msg.startswith(("FLOOD_WAIT_", "FLOOD_PREMIUM_WAIT_")):
+        return True
+    return bool(_FLOOD_TEXT.search(str(exc)))
+
+
+def flood_wait_seconds(exc: BaseException) -> int | None:
+    """Сколько ждать по FloodWait; None — это не FloodWait."""
+    if not is_flood_wait(exc):
+        return None
+    seconds = getattr(exc, "seconds", None)
+    if isinstance(seconds, int):
+        return seconds
+    m = _FLOOD_TEXT.search(f"{_rpc_message(exc)} {exc}")
+    return int(m.group(1) or m.group(2)) if m else 0
+
+
+def is_frozen_rpc(exc: BaseException) -> bool:
+    """FROZEN_METHOD_INVALID приходит с кодом 420, как и FloodWait — различаем по тексту."""
+    if is_flood_wait(exc):
+        return False
+    if _class_names(exc) & {"FrozenMethodInvalidError"}:
+        return True
+    return "FROZEN" in _rpc_message(exc) or "FROZEN_METHOD_INVALID" in str(exc).upper()
+
+
 def classify_error(exc: BaseException) -> str:
+    """Статус аккаунта по исключению: по классам Telethon, текст — только запасной путь."""
+    names = _class_names(exc)
+    if is_flood_wait(exc):
+        return "flood"
+    if names & _FROZEN_CLASSES or is_frozen_rpc(exc):
+        return "frozen"
+    if names & _UNAUTHORIZED_CLASSES or "UnauthorizedError" in names:
+        return "unauthorized"
     name = type(exc).__name__
     text = str(exc).lower()
     combined = f"{name} {text}"
@@ -37,10 +95,8 @@ def classify_error(exc: BaseException) -> str:
         if "deactivated" in combined or "banned" in combined:
             return "frozen"
         return "unauthorized"
-    if "frozen" in combined or "freeze" in combined or "420" in combined:
+    if "frozen" in combined:
         return "frozen"
-    if "flood" in combined:
-        return "disconnected"
     if any(
         x in combined
         for x in (
@@ -82,10 +138,13 @@ def humanize_connect_error(exc: BaseException, has_proxy: bool) -> str:
     return raw[:400]
 
 
-def is_frozen_rpc(exc: BaseException) -> bool:
-    text = str(exc).upper()
-    code = getattr(exc, "code", None)
-    return code == 420 or "FROZEN_METHOD_INVALID" in text or "FROZEN" in text
+def error_result(exc: BaseException, **extra: Any) -> dict[str, Any]:
+    """Единый ответ об ошибке: status по классу исключения, waitSec для FloodWait."""
+    out: dict[str, Any] = {"ok": False, "status": classify_error(exc), "error": str(exc)[:400], **extra}
+    wait = flood_wait_seconds(exc)
+    if wait is not None:
+        out["waitSec"] = wait
+    return out
 
 
 def frozen_action_error(action: str) -> dict[str, Any]:
@@ -387,6 +446,7 @@ async def load_client_from_tdata(
                 retry_delay=0,
                 timeout=6,
                 request_retries=1,
+                flood_sleep_threshold=0,
             )
             try:
                 client = await td.ToTelethon(**kwargs, password=two_fa or None)
@@ -394,7 +454,8 @@ async def load_client_from_tdata(
                 client = await td.ToTelethon(**kwargs)
             await client.connect()
             if await client.is_user_authorized():
-                client._uniseller_session_refreshed = flag is CreateNewSession  # type: ignore[attr-defined]
+                if flag is CreateNewSession:
+                    client._uniseller_refreshed_file = session_path  # type: ignore[attr-defined]
                 return client
             try:
                 await client.disconnect()
@@ -409,6 +470,9 @@ async def load_client_from_tdata(
                     await client.disconnect()
             except Exception:
                 pass
+            # FloodWait/заморозка не лечатся новой сессией — лишь плодят авторизации устройств
+            if classify_error(e) in ("flood", "frozen"):
+                raise
             low = str(e).lower()
             if any(
                 x in low
@@ -444,12 +508,57 @@ async def load_client_from_session_file(
         retry_delay=0,
         timeout=6,
         request_retries=1,
+        flood_sleep_threshold=0,
     )
     try:
         await client.connect()
     except Exception as e:
         raise RuntimeError(humanize_connect_error(e, bool(proxy))) from e
     return client
+
+
+def make_work_dir() -> Path:
+    """Каталог под расшифрованную сессию. Внутри UNISELLER_WORK_DIR (его удаляет Node после выхода)."""
+    parent = os.environ.get("UNISELLER_WORK_DIR") or None
+    return Path(tempfile.mkdtemp(prefix="uniseller-acc-", dir=parent))
+
+
+def build_refreshed_archive(zip_b64: str, session_file: Path) -> str:
+    """Исходный архив + новая сессия (REFRESHED_SESSION_NAME в корне) → base64 zip.
+
+    open_client берёт эту сессию первой, поэтому следующая проверка не создаёт ещё одно устройство.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(zip_b64)), "r") as src, zipfile.ZipFile(
+        buf, "w", zipfile.ZIP_DEFLATED
+    ) as dst:
+        for item in src.infolist():
+            if Path(item.filename).name == REFRESHED_SESSION_NAME:
+                continue
+            dst.writestr(item, src.read(item))
+        dst.writestr(REFRESHED_SESSION_NAME, session_file.read_bytes())
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def attach_refreshed_session(result: dict[str, Any], client, payload: dict[str, Any]) -> dict[str, Any]:
+    """После disconnect (сессия сохранена на диск) вернуть новую сессию приложению.
+
+    sessionRefreshed=true только если refreshedSession реально в ответе.
+    """
+    session_file = getattr(client, "_uniseller_refreshed_file", None) if client else None
+    result["sessionRefreshed"] = False
+    if not session_file:
+        return result
+    try:
+        result["refreshedSession"] = {
+            "zipBase64": build_refreshed_archive(payload.get("zipBase64") or "", Path(session_file)),
+            "apiId": TDESKTOP_API_ID,
+            "apiHash": TDESKTOP_API_HASH,
+        }
+        result["sessionRefreshed"] = True
+    except Exception as e:
+        result["sessionRefreshError"] = f"{type(e).__name__}: {e}"[:200]
+    return result
 
 
 async def open_client(payload: dict[str, Any], work: Path):
@@ -475,7 +584,10 @@ async def open_client(payload: dict[str, Any], work: Path):
         if p.is_dir() and (p / "key_datas").exists():
             tdata = p
             break
-    session_files = [p for p in root.rglob("*.session") if p.is_file()]
+    refreshed = root / REFRESHED_SESSION_NAME
+    session_files = [
+        p for p in root.rglob("*.session") if p.is_file() and p.name != REFRESHED_SESSION_NAME
+    ]
     # не брать наши временные первыми
     session_files.sort(key=lambda p: (0 if "uniseller" not in p.name else 1, str(p)))
 
@@ -483,8 +595,10 @@ async def open_client(payload: dict[str, Any], work: Path):
     api_hash = payload.get("apiHash") or TDESKTOP_API_HASH
 
     errors: list[str] = []
-    # Порядок: по format, затем fallback на второй источник
+    # Порядок: сессия, выданная прошлым CreateNewSession; затем по format и fallback на второй источник
     attempts: list[tuple[str, Any]] = []
+    if refreshed.is_file():
+        attempts.append(("refreshed", refreshed))
     if fmt in ("tdata", "manual") and tdata:
         attempts.append(("tdata", tdata))
         if session_files:
@@ -495,7 +609,7 @@ async def open_client(payload: dict[str, Any], work: Path):
             attempts.append(("tdata", tdata))
     elif tdata:
         attempts.append(("tdata", tdata))
-    else:
+    elif not attempts:
         raise RuntimeError("В архиве нет tdata или session")
 
     last_exc: BaseException | None = None
@@ -506,7 +620,11 @@ async def open_client(payload: dict[str, Any], work: Path):
                     src, proxy, two_fa, allow_session_refresh=allow_refresh
                 )
             else:
-                client = await load_client_from_session_file(src, api_id, api_hash, proxy)
+                # refreshed создан через opentele API.TelegramDesktop → его api_id/hash
+                sid, shash = (
+                    (TDESKTOP_API_ID, TDESKTOP_API_HASH) if kind == "refreshed" else (api_id, api_hash)
+                )
+                client = await load_client_from_session_file(src, sid, shash, proxy)
                 if not await client.is_user_authorized():
                     try:
                         await client.disconnect()
@@ -517,6 +635,8 @@ async def open_client(payload: dict[str, Any], work: Path):
         except Exception as e:
             last_exc = e
             errors.append(f"{kind}: {str(e)[:120]}")
+            if classify_error(e) in ("flood", "frozen"):
+                raise
             # Сетевой сбой — нет смысла пробовать второй файл на том же прокси
             low = str(e).lower()
             if any(
@@ -2159,21 +2279,24 @@ async def ensure_account_username(
             last_err = f"@{candidate} недопустим"
             continue
         except RPCError as e:
-            msg = str(e)
-            if e.code == 420 or "FROZEN" in msg.upper() or "frozen" in msg.lower():
+            wait = flood_wait_seconds(e)
+            if wait is not None:
+                last_err = f"FloodWait {wait}с"
+                break
+            if is_frozen_rpc(e):
                 me = await client.get_me()
                 return profile_from(
                     me,
                     usernameError="Telegram ограничил смену username (заморозка)",
                     frozenMethod=not bool(me.username),
                 )
-            last_err = msg[:200]
-            if "flood" in last_err.lower():
-                break
+            last_err = str(e)[:200]
             continue
         except Exception as e:
             last_err = str(e)[:200]
-            if "flood" in last_err.lower() or "frozen" in last_err.lower():
+            if is_flood_wait(e):
+                break
+            if classify_error(e) == "frozen":
                 me = await client.get_me()
                 return profile_from(
                     me,
@@ -2206,10 +2329,11 @@ async def update_profile(client, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         await client(UpdateProfileRequest(**kwargs))
     except RPCError as e:
-        msg = str(e)
-        if e.code == 420 or "FROZEN" in msg.upper():
+        if is_flood_wait(e):
+            return error_result(e)
+        if is_frozen_rpc(e):
             return {"ok": False, "status": "frozen", "error": "Telegram ограничил смену профиля (заморозка)"}
-        return {"ok": False, "error": msg[:300]}
+        return {"ok": False, "error": str(e)[:300]}
     me = await client.get_me()
     phone = me.phone or ""
     if phone and not str(phone).startswith("+"):
@@ -2250,178 +2374,155 @@ async def upload_profile_photo(client, payload: dict[str, Any]) -> dict[str, Any
         uploaded = await client.upload_file(raw, file_name="avatar.jpg")
         await client(UploadProfilePhotoRequest(file=uploaded))
     except RPCError as e:
-        msg = str(e)
-        if e.code == 420 or "FROZEN" in msg.upper():
+        if is_flood_wait(e):
+            return error_result(e)
+        if is_frozen_rpc(e):
             return {"ok": False, "status": "frozen", "error": "Telegram ограничил смену фото (заморозка)"}
-        return {"ok": False, "error": msg[:300]}
+        return {"ok": False, "error": str(e)[:300]}
     except Exception as e:
         return {"ok": False, "error": str(e)[:300]}
     return {"ok": True, "hasPhoto": True}
 
-async def run_check(payload: dict[str, Any]) -> dict[str, Any]:
-    work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+CANCELLED_ERROR = "Операция прервана (таймаут/отмена)"
+
+
+async def check_account(client, payload: dict[str, Any]) -> dict[str, Any]:
+    create_username = payload.get("ensureUsername", True)
+    force_username = bool(payload.get("forceUsername"))
+    desired = str(payload.get("desiredUsername") or "").strip()
+    if create_username or force_username:
+        profile = await ensure_account_username(
+            client,
+            desired=desired or None,
+            force=force_username,
+        )
+    else:
+        me = await client.get_me()
+        phone = me.phone or ""
+        if phone and not str(phone).startswith("+"):
+            phone = "+" + phone
+        profile = {
+            "firstName": me.first_name or "",
+            "lastName": me.last_name or "",
+            "username": me.username or "",
+            "usernameCreated": False,
+            "phone": phone,
+            "userId": me.id,
+        }
+    restriction = None
+    if payload.get("checkRestrictions", True):
+        restriction = await check_spambot(client)
+    status = "active"
+    error = ""
+    if profile.get("frozenMethod"):
+        # UpdateUsername заморожен — часто и JoinChannel тоже; помечаем аккаунт
+        status = "frozen"
+        error = "Аккаунт заморожен Telegram (FROZEN_METHOD_INVALID). Вступление в группы недоступно — нужен другой аккаунт."
+    elif restriction == "spamblock":
+        status = "spamblock"
+        error = "Ограничения по SpamBot"
+    elif restriction == "frozen":
+        status = "frozen"
+        error = "Аккаунт заморожен"
+    elif not profile.get("username") and profile.get("usernameError"):
+        error = f"Без @username: {profile['usernameError']}"
+    return {"ok": status == "active", "status": status, "error": error, "profile": profile}
+
+
+def _split_words(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        return [x.strip() for x in raw.replace(";", ",").split(",")]
+    return list(raw or [])
+
+
+async def dispatch_account_action(client, payload: dict[str, Any], action: str) -> dict[str, Any]:
+    # Join/scan НЕ трогают username: UpdateUsername на frozen даёт FROZEN_METHOD_INVALID
+    # и ломает вступление. @username нужен только по желанию при проверке аккаунта.
+    url = payload.get("url") or ""
+    if action == "check":
+        return await check_account(client, payload)
+    if action == "join":
+        return await join_group(client, url)
+    if action == "scan":
+        keywords = _split_words(payload.get("keywords"))
+        minus = _split_words(payload.get("minusKeywords") or payload.get("minus_keywords"))
+        limit = int(payload.get("limit") or 40)
+        days = int(payload.get("days") or 0)
+        return await scan_group(client, url, keywords, minus, limit, days=days)
+    if action == "collect":
+        return await collect_audience(client, payload)
+    if action == "invite":
+        return await invite_users(client, payload)
+    if action == "send":
+        return await send_message(
+            client,
+            mode=str(payload.get("mode") or "dm"),
+            text=str(payload.get("text") or ""),
+            url=str(payload.get("url") or ""),
+            reply_to=str(payload.get("replyTo") or payload.get("tgMsgId") or ""),
+            sender_id=str(payload.get("senderId") or ""),
+            sender_username=str(payload.get("senderUsername") or ""),
+            sender_access_hash=str(
+                payload.get("senderAccessHash") or payload.get("accessHash") or ""
+            ),
+            silent=bool(payload.get("silent") or False),
+            delete_dialog=bool(
+                payload.get("deleteDialog") or payload.get("delete_dialog") or False
+            ),
+        )
+    if action == "inbox":
+        return await poll_dm_inbox(
+            client,
+            since_ts=int(payload.get("sinceTs") or payload.get("since_ts") or 0),
+            limit_dialogs=int(payload.get("limitDialogs") or 20),
+        )
+    if action == "update_profile":
+        return await update_profile(client, payload)
+    if action == "upload_photo":
+        return await upload_profile_photo(client, payload)
+    return {"ok": False, "error": f"Неизвестное действие: {action}"}
+
+
+ACCOUNT_ACTIONS = frozenset(
+    {"check", "join", "scan", "collect", "invite", "send", "inbox", "update_profile", "upload_photo"}
+)
+
+
+async def run_account_action(payload: dict[str, Any], action: str) -> dict[str, Any]:
+    """Открыть клиент, выполнить действие, закрыть; новая сессия (если создана) — в ответ."""
+    error_extra: dict[str, Any] = {} if action == "check" else {"messages": []}
+    work = make_work_dir()
     client = None
     try:
         client = await open_client(payload, work)
-        create_username = payload.get("ensureUsername", True)
-        force_username = bool(payload.get("forceUsername"))
-        desired = str(payload.get("desiredUsername") or "").strip()
-        if create_username or force_username:
-            profile = await ensure_account_username(
-                client,
-                desired=desired or None,
-                force=force_username,
-            )
-        else:
-            me = await client.get_me()
-            phone = me.phone or ""
-            if phone and not str(phone).startswith("+"):
-                phone = "+" + phone
-            profile = {
-                "firstName": me.first_name or "",
-                "lastName": me.last_name or "",
-                "username": me.username or "",
-                "usernameCreated": False,
-                "phone": phone,
-                "userId": me.id,
-            }
-        restriction = None
-        if payload.get("checkRestrictions", True):
-            restriction = await check_spambot(client)
-        status = "active"
-        error = ""
-        if profile.get("frozenMethod"):
-            # UpdateUsername заморожен — часто и JoinChannel тоже; помечаем аккаунт
-            status = "frozen"
-            error = "Аккаунт заморожен Telegram (FROZEN_METHOD_INVALID). Вступление в группы недоступно — нужен другой аккаунт."
-        elif restriction == "spamblock":
-            status = "spamblock"
-            error = "Ограничения по SpamBot"
-        elif restriction == "frozen":
-            status = "frozen"
-            error = "Аккаунт заморожен"
-        elif not profile.get("username") and profile.get("usernameError"):
-            error = f"Без @username: {profile['usernameError']}"
-        return {
-            "ok": status == "active",
-            "status": status,
-            "error": error,
-            "profile": profile,
-            "sessionRefreshed": bool(
-                getattr(client, "_uniseller_session_refreshed", False)
-            ),
-        }
+        result = await dispatch_account_action(client, payload, action)
     except asyncio.CancelledError:
-        return {"ok": False, "status": "disconnected", "error": "Операция прервана (таймаут/отмена)"}
+        result = {"ok": False, "status": "disconnected", "error": CANCELLED_ERROR, **error_extra}
     except Exception as e:
-        return {"ok": False, "status": classify_error(e), "error": str(e)[:400]}
+        result = error_result(e, **error_extra)
+    try:
+        if client:
+            await client.disconnect()
+    except Exception:
+        pass
+    try:
+        return attach_refreshed_session(result, client, payload)
     finally:
-        try:
-            if client:
-                await client.disconnect()
-        except Exception:
-            pass
         shutil.rmtree(work, ignore_errors=True)
 
 
 async def run_action(payload: dict[str, Any]) -> dict[str, Any]:
     action = payload.get("action") or "check"
     try:
-        if action == "check":
-            return await run_check(payload)
         if action == "check_proxy":
             return await check_proxy_alive(payload)
-
-        work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
-        client = None
-        try:
-            client = await open_client(payload, work)
-            # Join/scan НЕ трогают username: UpdateUsername на frozen даёт FROZEN_METHOD_INVALID
-            # и ломает вступление. @username нужен только по желанию при проверке аккаунта.
-            url = payload.get("url") or ""
-            if action == "join":
-                return await join_group(client, url)
-            if action == "scan":
-                keywords = payload.get("keywords") or []
-                if isinstance(keywords, str):
-                    keywords = [x.strip() for x in keywords.replace(";", ",").split(",")]
-                minus = payload.get("minusKeywords") or payload.get("minus_keywords") or []
-                if isinstance(minus, str):
-                    minus = [x.strip() for x in minus.replace(";", ",").split(",")]
-                limit = int(payload.get("limit") or 40)
-                days = int(payload.get("days") or 0)
-                return await scan_group(client, url, keywords, minus, limit, days=days)
-            if action == "collect":
-                return await collect_audience(client, payload)
-            if action == "invite":
-                return await invite_users(client, payload)
-            if action == "send":
-                return await send_message(
-                    client,
-                    mode=str(payload.get("mode") or "dm"),
-                    text=str(payload.get("text") or ""),
-                    url=str(payload.get("url") or ""),
-                    reply_to=str(payload.get("replyTo") or payload.get("tgMsgId") or ""),
-                    sender_id=str(payload.get("senderId") or ""),
-                    sender_username=str(payload.get("senderUsername") or ""),
-                    sender_access_hash=str(
-                        payload.get("senderAccessHash")
-                        or payload.get("accessHash")
-                        or ""
-                    ),
-                    silent=bool(payload.get("silent") or False),
-                    delete_dialog=bool(
-                        payload.get("deleteDialog")
-                        or payload.get("delete_dialog")
-                        or False
-                    ),
-                )
-            if action == "inbox":
-                return await poll_dm_inbox(
-                    client,
-                    since_ts=int(payload.get("sinceTs") or payload.get("since_ts") or 0),
-                    limit_dialogs=int(payload.get("limitDialogs") or 20),
-                )
-            if action == "update_profile":
-                return await update_profile(client, payload)
-            if action == "upload_photo":
-                return await upload_profile_photo(client, payload)
+        if action not in ACCOUNT_ACTIONS:
             return {"ok": False, "error": f"Неизвестное действие: {action}"}
-        except asyncio.CancelledError:
-            return {
-                "ok": False,
-                "status": "disconnected",
-                "error": "Операция прервана (таймаут/отмена)",
-                "messages": [],
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "status": classify_error(e),
-                "error": str(e)[:400],
-                "messages": [],
-            }
-        finally:
-            try:
-                if client:
-                    await client.disconnect()
-            except Exception:
-                pass
-            shutil.rmtree(work, ignore_errors=True)
+        return await run_account_action(payload, action)
     except asyncio.CancelledError:
-        return {
-            "ok": False,
-            "status": "disconnected",
-            "error": "Операция прервана (таймаут/отмена)",
-            "messages": [],
-        }
+        return {"ok": False, "status": "disconnected", "error": CANCELLED_ERROR, "messages": []}
     except Exception as e:
-        return {
-            "ok": False,
-            "status": classify_error(e),
-            "error": str(e)[:400],
-            "messages": [],
-        }
+        return error_result(e, messages=[])
 
 
 def _emit_error(exc: BaseException) -> int:

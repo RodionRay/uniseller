@@ -1,0 +1,14 @@
+# Telegram worker (check_account.py). Pinned to the versions verified in the live .venv (pip freeze, 2026-09-30).
+# Python 3.10–3.11: all binary wheels exist (linux x86_64 / macOS / Windows).
+# Python 3.12+: TgCrypto 1.2.5 has no wheel and builds from source (needs a C compiler / build-essential).
+# Install: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+Telethon==1.36.0
+opentele==1.15.1
+TgCrypto==1.2.5
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.19
+PyQt5-sip==12.17.1
+PySocks==1.7.1
+pyaes==1.6.1
+pyasn1==0.6.4
+rsa==4.9.1

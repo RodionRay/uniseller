@@ -111,7 +111,7 @@ describe("FloodWait puts the account on cooldown", () => {
       id: "22222222-2222-4222-8222-222222222222",
       owner: OWNER,
       kind: "group",
-      data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "none" },
+      data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "none", joinWanted: true },
     });
 
     const res = await POST(post({ action: "join_group", id: "22222222-2222-4222-8222-222222222222" }));

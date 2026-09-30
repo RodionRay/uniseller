@@ -62,7 +62,7 @@ beforeEach(async () => {
     id: GROUP_ID,
     owner: OWNER,
     kind: "group",
-    data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "none" },
+    data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "none", joinWanted: true },
   });
   insertRecord(harness.sqlite!, {
     id: LEAD_ID,

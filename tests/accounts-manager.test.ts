@@ -126,6 +126,28 @@ describe("менеджер аккаунтов · helpers", () => {
     expect(isAccountUsable(out)).toBe(true);
   });
 
+  it("FloodWait cooldown blocks the account until the timer expires", () => {
+    const future = new Date(Date.now() + 600_000).toISOString();
+    const past = new Date(Date.now() - 1_000).toISOString();
+    const flooded = { status: "active", cooldownUntil: future, cooldownReason: "flood" };
+
+    expect(isAccountUsable(flooded)).toBe(false);
+    expect(isAccountUsable({ ...flooded, cooldownUntil: past })).toBe(true);
+  });
+
+  it("quota normaliser keeps a live FloodWait timer", () => {
+    const future = new Date(Date.now() + 600_000).toISOString();
+    const out = applyQuotaCooldownIfExhausted({
+      status: "active",
+      cooldownUntil: future,
+      cooldownReason: "flood",
+      limits: { invite: 40, message: 40, chat: 40, memberInvite: 40 },
+    });
+
+    expect(out.cooldownUntil).toBe(future);
+    expect(isAccountUsable(out)).toBe(false);
+  });
+
   it("отлёжка по комментариям и инвайтам рассылки", () => {
     const day = new Intl.DateTimeFormat("en-CA", {
       timeZone: "Europe/Moscow",

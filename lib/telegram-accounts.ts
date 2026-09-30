@@ -95,12 +95,39 @@ export function isDayLimitCooldown(data: {
   return String(data.status || "") === "cooldown" && isOnCooldown(data.cooldownUntil);
 }
 
+/** Telegram FloodWait pause (cooldownReason=flood) with a live timer; status stays active. */
+export function isFloodCooldown(data: {
+  cooldownUntil?: string | null;
+  cooldownReason?: string | null;
+} | null | undefined): boolean {
+  if (!data) return false;
+  return String(data.cooldownReason || "") === "flood" && isOnCooldown(data.cooldownUntil);
+}
+
+const FLOOD_DEFAULT_WAIT_SEC = 60;
+
+/**
+ * Seconds Telegram asked to wait, or 0 when the worker result is not a FloodWait.
+ * Accepts every worker shape: status flood|floodwait, flood:true, waitSec|floodWait.
+ */
+export function floodWaitSeconds(result: unknown): number {
+  if (!result || typeof result !== "object") return 0;
+  const r = result as { status?: unknown; flood?: unknown; waitSec?: unknown; floodWait?: unknown };
+  const st = String(r.status || "");
+  const isFlood = st === "flood" || st === "floodwait" || r.flood === true || Number(r.floodWait) > 0;
+  if (!isFlood) return 0;
+  const sec = Math.round(Number(r.waitSec) || Number(r.floodWait) || 0);
+  return sec > 0 ? sec : FLOOD_DEFAULT_WAIT_SEC;
+}
+
 /** Можно ли ставить в работу (рассылка / инвайт / сбор / группы). */
 export function isAccountUsable(data: {
   status?: string | null;
   cooldownUntil?: string | null;
+  cooldownReason?: string | null;
 } | null | undefined): boolean {
   if (!data) return false;
+  if (isFloodCooldown(data)) return false;
   const st = String(data.status || "");
   if (
     [
@@ -289,9 +316,10 @@ export function applyQuotaCooldownIfExhausted<T extends Record<string, unknown>>
   if (!hasChatQuota(data as Parameters<typeof hasChatQuota>[0])) {
     return withDayLimitCooldown(data, "chat");
   }
-  // Сброс «осиротевшего» таймера от старых FloodWait/коннект-фейлов.
+  // Сброс «осиротевшего» таймера от старых коннект-фейлов; живой FloodWait не трогаем.
   if (
     st !== "cooldown" &&
+    !isFloodCooldown(data as { cooldownUntil?: string; cooldownReason?: string }) &&
     isOnCooldown(String((data as { cooldownUntil?: string }).cooldownUntil || ""))
   ) {
     return {

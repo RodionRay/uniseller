@@ -22,7 +22,7 @@ export class ApiError extends Error {
 }
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
-/** Worker/AI-backed actions: the server waits up to 120 s per worker call, plus DB work around it. */
+/** Worker/AI-backed actions: the server waits up to 130 s per worker call, plus DB work around it. */
 export const LONG_TIMEOUT_MS = 150_000;
 
 const LONG_ACTIONS = new Set([
@@ -54,11 +54,19 @@ const LONG_ACTIONS = new Set([
   'export_audience',
 ]);
 
+/**
+ * Actions whose single worker call may take 180 s (invite, collect, photo upload) plus the app margin;
+ * mirrors lib/processes/worker-timeouts.ts. The server stops starting new calls after its tick budget.
+ */
+export const SLOW_WORKER_TIMEOUT_MS = 200_000;
+const SLOW_WORKER_ACTIONS = new Set(['tick_invite', 'tick_audience', 'upload_account_photos']);
+
 /** poll_dm_replies: server budget is up to 90 s per call (2 accounts max). */
 export const POLL_DM_TIMEOUT_MS = 100_000;
 
 export function timeoutForAction(action: unknown): number {
   if (action === 'poll_dm_replies') return POLL_DM_TIMEOUT_MS;
+  if (typeof action === 'string' && SLOW_WORKER_ACTIONS.has(action)) return SLOW_WORKER_TIMEOUT_MS;
   return typeof action === 'string' && LONG_ACTIONS.has(action) ? LONG_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 }
 

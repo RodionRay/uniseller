@@ -1,6 +1,6 @@
 import {getSessionUser} from '@/lib/auth';
 import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
-import {sanitizeJoinStateError} from '@/lib/processes/join-flow';
+import {JOIN_SUCCESS_PATCH,JOIN_WORKER_ERROR_RETRY_MS,joinFailurePatch,planGroupHeal,sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
 import {aiChatText,envAiApiKey,resolveAiConfig} from '@/lib/ai-client';
 import {buildProjectBrief,leadMessageFingerprint,normalizeLeadMessage,parseLeadTemperature,ratingFromTemperatures,strongPlusTerms,type LeadTemperature} from '@/lib/lead-filter';
@@ -1093,168 +1093,92 @@ async function persistGroupAccount(owner:string,gid:string,gdata:any,accountId:s
 async function healDeadGroupAccounts(owner:string){
  const db=database();
  const liveIds=await listLiveAccountIds(owner);
- if(!liveIds.length){
-  return {ok:false as const,error:'Нет живых аккаунтов для переназначения',reassigned:0,items:[] as {id:string;name:string}[]};
- }
-
  const accRows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='account'").bind(owner).all();
- const accHardDead=new Map<string,boolean>();
- const accOnCooldown=new Map<string,boolean>();
- const accJoinQuota=new Map<string,boolean>();
+ const accStatus=new Map<string,string>();
  for(const r of accRows.results){
-  try{
-   const a=JSON.parse(String(r.data));
-   const st=String(a.status||'');
-   accHardDead.set(String(r.id),isHardDeadAccountStatus(st));
-   // Отлёжка = дневной лимит (status=cooldown), не голый cooldownUntil от FloodWait/коннекта.
-   accOnCooldown.set(String(r.id),isDayLimitCooldown(a)||st==='spamblock'||st==='frozen');
-   accJoinQuota.set(String(r.id),hasInviteQuota(a));
-  }catch{
-   accHardDead.set(String(r.id),true);
-   accOnCooldown.set(String(r.id),false);
-   accJoinQuota.set(String(r.id),false);
-  }
+  try{accStatus.set(String(r.id),String(JSON.parse(String(r.data)).status||''))}catch{accStatus.set(String(r.id),'error')}
  }
-
  const groups=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='group'").bind(owner).all();
  const items:{id:string;name:string}[]=[];
  const seen=new Set<string>();
  let reassigned=0;
+ let restored=0;
  let cursor=0;
- const farmIds=liveIds.filter(id=>accJoinQuota.get(id)!==false);
  const enqueue=(id:string,name:string)=>{
   if(seen.has(id))return;
   seen.add(id);
   items.push({id,name});
  };
+ const save=(gid:string,next:any)=>db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,gid,'group').run();
 
  for(const row of groups.results){
   try{
    const d=JSON.parse(String(row.data));
    if(isCatalogPlaceholderUrl(d.url||''))continue;
+   if(!String(d.url||'').trim())continue;
    const gid=String(row.id);
+   const name=String(d.name||'Группа');
    const aid=String(d.accountId||'');
-   const hardDead=!aid||accHardDead.get(aid)===true;
-   const onCooldown=!!aid&&accOnCooldown.get(aid)===true;
-   const markedDead=/недоступен|заморожен|frozen|offline|смените аккаунт/i.test(String(d.error||''));
+   const prev=String(d.joinedAccountId||'');
+   const action=planGroupHeal({
+    group:d,
+    accountStatus:aid&&accStatus.has(aid)?accStatus.get(aid)!:null,
+    previousAccountStatus:prev&&accStatus.has(prev)?accStatus.get(prev)!:null,
+   });
    const joinBusy=['queued','waiting','joining','scanning'].includes(String(d.joinState||''));
-   const alreadyIn=groupLooksJoined(d);
 
-   // Отлёжка / мёртвый слот: пересаживаем только непокрытые; уже вступившие на
-   // отлёжке не трогаем — иначе membership wipe → бесконечная очередь.
-   if((onCooldown&&!hardDead)||hardDead){
-    if(!liveIds.length){
-     if(joinBusy&&!alreadyIn)enqueue(gid,String(d.name||'Группа'));
-     continue;
+   if(action==='keep'){
+    // Восстановить membership из joinedAt; снять зависшую очередь
+    if(d.joinedAt&&d.membership!=='joined'&&d.membership!=='pending'){
+     await save(gid,{...d,membership:'joined',status:d.status==='error'||d.status==='setup'?'active':d.status,joinState:'',joinStateAt:'',joinStateError:'',error:''});
+    }else if(joinBusy){
+     await save(gid,{...d,joinState:'',joinStateAt:'',joinStateError:''});
     }
+    continue;
+   }
+   if(action==='gave_up'||action==='wait'){
+    if(joinBusy)await save(gid,{...d,joinState:'',joinStateAt:''});
+    continue;
+   }
+   if(action==='restore_previous'){
+    // Аккаунт уже вступал: join вернёт «already» без новой заявки
+    await save(gid,{...d,accountId:prev,joinState:'queued',joinStateAt:new Date().toISOString(),...JOIN_SUCCESS_PATCH});
+    restored++;
+    enqueue(gid,name);
+    continue;
+   }
+   if(action==='reassign'){
+    if(!liveIds.length)continue;
     const nextAcc=liveIds[cursor%liveIds.length];
     cursor++;
-    if(alreadyIn&&!hardDead){
-      // Аккаунт на отлёжке, группа уже покрыта — сидим, ловим лиды позже
-      if(joinBusy){
-       const cleared={...d,joinState:'',joinStateAt:'',joinStateError:''};
-       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(cleared),owner,gid,'group').run();
-      }
-      continue;
-    }
-    if(nextAcc===aid){
-     if(joinBusy||!alreadyIn)enqueue(gid,String(d.name||'Группа'));
-     continue;
-    }
-    // hard-dead + alreadyIn или непокрытая: пересадка на живой слот
-    const next={
+    await save(gid,{
      ...d,
      accountId:nextAcc,
-     membership:'none' as const,
+     membership:'none',
      joinedAt:'',
      status:'setup',
      error:'',
      lastScanned:'',
      joinState:'queued',
      joinStateAt:new Date().toISOString(),
-     joinStateError:hardDead
-      ?'Аккаунт недоступен — группа переназначена'
-      :(onCooldown?'Аккаунт на отлёжке — группа переназначена':''),
-    };
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,gid,'group').run();
+     joinStateError:'Аккаунт отключён Telegram — группа переназначена',
+     ...JOIN_SUCCESS_PATCH,
+    });
     reassigned++;
-    enqueue(gid,String(d.name||'Группа'));
+    enqueue(gid,name);
     continue;
    }
-
-   if(markedDead&&liveIds.includes(aid)){
-    const fixed={
-     ...d,
-     error:'',
-     status:alreadyIn?(d.membership==='pending'||d.status==='pending'?'pending':'active'):(d.status==='error'?'setup':d.status),
-     ...(d.joinedAt&&d.membership!=='joined'&&d.membership!=='pending'?{membership:'joined'}:{}),
-    };
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(fixed),owner,gid,'group').run();
+   // enqueue: ошибку прошлой попытки не стираем — её видно в кабинете
+   if(!joinBusy){
+    await save(gid,{...d,status:d.status==='error'?d.status:'setup',joinState:'queued',joinStateAt:new Date().toISOString()});
    }
-
-   // Восстановить membership из joinedAt — не кидать в очередь заново
-   if(d.joinedAt&&d.membership!=='joined'&&d.membership!=='pending'){
-    const restored={
-     ...d,
-     membership:'joined' as const,
-     status:d.status==='error'||d.status==='setup'?'active':d.status,
-     joinState:joinBusy?'':(d.joinState||''),
-     joinStateAt:joinBusy?'':(d.joinStateAt||''),
-     joinStateError:'',
-     error:'',
-    };
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(restored),owner,gid,'group').run();
-    continue;
-   }
-
-   // Непокрытая группа на аккаунте без дневной квоты вступлений — пересадка на ферму
-   if(!alreadyIn&&aid&&accJoinQuota.get(aid)===false&&farmIds.length){
-    const nextAcc=farmIds[cursor%farmIds.length];
-    cursor++;
-    if(nextAcc&&nextAcc!==aid){
-     const next={
-      ...d,
-      accountId:nextAcc,
-      joinedAt:'',
-      membership:'none' as const,
-      status:'setup',
-      error:'',
-      lastScanned:'',
-      joinState:'queued',
-      joinStateAt:new Date().toISOString(),
-      joinStateError:'',
-     };
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,gid,'group').run();
-     reassigned++;
-     enqueue(gid,String(d.name||'Группа'));
-     continue;
-    }
-   }
-
-   // Только реально непокрытые (нет joined/pending/joinedAt) — очередь на ТОМ ЖЕ аккаунте смеси
-   const uncovered=
-    liveIds.includes(aid)&&
-    !alreadyIn&&
-    !joinBusy&&
-    !!String(d.url||'').trim();
-   if(uncovered){
-    const next={
-     ...d,
-     status:'setup',
-     membership:'none',
-     error:'',
-     joinState:'queued',
-     joinStateAt:new Date().toISOString(),
-     joinStateError:'',
-    };
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,gid,'group').run();
-    enqueue(gid,String(d.name||'Группа'));
-   }else if(joinBusy&&!alreadyIn){
-    enqueue(gid,String(d.name||'Группа'));
-   }
+   enqueue(gid,name);
   }catch{/* */}
  }
- return {ok:true as const,reassigned,items,liveAccounts:liveIds.length};
+ if(!liveIds.length&&!items.length){
+  return {ok:false as const,error:'Нет живых аккаунтов для переназначения',reassigned,restored,items};
+ }
+ return {ok:true as const,reassigned,restored,items,liveAccounts:liveIds.length};
 }
 
 function workerLooksFrozen(result:any,msg?:string){
@@ -1726,7 +1650,9 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     accessHash:String(result.accessHash||(reallyJoined?result.accessHash:'')||gdata.accessHash||'').slice(0,40),
     joinState:'',
     joinStateAt:'',
-    joinStateError:reallyJoined||result.join==='requested'?'':(result.error||'').slice(0,500),
+    joinStateError:reallyJoined||result.join==='requested'?'':(result.error||'Не удалось вступить').slice(0,500),
+    // FloodWait — проблема аккаунта, не группы: попытку не считаем
+    ...(joinedOk?JOIN_SUCCESS_PATCH:flood?{}:joinFailurePatch(gdata)),
     name:result.title&&(!gdata.name||gdata.name.startsWith('http')||gdata.name==='Группа')?result.title:gdata.name,
    };
    // accessHash только от фактического join/already этой сессии
@@ -1769,7 +1695,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      return reply({error:'Аккаунт заморожен — группа переназначена на живой аккаунт',accountFrozen:true,reassigned:true,needJoin:true,rejoinItem:rotated.rejoinItem,group:rotated.gdata},409);
     }
    }
-   const next={...gdata,status:'error',error:msg.slice(0,500),joinState:'',joinStateAt:'',joinStateError:msg.slice(0,500)};
+   const next={...gdata,status:'error',error:msg.slice(0,500),joinState:'',joinStateAt:'',joinStateError:msg.slice(0,500),joinNextAt:new Date(Date.now()+JOIN_WORKER_ERROR_RETRY_MS).toISOString()};
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'group').run();
    if(frozen){
     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,status:'frozen',error:msg.slice(0,500)}),owner,gdata.accountId,'account').run();
@@ -2687,6 +2613,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    queued:ids.length,
    rescanMinutes,
    reassigned:healed.reassigned||0,
+   restored:healed.restored||0,
    rejoinItems:healed.items||[],
   });
  }
@@ -2753,7 +2680,12 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   const next={
    ...current,
    lastAutoRescanAt:at,
-   rescanLog:pushTaskLog(current.rescanLog,'info','Автообход групп выполнен',120),
+   rescanLog:pushTaskLog(
+    current.rescanLog,
+    b.hasErrors===true?'warn':'info',
+    String(b.summary||'').trim().slice(0,400)||'Автообход групп выполнен',
+    120,
+   ),
   };
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,config.id,'settings').run();
   return reply({ok:true,lastAutoRescanAt:at});

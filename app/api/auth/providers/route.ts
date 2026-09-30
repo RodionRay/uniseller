@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
 import { authProviders, makeTelegramState } from "@/lib/oauth";
+import { registrationOpen } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
 /** Also issues the Telegram login state (cookie + nonce for data-auth-url). */
 export async function GET(req: Request) {
-  const providers = authProviders();
+  const providers = { ...authProviders(), registrationOpen: registrationOpen() };
   if (!providers.telegram) {
     return NextResponse.json(
       { ...providers, telegramState: "" },

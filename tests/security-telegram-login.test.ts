@@ -14,6 +14,8 @@ const ENV = {
   TELEGRAM_BOT_TOKEN: BOT_TOKEN,
   TELEGRAM_BOT_USERNAME: "unilab_test_bot",
   SESSION_SECRET: "s".repeat(48),
+  // A first Telegram login creates the user; that needs open registration.
+  REGISTRATION_OPEN: "true",
 };
 const saved: Record<string, string | undefined> = {};
 

@@ -12,7 +12,9 @@ describe("Docker image client-IP trust", () => {
   });
 
   // Miniflare only sees .env files unless told to include process env; the image has no .env.
+  // The image starts the app through scripts/start-server.mjs, which sets it for wrangler.
   it("hands container env to the app runtime", () => {
-    expect(read("Dockerfile")).toMatch(/^ENV CLOUDFLARE_INCLUDE_PROCESS_ENV=true$/m);
+    expect(read("Dockerfile")).toMatch(/^CMD .*node scripts\/start-server\.mjs/m);
+    expect(read("scripts/start-server.mjs")).toMatch(/CLOUDFLARE_INCLUDE_PROCESS_ENV: "true"/);
   });
 });

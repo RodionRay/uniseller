@@ -60,6 +60,7 @@ uniseller-project/
 # Telegram sessions, archives, local DBs, editor state (may hold secrets/PII)
 tdata/
 *.session-journal
+# archives (a project zip was once committed by accident)
 *.zip
 *.sqlite*
 .cursor/

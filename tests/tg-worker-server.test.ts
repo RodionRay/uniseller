@@ -124,6 +124,19 @@ describe('tg-worker config', () => {
     expect(cronTargetAllowed('http://app.example.com')).toBe(false);
     expect(cronTargetAllowed('not a url')).toBe(false);
   });
+
+  it('allows plain http only to hosts listed in TG_WORKER_CRON_HTTP_HOSTS', () => {
+    const hosts = resolveConfig({TG_WORKER_TOKEN: TOKEN, TG_WORKER_CRON_HTTP_HOSTS: 'web, Other'}).cronHttpHosts;
+    expect(cronTargetAllowed('http://web:5173', hosts)).toBe(true);
+    expect(cronTargetAllowed('http://other:5173', hosts)).toBe(true);
+    expect(cronTargetAllowed('http://web:5173')).toBe(false);
+    expect(cronTargetAllowed('http://web.example.com:5173', hosts)).toBe(false);
+  });
+
+  it('reads the slot count from TG_WORKER_MAX_CONCURRENCY, then the older TG_WORKER_CONCURRENCY', () => {
+    expect(resolveConfig({TG_WORKER_TOKEN: TOKEN, TG_WORKER_CONCURRENCY: '2'}).maxConcurrency).toBe(2);
+    expect(resolveConfig({TG_WORKER_TOKEN: TOKEN, TG_WORKER_CONCURRENCY: '2', TG_WORKER_MAX_CONCURRENCY: '6'}).maxConcurrency).toBe(6);
+  });
 });
 
 describe('tg-worker HTTP guard', () => {

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requestOrigin } from "@/lib/env";
 import {
   createSessionToken,
   safeRelativeReturnPath,
@@ -6,12 +7,13 @@ import {
   sessionCookieOptions,
 } from "@/lib/auth";
 import {
+  RegistrationClosedError,
+  signInOAuthUser,
   telegramEnabled,
   telegramStateCookieCleared,
   telegramStateValid,
   verifyTelegramAuth,
 } from "@/lib/oauth";
-import { upsertOAuthUser } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
@@ -21,10 +23,11 @@ function withStateCleared(req: Request, res: NextResponse): NextResponse {
   return res;
 }
 
-function fail(req: Request): NextResponse {
+function fail(req: Request, error?: unknown): NextResponse {
+  const code = error instanceof RegistrationClosedError ? "closed" : "oauth";
   return withStateCleared(
     req,
-    NextResponse.redirect(new URL("/login?error=oauth", new URL(req.url).origin)),
+    NextResponse.redirect(new URL(`/login?error=${code}`, requestOrigin(req))),
   );
 }
 
@@ -34,11 +37,10 @@ function fail(req: Request): NextResponse {
  * Telegram payload. Replays are limited by the 5-minute auth_date window.
  */
 async function finish(req: Request, data: Record<string, string>) {
-  const url = new URL(req.url);
   if (!telegramEnabled()) return fail(req);
   if (!(await telegramStateValid(req, data.state))) return fail(req);
   const profile = await verifyTelegramAuth(data);
-  const user = await upsertOAuthUser({
+  const user = await signInOAuthUser({
     provider: "telegram",
     providerUserId: profile.id,
     email: null,
@@ -51,7 +53,7 @@ async function finish(req: Request, data: Record<string, string>) {
     displayName: user.name,
   });
   const res = NextResponse.redirect(
-    new URL(safeRelativeReturnPath(data.return_to || "/app"), url.origin),
+    new URL(safeRelativeReturnPath(data.return_to || "/app"), requestOrigin(req)),
   );
   res.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
   return withStateCleared(req, res);
@@ -63,8 +65,8 @@ export async function GET(req: Request) {
       req,
       Object.fromEntries(new URL(req.url).searchParams),
     );
-  } catch {
-    return fail(req);
+  } catch (error) {
+    return fail(req, error);
   }
 }
 
@@ -76,7 +78,7 @@ export async function POST(req: Request) {
       if (typeof v === "string" || typeof v === "number") data[k] = String(v);
     }
     return await finish(req, data);
-  } catch {
-    return fail(req);
+  } catch (error) {
+    return fail(req, error);
   }
 }

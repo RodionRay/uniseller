@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ComponentType } from "react";
+import { useCallback, useMemo, useState, useSyncExternalStore, type ComponentType } from "react";
 import {
   Bell,
   Database,
@@ -145,12 +145,35 @@ export function loadNavOrder(): NavName[] {
   }
 }
 
+/* Nav order as an external store: read from localStorage once on the client, SSR sees defaults. */
+const DEFAULT_ORDER: NavName[] = DEFAULT_NAV.map((n) => n.name);
+let navOrderSnapshot: NavName[] | null = null;
+const navOrderListeners = new Set<() => void>();
+
+function readNavOrderSnapshot(): NavName[] {
+  if (!navOrderSnapshot) navOrderSnapshot = loadNavOrder();
+  return navOrderSnapshot;
+}
+
+function readServerNavOrder(): NavName[] {
+  return DEFAULT_ORDER;
+}
+
+function subscribeNavOrder(listener: () => void) {
+  navOrderListeners.add(listener);
+  return () => {
+    navOrderListeners.delete(listener);
+  };
+}
+
 function saveNavOrder(order: NavName[]) {
+  navOrderSnapshot = order;
   try {
     localStorage.setItem(NAV_ORDER_KEY, JSON.stringify(order));
   } catch {
     /* ignore */
   }
+  navOrderListeners.forEach((listener) => listener());
 }
 
 type Props = {
@@ -161,13 +184,9 @@ type Props = {
 };
 
 export function WorkspaceNav({ view, onNavigate, badges, allowed }: Props) {
-  const [order, setOrder] = useState<NavName[]>(() => DEFAULT_NAV.map((n) => n.name));
+  const order = useSyncExternalStore(subscribeNavOrder, readNavOrderSnapshot, readServerNavOrder);
   const [dragFrom, setDragFrom] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
-
-  useEffect(() => {
-    setOrder(loadNavOrder());
-  }, []);
 
   const byName = useMemo(() => new Map(DEFAULT_NAV.map((n) => [n.name, n])), []);
   const allowedSet = useMemo(
@@ -185,13 +204,10 @@ export function WorkspaceNav({ view, onNavigate, badges, allowed }: Props) {
 
   const move = useCallback((from: number, to: number) => {
     if (from === to || from < 0 || to < 0) return;
-    setOrder((prev) => {
-      const next = [...prev];
-      const [item] = next.splice(from, 1);
-      next.splice(to, 0, item);
-      saveNavOrder(next);
-      return next;
-    });
+    const next = [...readNavOrderSnapshot()];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    saveNavOrder(next);
   }, []);
 
   return (

@@ -301,10 +301,7 @@ export function isPermanentMailingRecipientError(error: string): boolean {
     e.includes("privacy") ||
     e.includes("ограничил") ||
     e.includes("запретил") ||
-    e.includes("username_not_occupied") ||
     e.includes("username_invalid") ||
-    e.includes("no user has") ||
-    e.includes("nobody is using this username") ||
     e.includes("user_deactivated") ||
     e.includes("input_user_deactivated") ||
     e.includes("каналом/чатом") ||

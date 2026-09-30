@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("cloudflare:workers", () => ({ env: {} }));
 vi.mock("@/lib/users", () => ({ listUserIdsForCron: async () => [] }));
 
 import { POST } from "@/app/api/cron/auto-rescan/route";

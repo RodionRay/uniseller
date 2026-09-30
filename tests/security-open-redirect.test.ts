@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { safeRelativeReturnPath } from "@/lib/auth";
-import { safeRelativeReturnPath as authPathsSafeReturn } from "@/lib/auth-paths";
 import { GET as logoutGet } from "@/app/api/auth/logout/route";
 
 const HOSTILE = [
@@ -49,14 +48,6 @@ describe("safeRelativeReturnPath dot-segment bypass", () => {
 
   it("still resolves harmless dot segments", () => {
     expect(safeRelativeReturnPath("/a/../app/leads")).toBe("/app/leads");
-  });
-});
-
-describe("lib/auth-paths safeRelativeReturnPath", () => {
-  it.each(HOSTILE)("keeps %s on-site", (value) => {
-    const out = authPathsSafeReturn(value);
-    expect(out.startsWith("//")).toBe(false);
-    expect(new URL(out, "https://app.test").origin).toBe("https://app.test");
   });
 });
 

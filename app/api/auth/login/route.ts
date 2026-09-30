@@ -19,6 +19,7 @@ import {
   tooManyRequests,
 } from "@/lib/security/rate-limit";
 import { findUserByEmail } from "@/lib/users";
+import { isSameOriginRequest } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -58,8 +59,7 @@ async function resolveUser(email: string, password: string): Promise<SessionPayl
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin) {
+  if (!isSameOriginRequest(req)) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
   }
 

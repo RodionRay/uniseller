@@ -1,35 +1,64 @@
 # syntax=docker/dockerfile:1
+# Two images from one file: `web` (vinext app served by wrangler/workerd, local D1 on
+# the /data volume) and `worker` (Telegram worker: Node HTTP server + Python 3.11).
+# Build via docker compose (see docker-compose.yml, docs/DEPLOY.md).
 
-FROM node:22-bookworm-slim AS deps
+# ---------- web ----------
+FROM node:22-bookworm-slim AS web-build
 WORKDIR /app
+# better-sqlite3 (backup script) compiles when no prebuilt binary matches.
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json .npmrc ./
 RUN npm ci
-
-FROM node:22-bookworm-slim AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-ENV DATA_DIR=/data
-ENV HOST=127.0.0.1
-ENV PORT=5173
-# wrangler dev --local passes a client-supplied CF-Connecting-IP through, so no
-# header is trusted by default. Behind a proxy that overwrites one, set it
-# (e.g. TRUSTED_IP_HEADER=x-real-ip); see README "Client IP and rate limits".
-ENV TRUSTED_IP_HEADER=none
-# The image carries no .env; without this Miniflare ignores the container env.
-ENV CLOUDFLARE_INCLUDE_PROCESS_ENV=true
-RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
-  && rm -rf /var/lib/apt/lists/*
-COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build \
-  && mkdir -p /data .wrangler .sites-runtime \
-  && chown -R node:node /data .wrangler .sites-runtime dist
-# Run as the unprivileged image user; only state dirs are writable.
+RUN npm run build
+
+FROM node:22-bookworm-slim AS web
+WORKDIR /app
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=5173 \
+    D1_PERSIST_DIR=/data/wrangler \
+    BACKUP_DIR=/data/backups \
+    WRANGLER_SEND_METRICS=false
+# wrangler dev --local passes a client-supplied CF-Connecting-IP through, so no header is
+# trusted by default; see README "Client IP and rate limits".
+ENV TRUSTED_IP_HEADER=none
+# wrangler (the server) is a devDependency, so node_modules is kept whole.
+COPY --from=web-build --chown=node:node /app /app
+RUN mkdir -p /data && chown node:node /data
 USER node
-EXPOSE 5173
 VOLUME ["/data"]
-# Inside the container bind 0.0.0.0 (127.0.0.1 is unreachable through the port map);
-# docker-compose publishes it on the host's 127.0.0.1 only.
-CMD ["sh", "-c", "node scripts/db-migrate.mjs && node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js dev --config dist/server/wrangler.json --local --persist-to .wrangler/state --ip 0.0.0.0 --port 5173 --inspector-port 0"]
+EXPOSE 5173
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:5173/api/health?scope=self').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+# Migrations are idempotent (wrangler d1_migrations bookkeeping), so every start applies pending ones.
+CMD ["sh", "-c", "node scripts/d1-migrate.mjs && exec node scripts/start-server.mjs"]
+
+# ---------- worker ----------
+FROM node:22-bookworm-slim AS node-runtime
+
+# Python 3.11 on linux/amd64 only: TgCrypto has no wheel for 3.12+, PyQt5-Qt5 none for aarch64.
+FROM python:3.11-slim-bookworm AS worker
+# libglib2.0-0: PyQt5 QtCore (opentele tdata import); libstdc++6: the copied node binary.
+RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0 libstdc++6 \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+WORKDIR /app
+COPY telegram-worker/requirements.txt telegram-worker/requirements.txt
+RUN python -m venv /opt/venv \
+  && /opt/venv/bin/pip install --no-cache-dir -r telegram-worker/requirements.txt
+COPY telegram-worker/src telegram-worker/src
+RUN useradd --create-home --uid 10001 worker
+ENV NODE_ENV=production \
+    TG_WORKER_HOST=0.0.0.0 \
+    TG_WORKER_PORT=8790 \
+    TG_WORKER_PYTHON=/opt/venv/bin/python \
+    TG_WORKER_SKIP_DOTENV=1 \
+    PYTHONUNBUFFERED=1
+USER worker
+EXPOSE 8790
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:8790/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+CMD ["node", "telegram-worker/src/server.mjs"]

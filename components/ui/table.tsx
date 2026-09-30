@@ -96,7 +96,11 @@ function SortableTableHead({
 }) {
   const active = sortKey === columnKey
   return (
-    <TableHead className={cn("table-sort-th", className)} {...props}>
+    <TableHead
+      className={cn("table-sort-th", className)}
+      aria-sort={active ? (sortDir === "asc" ? "ascending" : "descending") : "none"}
+      {...props}
+    >
       <button
         type="button"
         className={cn(
@@ -107,9 +111,6 @@ function SortableTableHead({
             "w-full justify-end"
         )}
         onClick={() => onSort(columnKey)}
-        aria-sort={
-          active ? (sortDir === "asc" ? "ascending" : "descending") : "none"
-        }
       >
         <span>{children}</span>
         <span className="table-sort-carets" aria-hidden>
@@ -155,11 +156,13 @@ function SortHeaderButton({
       type="button"
       className={cn("table-sort-btn table-sort-btn--plain", active && "is-active", className)}
       onClick={() => onSort(columnKey)}
-      aria-sort={
-        active ? (sortDir === "asc" ? "ascending" : "descending") : "none"
-      }
     >
       <span>{children}</span>
+      {active && (
+        <span className="sr-only">
+          {sortDir === "asc" ? ", по возрастанию" : ", по убыванию"}
+        </span>
+      )}
       <span className="table-sort-carets" aria-hidden>
         <ChevronUp
           size={12}

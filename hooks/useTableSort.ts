@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   defaultDirForType,
   sortRows,
@@ -36,18 +36,13 @@ export function useTableSort<T>(
     dir: initialDir,
   });
 
-  useEffect(() => {
-    if (options?.resetKey === undefined) return;
-    setState({
-      key: defaultKey,
-      dir:
-        options?.defaultDir ??
-        (defaultKey && types?.[defaultKey]
-          ? defaultDirForType(types[defaultKey])
-          : "asc"),
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only when resetKey changes
-  }, [options?.resetKey]);
+  // Reset sort when resetKey changes — adjusted during render (React "reset state on prop change").
+  const resetKey = options?.resetKey;
+  const [prevResetKey, setPrevResetKey] = useState(resetKey);
+  if (resetKey !== prevResetKey) {
+    setPrevResetKey(resetKey);
+    if (resetKey !== undefined) setState({ key: defaultKey, dir: initialDir });
+  }
 
   const onSort = useCallback(
     (key: string) => {

@@ -1,6 +1,6 @@
 import {describe,expect,it} from 'vitest';
 import {parseProxyLines} from '@/lib/proxy-import';
-import {safeRelativeReturnPath,chatGPTSignInPath} from '@/lib/auth-paths';
+import {safeRelativeReturnPath,loginPath} from '@/lib/auth';
 import {seal,unseal} from '@/lib/crypto-secrets';
 
 describe('импорт прокси для аккаунтов',()=>{
@@ -30,10 +30,13 @@ describe('auth return paths',()=>{
   it('блокирует open-redirect',()=>{
     expect(safeRelativeReturnPath('https://evil.example')).toBe('/');
     expect(safeRelativeReturnPath('//evil.example')).toBe('/');
+    expect(safeRelativeReturnPath('/.//evil.example')).toBe('/');
+    expect(safeRelativeReturnPath('/%2e//evil.example')).toBe('/');
+    expect(safeRelativeReturnPath('/\\evil.example')).toBe('/');
     expect(safeRelativeReturnPath('/leads?x=1')).toBe('/leads?x=1');
-    expect(safeRelativeReturnPath('/login')).toBe('/');
-    expect(chatGPTSignInPath('/workspace')).toContain('return_to=%2Fworkspace');
-    expect(chatGPTSignInPath('/workspace')).toContain('/login');
+    expect(safeRelativeReturnPath('/login')).toBe('/app');
+    expect(loginPath('/workspace')).toContain('return_to=%2Fworkspace');
+    expect(loginPath('/workspace')).toContain('/login');
   });
 });
 

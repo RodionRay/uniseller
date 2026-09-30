@@ -15,8 +15,6 @@
 **/*.sqlite3
 **/.git
 **/.cursor
-.openai/*
-!.openai/hosting.json
 **/node_modules
 dist
 .next
@@ -25,3 +23,4 @@ coverage
 telegram-worker/.venv
 telegram-worker/vendor
 uniseller-project
+**/.DS_Store

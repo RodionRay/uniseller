@@ -75,3 +75,32 @@ describe('learnableMinusTerms: auto-learning adds only phrases and clearly off-t
     expect(learnableMinusTerms(many,SETTINGS)).toHaveLength(MAX_LEARNED_MINUS_TERMS);
   });
 });
+
+describe('buyer-intent and product-fit phrases never become stop terms (settings do not contain them)',()=>{
+  const narrow:StopListSettings={keywords:'остатки, синхронизация, МойСклад'};
+  const REQUESTS=['ищу crm','нужна crm','выгрузка остатков','управление ценами','подскажите сервис','кто пользуется mpstats'];
+
+  it('auto-learning rejects them',()=>{
+    expect(learnableMinusTerms(REQUESTS,narrow)).toEqual([]);
+  });
+
+  it('read time drops them',()=>{
+    expect(scanStopTerms({...narrow,minusKeywords:REQUESTS.join(', ')})).toEqual([]);
+  });
+});
+
+describe('default junk survives product-text overlap',()=>{
+  const overlapping:StopListSettings={
+    keywords:'аккаунты, продажи',
+    product:'Сервис роста продаж для аккаунтов селлеров, перенос со старой системы',
+  };
+  const DEFAULT_JUNK=['продаю аккаунт','продажа аккаунтов','куплю аккаунт','таро','накрутка','казино'];
+
+  it('read time keeps them',()=>{
+    expect(scanStopTerms({...overlapping,minusKeywords:DEFAULT_JUNK.join(', ')})).toEqual(DEFAULT_JUNK);
+  });
+
+  it('learning keeps them',()=>{
+    expect(learnableMinusTerms(DEFAULT_JUNK,overlapping)).toEqual(DEFAULT_JUNK);
+  });
+});

@@ -18,7 +18,11 @@ import {
   WEAK_PLUS_TERMS,
   normalizeYo,
   splitTerms,
+  hasBuyerIntent,
+  hasProductFit,
+  hasSoftAsk,
 } from "@/lib/lead-filter";
+import { SUGGESTED_MINUS } from "@/lib/ai-keywords";
 
 export type StopListSettings = {
   keywords?: string;
@@ -164,15 +168,39 @@ function isProtectedWord(word: string, vocab: ProtectedVocabulary): boolean {
   return false;
 }
 
+/** Selling or buying ready-made accounts: spam in seller chats whatever the product text says. */
+const ACCOUNT_TRADE_RE = /^(?:прода\p{L}*|куп\p{L}*|покупк\p{L}*)\s+аккаунт\p{L}*$/u;
+
+const DEFAULT_JUNK = new Set(SUGGESTED_MINUS.map((t) => normalizeYo(t.toLowerCase())));
+
+/**
+ * Known junk (the default stop-list, off-topic lexicon, account trade) is never dropped for merely
+ * resembling product text: "продаж" in the product must not unblock "продаю аккаунт", "старой" not "таро".
+ */
+function isKnownJunk(candidate: string, words: readonly string[]): boolean {
+  return (
+    DEFAULT_JUNK.has(candidate) ||
+    ACCOUNT_TRADE_RE.test(candidate) ||
+    words.some((w) => OFF_TOPIC_WORD_RE.test(w))
+  );
+}
+
+/** A request our leads are made of ("ищу crm", "выгрузка остатков") must never become a stop term. */
+function looksLikeLeadRequest(candidate: string): boolean {
+  return hasBuyerIntent(candidate) || hasSoftAsk(candidate) || hasProductFit(candidate);
+}
+
 function rejectsCandidate(candidate: string, vocab: ProtectedVocabulary): boolean {
   if (candidate.length < MIN_CANDIDATE_LENGTH || candidate.length > MAX_MINUS_TERM_LENGTH) return true;
   if (WEAK_PLUS_TERMS.has(candidate)) return true;
   const words = wordsOf(candidate);
+  // An explicit positive term wins even over known junk.
+  if (vocab.terms.some((p) => p.includes(candidate))) return true;
+  if (isKnownJunk(candidate, words)) return false;
+  if (looksLikeLeadRequest(candidate)) return true;
   if (words.length > 1 && words.some((w) => GLUE_WORDS.has(w))) return true;
   const content = words.filter(isContentWord);
   if (!content.length) return true;
-  // The whole candidate sits inside a positive term ("синхронизация остатков" ⊃ "остатков").
-  if (vocab.terms.some((p) => p.includes(candidate))) return true;
   if (content.length === 1) {
     const single = vocab.terms.some(
       (p) => p.length >= MIN_PROTECTED_TERM_LENGTH && candidate.includes(p),

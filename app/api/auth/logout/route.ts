@@ -4,6 +4,7 @@ import {
   sessionCookieName,
   sessionCookieOptions,
 } from "@/lib/auth";
+import { isSameOriginRequest, requestOrigin } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -26,14 +27,12 @@ export async function GET(req: Request) {
   );
   return clearSession(
     req,
-    NextResponse.redirect(new URL(returnTo, url.origin), 302),
+    NextResponse.redirect(new URL(returnTo, requestOrigin(req)), 302),
   );
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  const url = new URL(req.url);
-  if (origin && origin !== url.origin) {
+  if (!isSameOriginRequest(req)) {
     return NextResponse.json(
       { error: "Недопустимый источник запроса" },
       { status: 403 },

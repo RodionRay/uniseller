@@ -1,11 +1,11 @@
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
-import {OWNER,addRecord,login,postRequest,resetWorkspace} from './helpers/workspace-harness';
+import {OWNER,addRecord,login,postRequest,resetWorkspace} from './helpers/workspace-api-harness';
 import {resolveConfig,timeoutForAction} from '../telegram-worker/src/worker-app.mjs';
 
-vi.mock('cloudflare:workers',async()=>(await import('./helpers/workspace-harness')).cfModule);
+vi.mock('cloudflare:workers',async()=>(await import('./helpers/workspace-api-harness')).cfModule);
 vi.mock('@/lib/auth',async(importOriginal)=>({
   ...await importOriginal<typeof import('@/lib/auth')>(),
-  getSessionUser:async()=>(await import('./helpers/workspace-harness')).authState.user,
+  getSessionUser:async()=>(await import('./helpers/workspace-api-harness')).authState.user,
 }));
 
 import {POST} from '@/app/api/workspace/route';
@@ -15,7 +15,7 @@ import {
   WORKER_CHECK_PROXY_TIMEOUT_MS,
   WORKER_DEFAULT_SLOTS,
   proxyCheckTimeoutMs,
-} from '@/lib/worker-timeouts';
+} from '@/lib/processes/worker-timeouts';
 
 describe('proxyCheckTimeoutMs',()=>{
   it('mirrors the worker per-check timeout and default slot count',()=>{

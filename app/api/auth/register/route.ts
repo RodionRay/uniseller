@@ -14,6 +14,7 @@ import {
   tooManyRequests,
 } from "@/lib/security/rate-limit";
 import { createUser, findUserByEmail } from "@/lib/users";
+import { isSameOriginRequest, registrationOpen } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -25,9 +26,11 @@ function reply(data: unknown, status = 200) {
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin) {
+  if (!isSameOriginRequest(req)) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
+  }
+  if (!registrationOpen()) {
+    return reply({ error: "Регистрация закрыта. Доступ выдаёт администратор." }, 403);
   }
   try {
     if (!authConfigured()) {
@@ -35,6 +38,7 @@ export async function POST(req: Request) {
     }
     const limit = await consumeRateLimits([
       [RATE_LIMITS.registerPerIp, trustedClientIp(req)],
+      [RATE_LIMITS.registerGlobal, "all"],
     ]);
     if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
     const body = (await req.json()) as {

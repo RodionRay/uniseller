@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
-  evaluateJoinGate,
+  evaluateJoinGate as joinGate,
   interpretJoinWorkerResult,
   sanitizeJoinStateError,
 } from "@/lib/processes/join-flow";
 import { withDayLimitCooldown, withSpamblockStatus } from "@/lib/telegram-accounts";
+
+/** Narrows the gate union so blocked results expose `reason`. */
+function evaluateJoinGate(...args: Parameters<typeof joinGate>) {
+  const r = joinGate(...args);
+  if (!r.ok) return r;
+  return { ...r, reason: undefined };
+}
 
 describe("вступление в группы · gate", () => {
   it("требует аккаунт и реальную ссылку", () => {

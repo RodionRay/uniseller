@@ -1,0 +1,33 @@
+# /etc/caddy/Caddyfile on the VPS host. Caddy obtains and renews the TLS certificate
+# automatically once DNS for the domain points at this server (ports 80/443 open).
+# Replace leads.example.com with the domain from APP_URL.
+leads.example.com {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# tdata/.session archives are uploaded through the app.
+	request_body {
+		max_size 200MB
+	}
+
+	# Cron endpoints are called only by the worker over the compose network
+	# (APP_URL=http://web:5173); never expose them publicly. /api/health stays open.
+	@cron path /api/cron /api/cron/*
+	respond @cron 404
+
+	# miniflare internals (Local Explorer = raw SQL on D1) must never be reachable publicly.
+	respond /cdn-cgi/* 404
+
+	# X-Real-IP is overwritten with the peer address, so a client cannot forge it.
+	# The app trusts it only with TRUSTED_IP_HEADER=x-real-ip in .env (default: no
+	# header is trusted and per-IP limits are off; README "Client IP and rate limits").
+	reverse_proxy 127.0.0.1:5173 {
+		header_up X-Real-IP {remote_host}
+	}
+}

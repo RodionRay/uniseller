@@ -1,26 +1,32 @@
 /**
- * HTTP guard, config and Python runner for the local Telegram worker.
- * Entry point: server.mjs. Split out so the security invariants are unit-testable.
+ * HTTP guard, config and job admission for the Telegram worker.
+ * Entry point: server.mjs; the Python process itself: python-runner.mjs.
+ * Split out so the security invariants are unit-testable.
  */
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
 import { timingSafeEqual, createHash } from "node:crypto";
-import { mkdtemp, chmod, readdir, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import {
+  DEFAULT_KILL_GRACE_MS,
+  DEFAULT_MAX_OUTPUT_BYTES,
+  STALE_WORK_DIR_MS,
+  WORK_DIR_PREFIX,
+  accountKey,
+  createProcessLimiter,
+  startPython,
+  stdoutCapFor,
+  sweepStaleWorkDirs,
+} from "./python-runner.mjs";
 
-export const WORK_DIR_PREFIX = "uniseller-acc-";
+export { WORK_DIR_PREFIX };
 export const MIN_TOKEN_LENGTH = 32;
 const DEFAULT_MAX_BODY_BYTES = 6_000_000;
 const DEFAULT_MAX_CONCURRENCY = 4;
 // Requests beyond the running slots wait here; the UI fires ~8 proxy checks at once.
 const DEFAULT_MAX_QUEUE = 64;
-const DEFAULT_MAX_STDOUT_BYTES = 2 * 1024 * 1024;
-const DEFAULT_KILL_GRACE_MS = 5_000;
 // After SIGKILL the kernel reaps the child almost at once; this only bounds a missing 'close'.
 const STOP_FALLBACK_MARGIN_MS = 1_000;
 const GENERIC_WORKER_ERROR = "Ошибка воркера (нет ответа)";
-const TIMEOUT_ERROR = "Таймаут воркера";
 const ABORTED_ERROR = "Запрос отменён клиентом";
 
 export const ROUTES = Object.freeze({
@@ -38,11 +44,25 @@ export const ROUTES = Object.freeze({
 
 const LONG_ACTIONS = new Set(["upload_photo", "collect", "invite"]);
 
+/**
+ * Read-only actions: when the app went away the process may be killed. A send, invite or join
+ * is left running — Telegram may already have done it; its own timeout frees the slot.
+ */
+const KILL_ON_ABORT = new Set(["check", "check_proxy", "scan", "collect", "inbox"]);
+
 /** @param {string} action */
 export function timeoutForAction(action) {
   if (action === "check") return 28_000;
   if (action === "check_proxy") return 18_000;
   return LONG_ACTIONS.has(action) ? 180_000 : 120_000;
+}
+
+/** @param {string | undefined} raw */
+function csvList(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -56,21 +76,35 @@ export function resolveConfig(env) {
   if (token.length < MIN_TOKEN_LENGTH) {
     throw new Error(`TG_WORKER_TOKEN must be at least ${MIN_TOKEN_LENGTH} characters`);
   }
-  const extraHosts = String(env.TG_WORKER_ALLOWED_HOSTS || "")
-    .split(",")
-    .map((h) => h.trim().toLowerCase())
-    .filter(Boolean);
   return {
     token,
+    host: env.TG_WORKER_HOST || "127.0.0.1",
     port: Number(env.TG_WORKER_PORT || 8790),
-    extraHosts,
-    maxConcurrency: positiveInt(env.TG_WORKER_MAX_CONCURRENCY, DEFAULT_MAX_CONCURRENCY),
+    extraHosts: csvList(env.TG_WORKER_ALLOWED_HOSTS).map((h) => h.toLowerCase()),
+    // TG_WORKER_CONCURRENCY is the older name, still set by existing deployments.
+    maxConcurrency: positiveInt(
+      env.TG_WORKER_MAX_CONCURRENCY || env.TG_WORKER_CONCURRENCY,
+      DEFAULT_MAX_CONCURRENCY,
+    ),
     maxQueue: nonNegativeInt(env.TG_WORKER_MAX_QUEUE, DEFAULT_MAX_QUEUE),
     maxBodyBytes: positiveInt(env.TG_WORKER_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES),
+    /** One timeout for every action (tests, slow networks); null = per-action defaults. */
+    timeoutMs: env.TG_WORKER_TIMEOUT_MS ? positiveInt(env.TG_WORKER_TIMEOUT_MS, null) : null,
+    killGraceMs: positiveInt(env.TG_WORKER_KILL_GRACE_MS, DEFAULT_KILL_GRACE_MS),
+    maxStdoutBytes: positiveInt(env.TG_WORKER_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES),
+    /** Extra env names passed to the Python child (it gets no app secrets by default). */
+    pythonEnv: csvList(env.TG_WORKER_PYTHON_ENV),
+    /** Plain-http APP_URL hosts cron may use (a private compose network, e.g. "web"). */
+    cronHttpHosts: csvList(env.TG_WORKER_CRON_HTTP_HOSTS).map((h) => h.toLowerCase()),
   };
 }
 
-/** @param {string | undefined} raw @param {number} fallback */
+/**
+ * @template T
+ * @param {string | undefined} raw
+ * @param {T} fallback
+ * @returns {number | T}
+ */
 function positiveInt(raw, fallback) {
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : fallback;
@@ -111,9 +145,11 @@ const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
 
 /**
  * The cron call carries CRON_SECRET, so it must never travel over plain HTTP off-host.
+ * `httpHosts` names private hosts (compose service names) that may be reached over http.
  * @param {string} appUrl
+ * @param {readonly string[]} [httpHosts]
  */
-export function cronTargetAllowed(appUrl) {
+export function cronTargetAllowed(appUrl, httpHosts = []) {
   let url;
   try {
     url = new URL(appUrl);
@@ -123,7 +159,9 @@ export function cronTargetAllowed(appUrl) {
   if (url.protocol === "https:") return true;
   if (url.protocol !== "http:") return false;
   const host = url.hostname.toLowerCase();
-  return LOOPBACK_HOSTNAMES.has(host) || /^127\.\d+\.\d+\.\d+$/.test(host);
+  return (
+    LOOPBACK_HOSTNAMES.has(host) || /^127\.\d+\.\d+\.\d+$/.test(host) || httpHosts.includes(host)
+  );
 }
 
 /**
@@ -131,152 +169,69 @@ export function cronTargetAllowed(appUrl) {
  * @param {{ dir?: string, maxAgeMs?: number, now?: number }} [opts]
  */
 export async function purgeStaleWorkDirs(opts = {}) {
-  const dir = opts.dir || tmpdir();
-  const maxAgeMs = opts.maxAgeMs ?? 10 * 60_000;
-  const now = opts.now ?? Date.now();
-  let removed = 0;
-  let names = [];
-  try {
-    names = await readdir(dir);
-  } catch {
-    return removed;
-  }
-  for (const name of names) {
-    if (!name.startsWith(WORK_DIR_PREFIX)) continue;
-    const path = join(dir, name);
-    try {
-      const st = await stat(path);
-      if (now - st.mtimeMs < maxAgeMs) continue;
-      await rm(path, { recursive: true, force: true });
-      removed += 1;
-    } catch {
-      /* raced with another cleaner — nothing to do */
-    }
-  }
-  return removed;
+  return sweepStaleWorkDirs({
+    root: opts.dir || tmpdir(),
+    maxAgeMs: opts.maxAgeMs ?? STALE_WORK_DIR_MS,
+    now: opts.now ?? Date.now(),
+  });
 }
 
 /**
- * Extract the exception class name from a Python traceback for logs, never the message.
- * @param {string} stderr
- */
-function exceptionType(stderr) {
-  const lines = stderr.trim().split("\n");
-  const last = lines[lines.length - 1] || "";
-  const m = last.match(/^([A-Za-z_][\w.]*)(?::|$)/);
-  return m ? m[1] : "unknown";
-}
-
-/**
+ * Runs one Python job per call (python-runner.mjs::startPython) and answers only once the
+ * child is gone, so the caller's slot is not freed while Python still runs. The fallback
+ * covers a killed child whose pipes stay open (e.g. an orphaned grandchild holding stdout).
  * @param {{ python: string, script: string, cwd?: string, tmpRoot?: string,
- *   killGraceMs?: number, maxStdoutBytes?: number, env?: NodeJS.ProcessEnv }} opts
+ *   killGraceMs?: number, maxStdoutBytes?: number, envPassthrough?: string[] }} opts
  */
 export function createPythonRunner(opts) {
-  const tmpRoot = opts.tmpRoot || tmpdir();
   const killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
-  const maxStdoutBytes = opts.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
   /** @type {Set<Promise<void>>} */
   const pending = new Set();
 
   /**
-   * @param {unknown} payload
+   * @param {Record<string, unknown>} payload
    * @param {number} timeoutMs
-   * @param {AbortSignal} [signal] aborted when the HTTP client went away
+   * @param {AbortSignal} [signal] aborted when the job must stop (client gone)
    * @returns {Promise<Record<string, unknown>>}
    */
   async function run(payload, timeoutMs, signal) {
     if (signal?.aborted) return { ok: false, status: "disconnected", error: ABORTED_ERROR };
-    const workDir = await mkdtemp(join(tmpRoot, WORK_DIR_PREFIX));
-    await chmod(workDir, 0o700);
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (/** @type {Record<string, unknown>} */ value) => {
-        if (settled) return;
-        settled = true;
-        resolve(value);
-      };
-      const child = spawn(opts.python, [opts.script, "--payload", "-", "--work-dir", workDir], {
-        cwd: opts.cwd,
-        env: { ...(opts.env || process.env), PYTHONUNBUFFERED: "1" },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      /** @type {Buffer[]} */
-      const outChunks = [];
-      let outBytes = 0;
-      let errTail = "";
-      /** @type {NodeJS.Timeout | undefined} */
-      let killTimer;
-      const terminate = () => {
-        if (child.exitCode !== null || child.signalCode !== null) return;
-        child.kill("SIGTERM");
-        killTimer = setTimeout(() => child.kill("SIGKILL"), killGraceMs);
-      };
-      /** Result to report once a stopped child is gone; null while it runs normally. */
-      /** @type {Record<string, unknown> | null} */
-      let stopResult = null;
-      /** @type {NodeJS.Timeout | undefined} */
-      let stopFallback;
-      /**
-       * Kills the child and answers only when it has exited ('close'), so the caller's
-       * slot is not freed while Python still runs. The fallback covers a killed child
-       * whose pipes stay open (e.g. an orphaned grandchild holding stdout).
-       * @param {string} error
-       */
-      const stop = (error) => {
-        if (settled || stopResult) return;
-        stopResult = { ok: false, status: "disconnected", error };
-        terminate();
-        const result = stopResult;
-        stopFallback = setTimeout(() => finish(result), killGraceMs + STOP_FALLBACK_MARGIN_MS);
-      };
-      const timer = setTimeout(() => stop(TIMEOUT_ERROR), timeoutMs);
-      const onAbort = () => stop(ABORTED_ERROR);
-      signal?.addEventListener("abort", onAbort, { once: true });
-      if (signal?.aborted) onAbort();
-      child.stdout.on("data", (/** @type {Buffer} */ d) => {
-        outBytes += d.length;
-        if (outBytes > maxStdoutBytes) {
-          stop(GENERIC_WORKER_ERROR);
-          return;
-        }
-        outChunks.push(d);
-      });
-      child.stderr.on("data", (/** @type {Buffer} */ d) => {
-        errTail = (errTail + d.toString()).slice(-4096);
-      });
-      const closed = new Promise((done) => {
-        child.on("close", () => {
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", onAbort);
-          if (killTimer) clearTimeout(killTimer);
-          if (stopFallback) clearTimeout(stopFallback);
-          rm(workDir, { recursive: true, force: true })
-            .catch(() => console.warn("[tg-worker] failed to remove work dir"))
-            .finally(() => done(undefined));
-          if (settled) return;
-          if (stopResult) return finish(stopResult);
-          const line = Buffer.concat(outChunks).toString("utf8").trim().split("\n").filter(Boolean).pop() || "";
-          try {
-            finish(JSON.parse(line));
-          } catch {
-            console.warn(`[tg-worker] python produced no JSON (${exceptionType(errTail)})`);
-            finish({ ok: false, status: "disconnected", error: GENERIC_WORKER_ERROR });
-          }
-        });
-      });
-      const tracked = closed.then(() => {
-        pending.delete(tracked);
-      });
-      pending.add(tracked);
-      child.on("error", () => {
-        console.warn("[tg-worker] failed to spawn python");
-        finish({ ok: false, status: "disconnected", error: GENERIC_WORKER_ERROR });
-      });
-      child.stdin.on("error", () => {
-        /* child exited before reading stdin — handled by close */
-      });
-      child.stdin.end(JSON.stringify(payload));
+    const handle = startPython({
+      python: opts.python,
+      script: opts.script,
+      cwd: opts.cwd,
+      payload,
+      timeoutMs,
+      killGraceMs,
+      maxStdoutBytes: stdoutCapFor(
+        String(payload.action || ""),
+        payload,
+        opts.maxStdoutBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+      ),
+      tempRoot: opts.tmpRoot || tmpdir(),
+      envPassthrough: opts.envPassthrough || [],
     });
+    const tracked = handle.exited.then(() => {
+      pending.delete(tracked);
+    });
+    pending.add(tracked);
+    const onAbort = () => handle.cancel();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const result = await handle.result;
+      /** @type {NodeJS.Timeout | undefined} */
+      let fallback;
+      await Promise.race([
+        handle.exited,
+        new Promise((resolve) => {
+          fallback = setTimeout(resolve, killGraceMs + STOP_FALLBACK_MARGIN_MS);
+        }),
+      ]);
+      clearTimeout(fallback);
+      return result;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   /** Resolves when every spawned child has exited and its work dir is gone. */
@@ -295,46 +250,15 @@ function isJson(contentType) {
  * @param {ReturnType<typeof resolveConfig>} config
  * @param {{ runPython: (payload: any, timeoutMs: number, signal?: AbortSignal) => Promise<unknown>,
  *   tickAutoRescan: (force: boolean) => Promise<unknown>,
- *   autoRescanStatus: () => Record<string, unknown> }} deps
+ *   autoRescanStatus: () => Record<string, unknown>,
+ *   info?: () => Record<string, unknown> }} deps
  */
 export function createWorkerServer(config, deps) {
   // Requests holding a place: reading their body, waiting for a slot or running.
   // Reserved before the body is read, so slow senders cannot all pass the check.
   let admitted = 0;
-  let active = 0;
-  /** @type {Array<() => void>} */
-  const waiters = [];
-  /**
-   * Resolves true once a Python slot is held (FIFO), false if `signal` aborts first.
-   * @param {AbortSignal} signal
-   * @returns {Promise<boolean>}
-   */
-  const acquire = (signal) => {
-    if (signal.aborted) return Promise.resolve(false);
-    if (active < config.maxConcurrency) {
-      active += 1;
-      return Promise.resolve(true);
-    }
-    return new Promise((resolve) => {
-      const onAbort = () => {
-        const i = waiters.indexOf(grant);
-        if (i >= 0) waiters.splice(i, 1);
-        resolve(false);
-      };
-      const grant = () => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(true);
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      waiters.push(grant);
-    });
-  };
-  /** Hands the slot to the next waiter, or frees it. Call once per granted slot. */
-  const release = () => {
-    const next = waiters.shift();
-    if (next) next();
-    else active -= 1;
-  };
+  // Python slots (FIFO) plus one-at-a-time per account: two jobs of one session never overlap.
+  const limiter = createProcessLimiter(config.maxConcurrency);
 
   /** @param {import("node:http").IncomingMessage} req */
   const hostAllowed = (req) => {
@@ -348,6 +272,12 @@ export function createWorkerServer(config, deps) {
     );
   };
 
+  const healthDetails = () => ({
+    ...(deps.info ? deps.info() : {}),
+    python: { ...limiter.stats(), admitted, maxQueue: config.maxQueue },
+    autoRescan: deps.autoRescanStatus(),
+  });
+
   const server = createServer(async (req, res) => {
     const send = (/** @type {number} */ code, /** @type {unknown} */ data, extra = {}) => {
       if (res.destroyed || res.writableEnded) return;
@@ -359,7 +289,7 @@ export function createWorkerServer(config, deps) {
 
     if (req.method === "GET" && req.url === "/health") {
       const base = { ok: true, service: "uniseller-tg-worker" };
-      return send(200, authed ? { ...base, autoRescan: deps.autoRescanStatus() } : base);
+      return send(200, authed ? { ...base, ...healthDetails() } : base);
     }
     const action = req.method === "POST" ? ROUTES[/** @type {keyof typeof ROUTES} */ (req.url)] : undefined;
     const isRescan = req.method === "POST" && req.url === "/auto-rescan-now";
@@ -384,7 +314,7 @@ export function createWorkerServer(config, deps) {
       placeHeld = false;
       admitted -= 1;
     };
-    // Client gone before we answered (e.g. app-side timeout): stop waiting / kill the job.
+    // Client gone before we answered (e.g. app-side timeout): stop waiting / kill a read-only job.
     const clientGone = new AbortController();
     res.on("close", () => {
       if (!res.writableFinished) clientGone.abort();
@@ -399,7 +329,7 @@ export function createWorkerServer(config, deps) {
 
   /**
    * Reads the body (before queueing, so a waiting request can't hit requestTimeout),
-   * then runs the job in a Python slot.
+   * then runs the job in a Python slot, after any earlier job of the same account.
    * @param {import("node:http").IncomingMessage} req
    * @param {(code: number, data: unknown, extra?: Record<string, string>) => void} send
    * @param {string} action
@@ -418,15 +348,27 @@ export function createWorkerServer(config, deps) {
       return send(400, { ok: false, error: "Invalid JSON" });
     }
     payload.action = action;
-    if (!(await acquire(signal))) return;
-    try {
-      if (signal.aborted) return;
-      return send(200, await deps.runPython(payload, timeoutForAction(action), signal));
-    } catch {
+    const timeoutMs = config.timeoutMs ?? timeoutForAction(action);
+    const outcome = await limiter.run(
+      action === "check_proxy" ? null : accountKey(payload),
+      () => {
+        const stop = new AbortController();
+        const done = Promise.resolve()
+          .then(() => deps.runPython(payload, timeoutMs, stop.signal))
+          .then(
+            (value) => ({ value }),
+            () => ({ failed: true }),
+          );
+        return { result: done, exited: done.then(() => undefined), cancel: () => stop.abort() };
+      },
+      signal,
+      { killOnAbort: KILL_ON_ABORT.has(action) },
+    );
+    if (signal.aborted) return;
+    if (!outcome || typeof outcome !== "object" || "failed" in outcome || !("value" in outcome)) {
       return send(500, { ok: false, error: GENERIC_WORKER_ERROR });
-    } finally {
-      release();
     }
+    return send(200, outcome.value);
   }
   // Slow senders must not pin a concurrency slot while the body trickles in.
   server.requestTimeout = 60_000;

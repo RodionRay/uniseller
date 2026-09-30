@@ -12,6 +12,7 @@ const saved: Record<string, string | undefined> = {};
 const T0 = Date.UTC(2026, 8, 30, 1, 0, 0);
 
 beforeAll(() => {
+  vi.stubEnv("TRUSTED_IP_HEADER", "cf-connecting-ip");
   for (const k of AI_KEYS) {
     saved[k] = process.env[k];
     delete process.env[k];
@@ -23,6 +24,7 @@ beforeAll(() => {
   vi.setSystemTime(T0);
 });
 afterAll(() => {
+  vi.unstubAllEnvs();
   vi.useRealTimers();
   for (const k of AI_KEYS) if (saved[k] !== undefined) process.env[k] = saved[k];
 });

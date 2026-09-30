@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("cloudflare:workers", () => ({ env: {} }));
 vi.mock("@/lib/users", () => ({ listUserIdsForCron: async () => [] }));
 
 import { POST } from "@/app/api/cron/auto-rescan/route";
 
 const GOOD = "c".repeat(40);
-const ENV_KEYS = ["CRON_SECRET", "SESSION_SECRET", "TG_WORKER_TOKEN", "ADMIN_EMAIL"];
+const ENV_KEYS = ["CRON_SECRET", "SESSION_SECRET", "TG_WORKER_TOKEN", "ADMIN_EMAIL", "APP_URL"];
 const saved: Record<string, string | undefined> = {};
 
 async function misconfigured(res: Response) {
@@ -57,6 +58,7 @@ describe("cron auto-rescan auth", () => {
 
   it("passes auth with the right bearer", async () => {
     process.env.CRON_SECRET = GOOD;
+    process.env.APP_URL = "https://app.test";
     const res = await call(`Bearer ${GOOD}`);
     const body = (await res.json()) as { error?: string };
     expect(body.error).toBe("Нет пользователей для обхода");

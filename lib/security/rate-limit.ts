@@ -1,3 +1,4 @@
+import { createRateLimiter, type RateRule } from "@/lib/rate-limit";
 import { database } from "@/lib/server-store";
 
 export type RateLimitRule = {
@@ -23,13 +24,17 @@ const DAY = 24 * HOUR;
  * trusted) is the tight guess limit and is cleared by a successful login, so
  * guesses from one network do not lock the owner out elsewhere;
  * `loginPerEmail` is a high ceiling against guessing spread over many IPs.
+ * `*Global` rules use one shared bucket and always apply, so a flood is
+ * capped even when no client IP is trusted and per-IP rules are skipped.
  */
 export const RATE_LIMITS = {
   loginPerIp: { name: "login-ip", limit: 20, windowSec: 15 * MINUTE },
   loginPerEmailIp: { name: "login-email-ip", limit: 10, windowSec: 15 * MINUTE },
   loginPerEmail: { name: "login-email", limit: 100, windowSec: 15 * MINUTE },
   registerPerIp: { name: "register-ip", limit: 5, windowSec: HOUR },
+  registerGlobal: { name: "register-global", limit: 50, windowSec: HOUR },
   contactPerIp: { name: "contact-ip", limit: 5, windowSec: HOUR },
+  contactGlobal: { name: "contact-global", limit: 100, windowSec: DAY },
   assistantAnonPerIp: { name: "assistant-anon-ip", limit: 30, windowSec: DAY },
   assistantAnonGlobal: { name: "assistant-anon-global", limit: 500, windowSec: DAY },
 } as const satisfies Record<string, RateLimitRule>;
@@ -49,8 +54,11 @@ export function assistantUserDailyRule(): RateLimitRule {
   return { name: "assistant-user", limit, windowSec: DAY };
 }
 
+const MS_PER_SEC = 1000;
+
 let tableReady = false;
 
+/** Same shape as drizzle/0003_rate_limits.sql, for databases the migrations have not reached. */
 async function ensureTable(): Promise<void> {
   if (tableReady) return;
   const db = database();
@@ -58,15 +66,14 @@ async function ensureTable(): Promise<void> {
     .prepare(
       `CREATE TABLE IF NOT EXISTS rate_limits (
         key text PRIMARY KEY NOT NULL,
-        window_start integer NOT NULL,
         count integer NOT NULL,
-        expires integer NOT NULL
+        window_start integer NOT NULL
       )`,
     )
     .bind()
     .run();
   await db
-    .prepare("CREATE INDEX IF NOT EXISTS idx_rate_limits_expires ON rate_limits (expires)")
+    .prepare("CREATE INDEX IF NOT EXISTS idx_rate_limits_window ON rate_limits (window_start)")
     .bind()
     .run();
   tableReady = true;
@@ -81,40 +88,34 @@ async function bucketKey(rule: RateLimitRule, subject: string): Promise<string> 
   return `${rule.name}:${Buffer.from(digest).toString("base64url")}`;
 }
 
-/** Counts one attempt against `rule` for `subject`; atomic per bucket. */
+function storeRule(rule: RateLimitRule): RateRule {
+  return { max: rule.limit, windowMs: rule.windowSec * MS_PER_SEC };
+}
+
+/**
+ * Counts one attempt against `rule` for `subject`; atomic per bucket.
+ * Fails closed: the store is fail-open (`hit` answers 0 on a D1 error), so 0
+ * means "not counted" and the guarded action must not run unthrottled.
+ */
 export async function consumeRateLimit(
   rule: RateLimitRule,
   subject: string,
   nowMs = Date.now(),
 ): Promise<RateLimitResult> {
   await ensureTable();
-  const nowSec = Math.floor(nowMs / 1000);
-  const windowStart = nowSec - (nowSec % rule.windowSec);
-  const expires = windowStart + rule.windowSec;
-  const db = database();
-  await db.prepare("DELETE FROM rate_limits WHERE expires <= ?").bind(nowSec).run();
-  const row = await db
-    .prepare(
-      `INSERT INTO rate_limits (key, window_start, count, expires) VALUES (?, ?, 1, ?)
-       ON CONFLICT(key) DO UPDATE SET
-         count = CASE WHEN window_start = excluded.window_start THEN count + 1 ELSE 1 END,
-         window_start = excluded.window_start,
-         expires = excluded.expires
-       RETURNING count`,
-    )
-    .bind(await bucketKey(rule, subject), windowStart, expires)
-    .first<{ count: number }>();
-  const count = Number(row?.count ?? 1);
-  return { allowed: count <= rule.limit, retryAfterSec: Math.max(1, expires - nowSec) };
+  const store = createRateLimiter(database(), () => nowMs);
+  const key = await bucketKey(rule, subject);
+  const count = await store.hit(key, storeRule(rule));
+  if (count === 0) throw new Error("Счётчик лимитов недоступен");
+  if (count <= rule.limit) return { allowed: true, retryAfterSec: 0 };
+  const retryAfterSec = await store.retryAfterSec(key, storeRule(rule));
+  return { allowed: false, retryAfterSec: Math.max(1, retryAfterSec) };
 }
 
 /** Forgets all counted attempts of `subject` under `rule`. */
 export async function resetRateLimit(rule: RateLimitRule, subject: string): Promise<void> {
   await ensureTable();
-  await database()
-    .prepare("DELETE FROM rate_limits WHERE key = ?")
-    .bind(await bucketKey(rule, subject))
-    .run();
+  await createRateLimiter(database()).reset(await bucketKey(rule, subject));
 }
 
 /**

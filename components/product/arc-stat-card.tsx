@@ -32,16 +32,16 @@ function HalfArc({segments}:{segments:ArcSegment[]}){
   const gap=parts.length>1?3.2:0;
   const usable=sweep-gap*Math.max(0,parts.length-1);
 
+  const slices:(ArcSegment&{start:number;end:number;mid:number;label:{x:number;y:number}})[]=[];
   let cursor=180;
-  const slices=parts.map(s=>{
+  for(const s of parts){
     const span=Math.max(4,(s.value/total)*usable);
     const start=cursor;
     const end=cursor-span;
     cursor=end-gap;
     const mid=(start+end)/2;
-    const label=polar(cx,cy,r,mid);
-    return {...s,start,end,mid,label};
-  });
+    slices.push({...s,start,end,mid,label:polar(cx,cy,r,mid)});
+  }
 
   const first=slices[0];
   const last=slices[slices.length-1];

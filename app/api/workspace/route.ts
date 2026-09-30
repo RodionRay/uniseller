@@ -1131,13 +1131,14 @@ async function healDeadGroupAccounts(owner:string){
     // Восстановить membership из joinedAt; снять зависшую очередь
     if(d.joinedAt&&d.membership!=='joined'&&d.membership!=='pending'){
      await save(gid,{...d,membership:'joined',status:d.status==='error'||d.status==='setup'?'active':d.status,joinState:'',joinStateAt:'',joinStateError:'',error:''});
-    }else if(joinBusy){
-     await save(gid,{...d,joinState:'',joinStateAt:'',joinStateError:''});
+    }else if(d.joinState==='queued'){
+     // Только зависшая очередь; scanning/joining — идущая операция, не трогаем
+     await save(gid,{...d,joinState:'',joinStateAt:''});
     }
     continue;
    }
    if(action==='gave_up'||action==='wait'){
-    if(joinBusy)await save(gid,{...d,joinState:'',joinStateAt:''});
+    if(d.joinState==='queued')await save(gid,{...d,joinState:'',joinStateAt:''});
     continue;
    }
    if(action==='restore_previous'){

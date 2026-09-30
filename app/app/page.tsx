@@ -1,19 +1,13 @@
 "use client";
-import {useState,useEffect,useEffectEvent,useCallback,useRef,useMemo,Suspense} from 'react';
+import {useState,useEffect,useEffectEvent,useCallback,useRef,useMemo,Suspense,lazy} from 'react';
 import {useSearchParams} from 'next/navigation';
 import {Users,Radio,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge,AlertTriangle,BarChart3,Folder,CircleX} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {OverviewDashboard} from '@/components/product/overview-dashboard';
-import {LeadCorePanel} from '@/components/product/lead-core-panel';
 import {WorkspaceNav,parseWorkspaceView,persistWorkspaceView,readStoredWorkspaceView,WORKSPACE_VIEW_PARAM,type NavName} from '@/components/product/workspace-nav';
 import {NotificationsBell,NotificationsPanel} from '@/components/product/notifications-center';
 import {useWorkspaceNotices} from '@/hooks/useWorkspaceNotices';
-import {AudiencePanel,AudienceTaskFields} from '@/components/product/audience-panel';
-import {InvitePanel,InviteModePicker,InviteTaskFields} from '@/components/product/invite-panel';
-import {MailingPanel,MailingTaskFields,MailingDeliveriesView} from '@/components/product/mailing-panel';
-import {TaskLogDialog} from '@/components/product/task-log-dialog';
 import {PanelErrorBoundary} from '@/components/product/error-fallback';
-import {EmployeesPanel} from '@/components/product/employees-panel';
 import {DEFAULT_DM_SOFT_CLOSE,DEFAULT_MAILING_TASK} from '@/lib/mailing';
 import {canAccessNav,type CrmAccess,type WorkspaceInvite,type WorkspaceMember} from '@/lib/staff-types';
 import {DEFAULT_NAV} from '@/components/product/workspace-nav';
@@ -32,7 +26,7 @@ import {toast} from '@/lib/workspace-notifications';
 import {SidebarProvider,Sidebar,SidebarHeader,SidebarContent,SidebarFooter,SidebarInset,SidebarTrigger} from '@/components/ui/sidebar';
 import {parseProxyLine,parseProxyLines,type ProxyProtocol} from '@/lib/proxy-line';
 import {accountPhoneKey,canonicalizeTgUrl,duplicateReason,findDuplicate,proxyIdentityKey,telegramEntityKey} from '@/lib/record-identity';
-import {accountSessionSecret,formatArchiveSize,parseAccountZip,ACCOUNT_ARCHIVE_ACCEPT,MAX_ACCOUNT_ARCHIVE_BYTES} from '@/lib/account-zip';
+import type * as AccountZipModule from '@/lib/account-zip';
 import {
   ACCOUNT_STATUS_LABELS,
   ACCOUNT_STATUSES,
@@ -90,6 +84,26 @@ import {useTableSort} from '@/hooks/useTableSort';
 import type {SortValueType} from '@/lib/table-sort';
 import {ApiError,requestJson,timeoutForAction} from './api-client';
 import {createPollGate} from './poll-gate';
+
+// Разделы и формы задач грузятся отдельными чанками: главный бандл кабинета был ~730 kB.
+const loadAudience=()=>import('@/components/product/audience-panel');
+const loadInvite=()=>import('@/components/product/invite-panel');
+const loadMailing=()=>import('@/components/product/mailing-panel');
+const AudiencePanel=lazy(()=>loadAudience().then(m=>({default:m.AudiencePanel})));
+const AudienceTaskFields=lazy(()=>loadAudience().then(m=>({default:m.AudienceTaskFields})));
+const InvitePanel=lazy(()=>loadInvite().then(m=>({default:m.InvitePanel})));
+const InviteModePicker=lazy(()=>loadInvite().then(m=>({default:m.InviteModePicker})));
+const InviteTaskFields=lazy(()=>loadInvite().then(m=>({default:m.InviteTaskFields})));
+const MailingPanel=lazy(()=>loadMailing().then(m=>({default:m.MailingPanel})));
+const MailingTaskFields=lazy(()=>loadMailing().then(m=>({default:m.MailingTaskFields})));
+const MailingDeliveriesView=lazy(()=>loadMailing().then(m=>({default:m.MailingDeliveriesView})));
+const EmployeesPanel=lazy(()=>import('@/components/product/employees-panel').then(m=>({default:m.EmployeesPanel})));
+const LeadCorePanel=lazy(()=>import('@/components/product/lead-core-panel').then(m=>({default:m.LeadCorePanel})));
+const TaskLogDialog=lazy(()=>import('@/components/product/task-log-dialog').then(m=>({default:m.TaskLogDialog})));
+
+function SectionSkeleton(){
+  return <Skeleton className="h-64 w-full rounded-xl"/>;
+}
 
 type Kind='account'|'proxy'|'group'|'lead'|'settings'|'audience_task'|'invite_task'|'mailing_task';
 type RecordItem={id:string;kind:Kind;data:any;hasSecret:boolean;created:string};
@@ -151,6 +165,9 @@ async function api(body?:{action?:string}&Record<string,unknown>):Promise<any>{
   const init:RequestInit=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'};
   return requestJson('/api/workspace',init,{timeoutMs:timeoutForAction(body?.action)});
 }
+
+/** jszip + unrar (~140 kB) нужны только в импорте аккаунтов — грузим по требованию. */
+const loadAccountZip=()=>import('@/lib/account-zip');
 
 /** Сеть, таймаут или 5xx — повод для backoff поллера; 4xx/409 «занято» — обычный ответ. */
 function isTransportFailure(e:unknown){
@@ -467,8 +484,15 @@ function WorkspaceHome(){
   const [groupImportJoin,setGroupImportJoin]=useState(true);
   const [accountImportOpen,setAccountImportOpen]=useState(false),[accountImportProxyId,setAccountImportProxyId]=useState('');
   const [accountImportFiles,setAccountImportFiles]=useState<File[]>([]);
+  const [accountZip,setAccountZip]=useState<typeof AccountZipModule|null>(null);
   const [accountImportSessionMode,setAccountImportSessionMode]=useState<SessionMode>('keep');
   const [accountImportMixProxy,setAccountImportMixProxy]=useState(true);
+  useEffect(()=>{
+    if(!accountImportOpen||accountZip)return;
+    let cancelled=false;
+    loadAccountZip().then(m=>{if(!cancelled)setAccountZip(m)}).catch(()=>{/* повторим при следующем открытии */});
+    return()=>{cancelled=true};
+  },[accountImportOpen,accountZip]);
   const [accountImportProgress,setAccountImportProgress]=useState('');
   const [proxyCheckProgress,setProxyCheckProgress]=useState<{done:number;total:number;active:number;inactive:number}|null>(null);
   const [telegramConnected,setTelegramConnected]=useState(false);
@@ -1802,7 +1826,11 @@ function WorkspaceHome(){
     }
   }
 
-  function addAccountArchiveFiles(list:File[]){
+  async function addAccountArchiveFiles(list:File[]){
+    let zip:typeof AccountZipModule;
+    try{zip=await loadAccountZip()}
+    catch{setFormError('Не удалось загрузить модуль импорта — перезагрузите страницу');return}
+    const {MAX_ACCOUNT_ARCHIVE_BYTES}=zip;
     const next:File[]=[];
     const errs:string[]=[];
     for(const f of list){
@@ -1842,6 +1870,7 @@ function WorkspaceHome(){
       let done=0,skipped=0;
       const savedIds:string[]=[];
       const total=accountImportFiles.length;
+      const {parseAccountZip,accountSessionSecret}=await loadAccountZip();
       for(let i=0;i<accountImportFiles.length;i++){
         const file=accountImportFiles[i];
         setAccountImportProgress(`${i+1}/${total}`);
@@ -3149,6 +3178,7 @@ function WorkspaceHome(){
           )}
 
           <PanelErrorBoundary key={view} section={view}>
+          <Suspense fallback={<SectionSkeleton/>}>
           {view==='Уведомления'&&(
             <NotificationsPanel onOpenItem={(next)=>{if(next)navigate(next)}}/>
           )}
@@ -4244,6 +4274,7 @@ function WorkspaceHome(){
               </div>
             </div>
           )}
+          </Suspense>
           </PanelErrorBoundary>
 
           <footer className="app-footer">
@@ -4273,6 +4304,7 @@ function WorkspaceHome(){
           </DialogHeader>
           <form className="form-stack" onSubmit={save}>
             {modal?.kind!=='settings'&&modal?.kind!=='audience_task'&&modal?.kind!=='invite_task'&&modal?.kind!=='mailing_task'&&field('name','Название')}
+            <Suspense fallback={<SectionSkeleton/>}>
             {modal?.kind==='audience_task'&&(
               <AudienceTaskFields form={form} setForm={setForm} accounts={accountsUsableOpts}/>
             )}
@@ -4285,6 +4317,7 @@ function WorkspaceHome(){
             {modal?.kind==='mailing_task'&&(
               <MailingTaskFields form={form} setForm={setForm} accounts={accountsUsableOpts} audienceTasks={list('audience_task').map(r=>({id:r.id,data:r.data}))}/>
             )}
+            </Suspense>
             {modal?.kind==='account'&&<>
               {field('phone','Телефон','tel','+79991234567')}
               <label className="field">Прокси
@@ -4538,12 +4571,14 @@ function WorkspaceHome(){
         </DialogContent>
       </Dialog>
 
+      <Suspense fallback={null}>
       <TaskLogDialog
         open={taskLog}
         liveLog={taskLog?.taskId?(records.find(r=>r.id===taskLog.taskId)?.data?.log||taskLog.log):taskLog?.log}
         liveNextAt={taskLog?.taskId?String(records.find(r=>r.id===taskLog.taskId)?.data?.nextAt||''):''}
         onClose={()=>setTaskLog(null)}
       />
+      </Suspense>
 
       <Dialog open={!!mailingDeliveries} onOpenChange={o=>{if(!o)setMailingDeliveries(null)}}>
         <DialogContent className="sm:max-w-xl max-h-[70vh] overflow-y-auto">
@@ -4551,7 +4586,9 @@ function WorkspaceHome(){
             <DialogTitle>Доставки · {mailingDeliveries?.title}</DialogTitle>
             <DialogDescription>Ссылки на сообщения в ЛС или в чате, статус и превью текста</DialogDescription>
           </DialogHeader>
-          <MailingDeliveriesView deliveries={mailingDeliveries?.deliveries||[]}/>
+          <Suspense fallback={<SectionSkeleton/>}>
+            <MailingDeliveriesView deliveries={mailingDeliveries?.deliveries||[]}/>
+          </Suspense>
         </DialogContent>
       </Dialog>
 
@@ -4673,7 +4710,7 @@ function WorkspaceHome(){
               onDrop={e=>{
                 e.preventDefault();
                 e.stopPropagation();
-                addAccountArchiveFiles(Array.from(e.dataTransfer.files||[]));
+                void addAccountArchiveFiles(Array.from(e.dataTransfer.files||[]));
               }}
             >
               <CloudUpload size={36} className="text-[var(--spike-primary)] mb-3"/>
@@ -4684,10 +4721,10 @@ function WorkspaceHome(){
                 <input
                   type="file"
                   className="sr-only"
-                  accept={ACCOUNT_ARCHIVE_ACCEPT}
+                  accept={accountZip?.ACCOUNT_ARCHIVE_ACCEPT}
                   multiple
                   onChange={e=>{
-                    addAccountArchiveFiles(Array.from(e.target.files||[]));
+                    void addAccountArchiveFiles(Array.from(e.target.files||[]));
                     e.target.value='';
                   }}
                 />
@@ -4703,7 +4740,7 @@ function WorkspaceHome(){
                   <li key={f.name}>
                     <FileArchive size={16}/>
                     <span className="min-w-0 flex-1 truncate">{f.name}</span>
-                    <span className="small-note shrink-0">{formatArchiveSize(f.size)}</span>
+                    <span className="small-note shrink-0">{accountZip?.formatArchiveSize(f.size)}</span>
                     <button
                       type="button"
                       className="text-[var(--spike-muted)] hover:text-[var(--spike-text)]"

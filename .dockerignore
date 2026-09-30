@@ -1,0 +1,16 @@
+.git
+node_modules
+dist
+.wrangler
+.sites-runtime
+.data
+.env
+.env.*
+!.env.example
+*.zip
+*.session
+*.sqlite
+telegram-worker/.venv
+telegram-worker/vendor
+coverage
+.DS_Store

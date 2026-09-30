@@ -1,15 +1,61 @@
+# Production on one VPS: `docker compose up -d --build` (docs/DEPLOY.md).
+# Secrets come from ./.env (see .env.example); per-service overrides below win over it.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
-  uniseller:
-    build: .
-    ports:
-      - "127.0.0.1:5173:5173"
-    env_file:
-      - .env
+  web:
+    build:
+      context: .
+      target: web
+    image: uniseller-web:latest
+    env_file: .env
     environment:
-      DATA_DIR: /data
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "5173"
+      D1_PERSIST_DIR: /data/wrangler
+      BACKUP_DIR: /data/backups
+      TELEGRAM_WORKER_URL: http://worker:8790
+    ports:
+      # Only Caddy on the host reaches the app; never publish on 0.0.0.0.
+      - "127.0.0.1:5173:5173"
     volumes:
       - uniseller-data:/data
+    networks:
+      - uniseller
     restart: unless-stopped
+    logging: *logging
+
+  worker:
+    build:
+      context: .
+      target: worker
+    image: uniseller-worker:latest
+    # TgCrypto / PyQt5-Qt5 wheels exist for x86_64 only.
+    platform: linux/amd64
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      TG_WORKER_HOST: 0.0.0.0
+      TG_WORKER_PORT: "8790"
+      # worker -> web (auto-rescan cron) over the compose network, not the public URL
+      APP_URL: http://web:5173
+    expose:
+      - "8790"
+    networks:
+      - uniseller
+    depends_on:
+      - web
+    restart: unless-stopped
+    logging: *logging
+
+networks:
+  uniseller:
 
 volumes:
   uniseller-data:

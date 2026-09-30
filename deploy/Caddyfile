@@ -1,0 +1,22 @@
+# /etc/caddy/Caddyfile on the VPS host. Caddy obtains and renews the TLS certificate
+# automatically once DNS for the domain points at this server (ports 80/443 open).
+# Replace leads.example.com with the domain from APP_URL.
+leads.example.com {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# tdata/.session archives are uploaded through the app.
+	request_body {
+		max_size 200MB
+	}
+
+	# Caddy sets X-Forwarded-For to the real client IP (incoming values are not
+	# trusted by default) — the login/contact throttles key on it.
+	reverse_proxy 127.0.0.1:5173
+}

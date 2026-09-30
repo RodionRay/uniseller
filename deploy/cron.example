@@ -1,0 +1,3 @@
+# crontab -e  (user in the docker group, repo cloned to /opt/uniseller)
+# Daily D1 backup at 03:15 server time, log to syslog.
+15 3 * * * cd /opt/uniseller && ./deploy/backup.sh 2>&1 | logger -t uniseller-backup

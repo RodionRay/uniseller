@@ -13,6 +13,12 @@ ENV NODE_ENV=production
 ENV DATA_DIR=/data
 ENV HOST=127.0.0.1
 ENV PORT=5173
+# wrangler dev --local passes a client-supplied CF-Connecting-IP through, so no
+# header is trusted by default. Behind a proxy that overwrites one, set it
+# (e.g. TRUSTED_IP_HEADER=x-real-ip); see README "Client IP and rate limits".
+ENV TRUSTED_IP_HEADER=none
+# The image carries no .env; without this Miniflare ignores the container env.
+ENV CLOUDFLARE_INCLUDE_PROCESS_ENV=true
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/node_modules ./node_modules

@@ -17,14 +17,17 @@ const DAY = 24 * HOUR;
 
 /**
  * Fixed-window limits, stored in D1 so they hold across Worker isolates.
- * Every attempt counts (successful ones too); humans stay far below these.
- * Exception: `loginPerEmail` counts failed logins only (see login route), so
- * an attacker cannot lock a victim out by spending their quota with noise
- * while the victim keeps logging in successfully.
+ * Every attempt is counted before the work it guards (atomic per bucket, so
+ * parallel requests cannot slip past); humans stay far below these.
+ * Login: `loginPerEmailIp` (email + trusted IP, or email alone when no IP is
+ * trusted) is the tight guess limit and is cleared by a successful login, so
+ * guesses from one network do not lock the owner out elsewhere;
+ * `loginPerEmail` is a high ceiling against guessing spread over many IPs.
  */
 export const RATE_LIMITS = {
   loginPerIp: { name: "login-ip", limit: 20, windowSec: 15 * MINUTE },
-  loginPerEmail: { name: "login-email", limit: 10, windowSec: 15 * MINUTE },
+  loginPerEmailIp: { name: "login-email-ip", limit: 10, windowSec: 15 * MINUTE },
+  loginPerEmail: { name: "login-email", limit: 100, windowSec: 15 * MINUTE },
   registerPerIp: { name: "register-ip", limit: 5, windowSec: HOUR },
   contactPerIp: { name: "contact-ip", limit: 5, windowSec: HOUR },
   assistantAnonPerIp: { name: "assistant-anon-ip", limit: 30, windowSec: DAY },
@@ -105,24 +108,6 @@ export async function consumeRateLimit(
   return { allowed: count <= rule.limit, retryAfterSec: Math.max(1, expires - nowSec) };
 }
 
-/** Whether `subject` still has quota under `rule`, without counting an attempt. */
-export async function peekRateLimit(
-  rule: RateLimitRule,
-  subject: string,
-  nowMs = Date.now(),
-): Promise<RateLimitResult> {
-  await ensureTable();
-  const nowSec = Math.floor(nowMs / 1000);
-  const windowStart = nowSec - (nowSec % rule.windowSec);
-  const expires = windowStart + rule.windowSec;
-  const row = await database()
-    .prepare("SELECT count FROM rate_limits WHERE key = ? AND window_start = ?")
-    .bind(await bucketKey(rule, subject), windowStart)
-    .first<{ count: number }>();
-  const count = Number(row?.count ?? 0);
-  return { allowed: count < rule.limit, retryAfterSec: Math.max(1, expires - nowSec) };
-}
-
 /** Forgets all counted attempts of `subject` under `rule`. */
 export async function resetRateLimit(rule: RateLimitRule, subject: string): Promise<void> {
   await ensureTable();
@@ -133,21 +118,21 @@ export async function resetRateLimit(rule: RateLimitRule, subject: string): Prom
 }
 
 /**
- * First rule that is exceeded wins; all rules are counted. A null subject
- * (e.g. no trusted client IP) skips that rule: one shared bucket for every
- * unidentified client would let a single abuser lock everyone out.
+ * Counts `checks` in order and stops at the first exceeded rule: later
+ * (usually wider) buckets are not spent by a client that is already blocked.
+ * A null subject (e.g. no trusted client IP) skips that rule: one shared
+ * bucket for every unidentified client would let one abuser lock out everyone.
  */
 export async function consumeRateLimits(
   checks: ReadonlyArray<readonly [RateLimitRule, string | null]>,
   nowMs = Date.now(),
 ): Promise<RateLimitResult> {
-  let blocked: RateLimitResult | null = null;
   for (const [rule, subject] of checks) {
     if (subject === null) continue;
     const result = await consumeRateLimit(rule, subject, nowMs);
-    if (!result.allowed && !blocked) blocked = result;
+    if (!result.allowed) return result;
   }
-  return blocked ?? { allowed: true, retryAfterSec: 0 };
+  return { allowed: true, retryAfterSec: 0 };
 }
 
 export function tooManyRequests(retryAfterSec: number): Response {

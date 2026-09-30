@@ -37,9 +37,15 @@ function dailyCapReached(limit: number, retryAfterSec: number) {
   );
 }
 
-function clientKey(req: Request, owner?: string | null) {
+/**
+ * Cooldown record id, or null when the client cannot be told apart (anonymous
+ * without a trusted IP): a shared key would make every such visitor wait on
+ * each other; the global daily quota bounds them instead.
+ */
+function cooldownKey(req: Request, owner: string | null): string | null {
   if (owner) return "assistant-guard:user:" + owner;
-  return "assistant-guard:ip:" + (trustedClientIp(req) ?? "anon");
+  const ip = trustedClientIp(req);
+  return ip ? "assistant-guard:ip:" + ip : null;
 }
 
 type RecordRow = { created?: string; data?: string; secret?: string | null };
@@ -78,7 +84,7 @@ export async function POST(req: Request) {
 
     const user = await getSessionUser().catch(() => null);
     const owner = user?.userId || null;
-    const guardId = clientKey(req, owner);
+    const guardId = cooldownKey(req, owner);
     const now = new Date();
 
     let db: ReturnType<typeof database> | null = null;
@@ -89,21 +95,31 @@ export async function POST(req: Request) {
     }
 
     if (db) {
-      const guardRow = await db
-        .prepare("SELECT created FROM records WHERE id=?")
-        .bind(guardId)
-        .first<RecordRow>();
-      if (!canAskAssistant(guardRow?.created, now)) {
-        return reply(
-          { error: "Подождите несколько секунд перед следующим вопросом." },
-          429,
-        );
+      if (guardId) {
+        const guardRow = await db
+          .prepare("SELECT created FROM records WHERE id=?")
+          .bind(guardId)
+          .first<RecordRow>();
+        if (!canAskAssistant(guardRow?.created, now)) {
+          return reply(
+            { error: "Подождите несколько секунд перед следующим вопросом." },
+            429,
+          );
+        }
+        // Start the cooldown before the quota check so a blocked client cannot hammer it.
+        await db
+          .prepare(
+            "INSERT INTO records(id,owner,kind,data,created) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET created=excluded.created",
+          )
+          .bind(guardId, owner || "public", "ai_guard", "{}", now.toISOString())
+          .run();
       }
       // The site widget is public: anonymous use has a per-IP and a global daily cap.
+      // Per-IP first: an IP over its cap must not spend the shared global quota.
       if (!owner) {
         const quota = await consumeRateLimits([
-          [RATE_LIMITS.assistantAnonGlobal, "all"],
           [RATE_LIMITS.assistantAnonPerIp, trustedClientIp(req)],
+          [RATE_LIMITS.assistantAnonGlobal, "all"],
         ]);
         if (!quota.allowed) return tooManyRequests(quota.retryAfterSec);
       } else {
@@ -111,12 +127,6 @@ export async function POST(req: Request) {
         const quota = await consumeRateLimit(rule, owner);
         if (!quota.allowed) return dailyCapReached(rule.limit, quota.retryAfterSec);
       }
-      await db
-        .prepare(
-          "INSERT INTO records(id,owner,kind,data,created) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET created=excluded.created",
-        )
-        .bind(guardId, owner || "public", "ai_guard", "{}", now.toISOString())
-        .run();
     }
 
     const owned = owner

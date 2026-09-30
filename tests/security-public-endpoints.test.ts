@@ -27,6 +27,14 @@ afterAll(() => {
   for (const k of AI_KEYS) if (saved[k] !== undefined) process.env[k] = saved[k];
 });
 
+async function globalCount(): Promise<number> {
+  const row = await db
+    .prepare("SELECT count FROM rate_limits WHERE key LIKE 'assistant-anon-global:%'")
+    .bind()
+    .first<{ count: number }>();
+  return Number(row?.count ?? 0);
+}
+
 function ask(headers: Record<string, string>) {
   return assistant(
     new Request("https://app.test/api/assistant", {
@@ -59,9 +67,16 @@ describe("POST /api/contact rate limit", () => {
 });
 
 describe("POST /api/assistant (public widget)", () => {
-  it("does not trust X-Forwarded-For for the anonymous throttle", async () => {
+  it("without a trusted IP uses only the global quota, not a shared cooldown", async () => {
+    const before = await globalCount();
     expect((await ask({ "x-forwarded-for": "192.0.2.1" })).status).toBe(200);
-    expect((await ask({ "x-forwarded-for": "192.0.2.2" })).status).toBe(429);
+    expect((await ask({ "x-forwarded-for": "192.0.2.2" })).status).toBe(200);
+    expect(await globalCount()).toBe(before + 2);
+    const guards = await db
+      .prepare("SELECT count(*) AS n FROM records WHERE id LIKE 'assistant-guard:ip:%'")
+      .bind()
+      .first<{ n: number }>();
+    expect(Number(guards?.n)).toBe(0);
   });
 
   it("caps anonymous questions per IP per day", async () => {
@@ -72,6 +87,16 @@ describe("POST /api/assistant (public widget)", () => {
     }
     expect(statuses.slice(0, 30).every((s) => s === 200)).toBe(true);
     expect(statuses[30]).toBe(429);
+  });
+
+  it("a blocked IP neither drains the global quota nor skips the cooldown", async () => {
+    const before = await globalCount();
+    vi.setSystemTime(Date.now() + 21_000);
+    expect((await ask({ "cf-connecting-ip": "203.0.113.30" })).status).toBe(429);
+    const again = await ask({ "cf-connecting-ip": "203.0.113.30" });
+    expect(again.status).toBe(429);
+    expect(((await again.json()) as { error: string }).error).toMatch(/Подождите/);
+    expect(await globalCount()).toBe(before);
   });
 
   it("caps anonymous questions globally per day", async () => {

@@ -41,6 +41,7 @@ Telegram authorization / tdata import, joining groups, proxy connectivity checks
 - Per-IP limits (`login-ip`, `register-ip`, `contact-ip`, `assistant-anon-ip` in `lib/security/rate-limit.ts::RATE_LIMITS`) key on the header named by `TRUSTED_IP_HEADER` (`lib/security/client-ip.ts::trustedClientIp`), default `cf-connecting-ip`.
 - The reverse proxy in front of the app **must overwrite** that header with the real client IP (Cloudflare does this for `cf-connecting-ip`). Without such a proxy (local dev, Docker/VPS via `wrangler dev --local` — miniflare passes a client-supplied `CF-Connecting-IP` through) the header is spoofable: set `TRUSTED_IP_HEADER=none` (or empty), or point it at the header your proxy overwrites (e.g. `x-real-ip`).
 - Signed-in assistant use is capped per user per day: `ASSISTANT_USER_DAILY_LIMIT` (default 200; `lib/security/rate-limit.ts::assistantUserDailyRule`), then 429 with `Retry-After`.
+- Docker (`Dockerfile`, `docker-compose.yml`) ships `TRUSTED_IP_HEADER=none`. To enable per-IP limits, put a reverse proxy in front that overwrites a header with the real client IP (nginx: `proxy_set_header X-Real-IP $remote_addr;`) and set `TRUSTED_IP_HEADER=x-real-ip` in `.env` (compose passes it through).
 - With no trusted IP the per-IP buckets are skipped (not shared under one key, which would let one client lock everyone out); per-email, per-user and global limits still apply.
 
 Runtime DB is Cloudflare D1 (local file under `.wrangler/state`). `better-sqlite3` is only for optional Node scripts (`npm run db:migrate`).

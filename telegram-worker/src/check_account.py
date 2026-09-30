@@ -147,6 +147,57 @@ def error_result(exc: BaseException, **extra: Any) -> dict[str, Any]:
     return out
 
 
+def flood_result(exc: BaseException, **extra: Any) -> dict[str, Any]:
+    """FloodWait: status flood + waitSec; floodWait — прежнее имя поля для старых читателей."""
+    wait = flood_wait_seconds(exc) or 0
+    return {
+        "ok": False,
+        "status": "flood",
+        "error": f"FloodWait {wait}с",
+        "waitSec": wait,
+        "floodWait": wait,
+        **extra,
+    }
+
+
+def invite_flood_result(exc: BaseException, *, results: list[dict[str, Any]], title: str) -> dict[str, Any]:
+    """Инвайт: приложение пока читает status «floodwait» — сохраняем его, плюс flood/waitSec."""
+    return {**flood_result(exc, results=results, title=title), "status": "floodwait", "flood": True}
+
+
+def is_peer_flood(exc: BaseException) -> bool:
+    return "PeerFloodError" in _class_names(exc) or _rpc_message(exc) == "PEER_FLOOD"
+
+
+_SPAMBLOCK_ERROR = (
+    "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы. "
+    "Смените аккаунт фермы или подождите 24ч."
+)
+
+
+def send_rpc_error_result(exc: BaseException) -> dict[str, Any]:
+    """Ответ отправки на RPCError: классификация по классу/коду ошибки, не по подстроке «flood»."""
+    if is_flood_wait(exc):
+        return flood_result(exc)
+    if is_peer_flood(exc):
+        return {"ok": False, "status": "spamblock", "error": f"PEER_FLOOD: {_SPAMBLOCK_ERROR}"[:400]}
+    if is_frozen_rpc(exc):
+        return frozen_action_error("отправка сообщения")
+    msg = str(exc)
+    low = msg.lower()
+    if "banned from sending" in low or "chat_write_forbidden" in low or "user_banned_in_channel" in low:
+        return {"ok": False, "status": "spamblock", "error": _SPAMBLOCK_ERROR}
+    if "invalid peer" in low:
+        return {
+            "ok": False,
+            "error": (
+                "Неверный peer для этого аккаунта (часто чужой access_hash). "
+                "Ответьте тем же аккаунтом или укажите @username клиента."
+            ),
+        }
+    return {"ok": False, "error": msg[:400]}
+
+
 def frozen_action_error(action: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -876,14 +927,7 @@ async def join_group(client, url: str) -> dict[str, Any]:
                 "member": True,
             }
     except FloodWaitError as e:
-        return {
-            "ok": False,
-            "status": "setup",
-            "join": "flood",
-            "error": f"FloodWait {e.seconds}с",
-            "member": False,
-            "waitSec": int(e.seconds),
-        }
+        return flood_result(e, join="flood", member=False)
     except RPCError as e:
         if is_frozen_rpc(e):
             return frozen_action_error("вступление")
@@ -1724,14 +1768,7 @@ async def invite_users(client, payload: dict[str, Any]) -> dict[str, Any]:
                     "title": title,
                 }
             except FloodWaitError as e:
-                return {
-                    "ok": False,
-                    "status": "floodwait",
-                    "error": f"FloodWait {e.seconds}s",
-                    "floodWait": int(e.seconds),
-                    "results": results,
-                    "title": title,
-                }
+                return invite_flood_result(e, results=results, title=title)
             except RPCError as e:
                 if is_frozen_rpc(e):
                     return {**frozen_action_error("инвайт"), "results": results}
@@ -1767,7 +1804,6 @@ async def send_message(
     delete_dialog: bool = False,
 ) -> dict[str, Any]:
     from telethon.errors import (
-        FloodWaitError,
         RPCError,
         UserPrivacyRestrictedError,
         UserBannedInChannelError,
@@ -2059,47 +2095,11 @@ async def send_message(
                 "Смените аккаунт фермы или подождите 24ч."
             )[:400],
         }
-    except FloodWaitError as e:
-        return {"ok": False, "status": "flood", "error": f"FloodWait {e.seconds}с", "waitSec": int(e.seconds)}
     except RPCError as e:
-        if is_frozen_rpc(e):
-            return frozen_action_error("отправка сообщения")
-        msg = str(e)
-        low = msg.lower()
-        if "banned from sending" in low or "chat_write_forbidden" in low or "user_banned_in_channel" in low:
-            return {
-                "ok": False,
-                "status": "spamblock",
-                "error": (
-                    "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы. "
-                    "Смените аккаунт фермы или подождите 24ч."
-                )[:400],
-            }
-        if "invalid peer" in low:
-            return {
-                "ok": False,
-                "error": (
-                    "Неверный peer для этого аккаунта (часто чужой access_hash). "
-                    "Ответьте тем же аккаунтом или укажите @username клиента."
-                )[:400],
-            }
-        # Telethon иногда отдаёт Flood как обычный RPC «Too many requests» без FloodWaitError
-        if "too many requests" in low or ("flood" in low and "peer_flood" not in low and "banned" not in low):
-            wait = 900
-            m = re.search(r"(\d+)\s*(?:seconds?|s\b)", msg, re.I)
-            if m:
-                try:
-                    wait = max(60, min(86400, int(m.group(1))))
-                except Exception:
-                    wait = 900
-            return {
-                "ok": False,
-                "status": "flood",
-                "error": msg[:400],
-                "waitSec": wait,
-            }
-        return {"ok": False, "error": msg[:400]}
+        return send_rpc_error_result(e)
     except Exception as e:
+        if is_flood_wait(e):
+            return flood_result(e)
         msg = str(e)
         low = msg.lower()
         if "banned from sending" in low:

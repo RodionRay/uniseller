@@ -1118,6 +1118,60 @@ AD_MARKERS = compile_minus_terms([
 ])
 
 
+# Seller-question gate. Mirrors lib/lead-question-gate.ts (shared fixture tests/fixtures/lead-question-gate.json).
+QUESTION_STEMS = ("подскаж", "посоветуй", "порекомендуй")
+QUESTION_WORDS = (
+    "кто-нибудь", "кто нибудь", "кто знает", "кто в курсе", "кто пользуется", "кто пользовался",
+    "кто сталкивался", "кто работает", "кто работал", "у кого есть", "у кого-нибудь", "у кого-то",
+    "может кто", "может кто-то", "как вы", "как у вас", "чем вы", "где взять", "где найти", "есть ли",
+    "как правильно", "как лучше", "какой", "какая", "какое", "какие", "какую", "каким", "какими",
+)
+TOPIC_STEMS = (
+    "wildberries", "вайлдберр", "ozon", "озон", "яндекс маркет", "яндекс.маркет", "маркетплейс",
+    "мегамаркет", "селлер", "кабинет", "остатк", "остаток", "поставк", "заказ", "отзыв", "карточк",
+    "артикул", "мойсклад", "мой склад", "выгрузк", "выгруж", "синхрониз", "интеграц", "учет",
+    "ценообраз", "ценник", "складск", "фулфилмент",
+)
+TOPIC_WORDS = (
+    "wb", "вб", "1с", "1c", "api", "апи", "fbs", "fbo", "rfbs", "фбс", "фбо", "рфбс", "crm", "срм", "лк",
+    "склад", "склада", "складе", "складу", "складом", "склады", "складов", "складам", "складами", "складах",
+    "цен", "цена", "цены", "цену", "цене", "ценой", "ценам", "ценами", "ценах",
+)
+
+
+def _compile_gate_terms(stems: tuple[str, ...], words: tuple[str, ...]) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    """Stems match at a word start; words also need a word end (no letter, digit or hyphen after)."""
+
+    def body(term: str) -> str:
+        return r"\s+".join(re.escape(w) for w in term.split())
+
+    start = r"(?<![^\W_])"
+    return tuple(
+        [(t, re.compile(start + body(t))) for t in stems]
+        + [(t, re.compile(start + body(t) + r"(?![^\W_]|-)")) for t in words]
+    )
+
+
+_QUESTION_TERMS = _compile_gate_terms(QUESTION_STEMS, QUESTION_WORDS)
+_TOPIC_TERMS = _compile_gate_terms(TOPIC_STEMS, TOPIC_WORDS)
+
+
+def has_question(text: str) -> bool:
+    low = _normalize_minus_text(text)
+    return "?" in low or "？" in low or any(p.search(low) for _, p in _QUESTION_TERMS)
+
+
+def seller_topic_hits(text: str) -> list[str]:
+    """Seller-topic terms in the text, in vocabulary order (stems first, then words)."""
+    low = _normalize_minus_text(text)
+    return [t for t, p in _TOPIC_TERMS if p.search(low)]
+
+
+def is_seller_question(text: str) -> bool:
+    """A question or soft ask about marketplace operations: a lead candidate without a plus keyword."""
+    return has_question(text) and bool(seller_topic_hits(text))
+
+
 async def scan_group(
     client,
     url: str,
@@ -1180,20 +1234,15 @@ async def scan_group(
         }
 
     def passes_kw(text: str) -> bool:
+        """Plus keyword, explicit intent, or a seller question (вопрос + тема маркетплейсов)."""
         nonlocal skipped_kw
         low = text.lower()
-        if kws:
-            hit = any(k in low for k in kws if len(k) >= 2)
-            intentish = any(x in low for x in intent_markers)
-            if not hit and not intentish:
-                skipped_kw += 1
-                return False
-        else:
-            # без плюс-слов из настроек — только явный intent
-            if not any(x in low for x in intent_markers):
-                skipped_kw += 1
-                return False
-        return True
+        hit = any(k in low for k in kws if len(k) >= 2)
+        intentish = any(x in low for x in intent_markers)
+        if hit or intentish or is_seller_question(text):
+            return True
+        skipped_kw += 1
+        return False
 
     async def add_msg(m, *, kind: str, peer_entity) -> None:
         nonlocal fetched, skipped_minus, skipped_not_user

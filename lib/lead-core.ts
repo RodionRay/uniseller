@@ -17,6 +17,7 @@ import {
   strongPlusTerms,
   type LeadTemperature,
 } from "@/lib/lead-filter";
+import { hasQuestion, sellerOpsTopicHits, sellerTopicHits } from "@/lib/lead-question-gate";
 
 export const LEAD_SCORE_HOT = 70;
 export const LEAD_SCORE_WARM = 45;
@@ -176,7 +177,7 @@ export function hardReject(
  * count, and a hit contained in another hit ("склад" in "мойсклад") is the same evidence.
  */
 export function distinctTopicHits(hits: readonly string[]): string[] {
-  const topical = [...new Set(hits.map((h) => h.toLowerCase().trim()))].filter(
+  const topical = [...new Set(hits.map((h) => h.toLowerCase().trim().replace(/ё/g, "е")))].filter(
     (h) => h && !hasBuyerIntent(h) && !hasSoftAsk(h),
   );
   return topical.filter((h) => !topical.some((other) => other !== h && other.includes(h)));
@@ -200,7 +201,9 @@ export function scoreLead(text: string, settings: LeadCoreSettings): LeadScoreRe
 
   const { body } = normalizeCandidate(text);
   const buyer = hasBuyerIntent(text);
-  const softAsk = hasSoftAsk(text);
+  // The worker passes seller questions without a plus keyword; the core treats them as soft asks.
+  const sellerQuestion = hasQuestion(text) && sellerTopicHits(text).length > 0;
+  const softAsk = hasSoftAsk(text) || sellerQuestion;
 
   const plus = strongPlusTerms(settings.keywords || "");
   const plusHits = plus.filter((p) => body.includes(p));
@@ -234,7 +237,11 @@ export function scoreLead(text: string, settings: LeadCoreSettings): LeadScoreRe
   }
   if (softAsk) {
     score += 20;
-    reasons.push("Мягкий вопрос (подскажите / кто пользуется)");
+    reasons.push(
+      hasSoftAsk(text)
+        ? "Мягкий вопрос (подскажите / кто пользуется)"
+        : "Вопрос селлера по теме маркетплейсов",
+    );
   }
   if (plusHits.length) {
     score += Math.min(22, 8 * plusHits.length);
@@ -259,8 +266,15 @@ export function scoreLead(text: string, settings: LeadCoreSettings): LeadScoreRe
     if (score > 0) reasons.push("Нет запроса услуги — только тема чата");
   }
 
-  // Soft + ≥2 совпадений с настройками AI — это вопрос по теме продукта, минимум warm
-  const topicHitCount = distinctTopicHits([...plusHits, ...signalHits, ...criteriaHits]).length;
+  // Soft + ≥2 тем (настройки AI; при совпадении с настройками — и операции из словаря селлера)
+  // — минимум warm. Словарь считается только вместе с настройками: другая ниша не получает лиды
+  // про WB; названия маркетплейсов (вб, озон, фбс) — контекст, а не тема.
+  const topicHitCount = distinctTopicHits([
+    ...plusHits,
+    ...signalHits,
+    ...criteriaHits,
+    ...(settingsFit ? sellerOpsTopicHits(text) : []),
+  ]).length;
   if (softAsk && !buyer && topicHitCount >= SOFT_ASK_WARM_MIN_HITS) {
     score = Math.max(score, LEAD_SCORE_WARM);
   }

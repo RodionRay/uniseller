@@ -11,6 +11,9 @@ import {
   verifyPasswordHash,
 } from "@/lib/auth";
 import { findUserByEmail } from "@/lib/users";
+import { getDatabase } from "@/lib/db";
+import { isSameOriginRequest } from "@/lib/env";
+import { LOGIN_FAILURE_RULE, clientIp, createRateLimiter } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -22,8 +25,7 @@ function reply(data: unknown, status = 200) {
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin) {
+  if (!isSameOriginRequest(req)) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
   }
 
@@ -41,11 +43,29 @@ export async function POST(req: Request) {
       return reply({ error: "Неверный email или пароль" }, 401);
     }
 
+    const limiter = createRateLimiter(getDatabase());
+    const throttleKey = `login:${clientIp(req)}:${email}`;
+    if (await limiter.isLimited(throttleKey, LOGIN_FAILURE_RULE)) {
+      const retryAfter = await limiter.retryAfterSec(throttleKey, LOGIN_FAILURE_RULE);
+      return NextResponse.json(
+        { error: "Слишком много попыток входа. Попробуйте позже." },
+        {
+          status: 429,
+          headers: { "Cache-Control": "no-store", "Retry-After": String(retryAfter) },
+        },
+      );
+    }
+    const rejectCredentials = async () => {
+      await limiter.hit(throttleKey, LOGIN_FAILURE_RULE);
+      return reply({ error: "Неверный email или пароль" }, 401);
+    };
+
     const dbUser = await findUserByEmail(email);
     if (dbUser?.passwordHash) {
       if (!(await verifyPasswordHash(password, dbUser.passwordHash))) {
-        return reply({ error: "Неверный email или пароль" }, 401);
+        return rejectCredentials();
       }
+      await limiter.reset(throttleKey);
       const token = await createSessionToken({
         userId: dbUser.id,
         email: dbUser.email || email,
@@ -68,12 +88,13 @@ export async function POST(req: Request) {
         email: expected,
         displayName: "Администратор",
       });
+      await limiter.reset(throttleKey);
       const response = reply({ ok: true });
       response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
       return response;
     }
 
-    return reply({ error: "Неверный email или пароль" }, 401);
+    return rejectCredentials();
   } catch {
     return reply({ error: "Не удалось выполнить вход" }, 503);
   }

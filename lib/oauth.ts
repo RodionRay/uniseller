@@ -3,6 +3,14 @@ import {
   safeRelativeReturnPath,
   sessionCookieOptions,
 } from "@/lib/auth";
+import { appOrigin, registrationOpen } from "@/lib/env";
+import {
+  findOAuthUser,
+  findUserByEmail,
+  linkOAuth,
+  upsertOAuthUser,
+  type DbUser,
+} from "@/lib/users";
 
 export type OAuthProvider = "google" | "yandex" | "vk";
 
@@ -45,8 +53,12 @@ function client(provider: OAuthProvider) {
   };
 }
 
+/**
+ * Redirect URI registered with the provider. APP_URL wins over the request origin:
+ * behind Caddy the worker sees an internal host, which providers would reject.
+ */
 export function oauthCallbackUrl(origin: string, provider: OAuthProvider) {
-  return `${origin}/api/auth/${provider}/callback`;
+  return `${appOrigin() ?? origin}/api/auth/${provider}/callback`;
 }
 
 export function oauthAuthorizeUrl(
@@ -267,4 +279,33 @@ export async function verifyTelegramAuth(
     data.username ||
     "Telegram";
   return { id: data.id, name };
+}
+
+/** OAuth/Telegram login for an unknown identity while REGISTRATION_OPEN is off. */
+export class RegistrationClosedError extends Error {
+  constructor() {
+    super("Регистрация закрыта");
+    this.name = "RegistrationClosedError";
+  }
+}
+
+/**
+ * Signs in an OAuth/Telegram identity. With registration closed only existing
+ * users (linked identity or same email) get in; creating a user would be
+ * self-registration through the back door.
+ */
+export async function signInOAuthUser(input: {
+  provider: string;
+  providerUserId: string;
+  email: string | null;
+  name: string;
+}): Promise<DbUser> {
+  if (registrationOpen()) return upsertOAuthUser(input);
+  const linked = await findOAuthUser(input.provider, input.providerUserId);
+  if (linked) return linked;
+  const email = input.email?.trim().toLowerCase();
+  const byEmail = email ? await findUserByEmail(email) : null;
+  if (!byEmail) throw new RegistrationClosedError();
+  await linkOAuth(byEmail.id, input.provider, input.providerUserId);
+  return byEmail;
 }

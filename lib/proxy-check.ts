@@ -86,7 +86,10 @@ async function openTcp(host: string, port: number): Promise<TcpSocket> {
     return openTcpNode(host, port);
   }
   const { connect } = await import("cloudflare:sockets");
-  return connect({ hostname: host, port }, { secureTransport: "off" }) as TcpSocket;
+  return connect(
+    { hostname: host, port },
+    { secureTransport: "off", allowHalfOpen: false },
+  ) as TcpSocket;
 }
 
 class ByteReader {
@@ -292,13 +295,19 @@ async function httpGetIpify(socket: TcpSocket, reader: ByteReader) {
 
 export async function checkProxy(input: ProxyCheckInput): Promise<ProxyCheckResult> {
   const started = Date.now();
-  let socket: TcpSocket | null = null;
-  let reader: ByteReader | null = null;
+  // A holder object (not reassigned locals) so TS keeps the union type in `finally`
+  // instead of narrowing the closure-assigned variables to `null`.
+  const conn: { socket: TcpSocket | null; reader: ByteReader | null } = {
+    socket: null,
+    reader: null,
+  };
   try {
     const race = Promise.race([
       (async () => {
-        socket = await openTcp(input.host, input.port);
-        reader = new ByteReader(socket.readable);
+        const socket = await openTcp(input.host, input.port);
+        conn.socket = socket;
+        const reader = new ByteReader(socket.readable);
+        conn.reader = reader;
         if (input.protocol === "http") {
           const exitIp = await httpProxyConnect(socket, reader, input);
           return exitIp;
@@ -320,12 +329,12 @@ export async function checkProxy(input: ProxyCheckInput): Promise<ProxyCheckResu
     };
   } finally {
     try {
-      await reader?.release();
+      await conn.reader?.release();
     } catch {
       /* ignore */
     }
     try {
-      await socket?.close();
+      await conn.socket?.close();
     } catch {
       /* ignore */
     }

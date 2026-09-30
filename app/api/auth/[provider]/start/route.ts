@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requestOrigin } from "@/lib/env";
 import {
   makeOAuthState,
   oauthAuthorizeUrl,
@@ -18,12 +19,12 @@ export async function GET(
 ) {
   const { provider } = await ctx.params;
   if (!PROVIDERS.has(provider as OAuthProvider) || !oauthEnabled(provider as OAuthProvider)) {
-    return NextResponse.redirect(new URL("/login?error=oauth", req.url));
+    return NextResponse.redirect(new URL("/login?error=oauth", requestOrigin(req)));
   }
   const url = new URL(req.url);
   const returnTo = safeRelativeReturnPath(url.searchParams.get("return_to") || "/app");
   const { s, packed } = makeOAuthState(provider, returnTo);
-  const dest = oauthAuthorizeUrl(url.origin, provider as OAuthProvider, s);
+  const dest = oauthAuthorizeUrl(requestOrigin(req), provider as OAuthProvider, s);
   const res = NextResponse.redirect(dest);
   const cookie = oauthStateCookie(packed);
   res.cookies.set(cookie.name, cookie.value, cookie.options);

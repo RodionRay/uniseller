@@ -7,6 +7,7 @@ import {
   sessionCookieOptions,
 } from "@/lib/auth";
 import { createUser, findUserByEmail } from "@/lib/users";
+import { isSameOriginRequest, registrationOpen } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -18,9 +19,11 @@ function reply(data: unknown, status = 200) {
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin) {
+  if (!isSameOriginRequest(req)) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
+  }
+  if (!registrationOpen()) {
+    return reply({ error: "Регистрация закрыта. Доступ выдаёт администратор." }, 403);
   }
   try {
     if (!authConfigured()) {

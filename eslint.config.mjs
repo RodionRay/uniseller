@@ -14,6 +14,13 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
   ]),
   {
+    rules: {
+      // Decision 2026-09-30 (REQ-C6): legacy code has ~260 `any`s; keep them
+      // visible as warnings so CI can gate on errors while they are paid down.
+      "@typescript-eslint/no-explicit-any": "warn",
+    },
+  },
+  {
     files: ["components/ui/**/*.{ts,tsx}", "hooks/use-mobile.ts"],
     rules: {
       // These files are vendored verbatim from shadcn@4.17.0. Keep the

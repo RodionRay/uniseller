@@ -56,3 +56,6 @@ telegram-worker/vendor/
 
 # nested accidental copy
 uniseller-project/
+
+# archives (a project zip was once committed by accident)
+*.zip

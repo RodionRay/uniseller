@@ -94,12 +94,30 @@ export function normalizeYo(text: string): string {
 
 const minusPatternCache = new Map<string, RegExp>();
 
+/**
+ * Closed junk words matched by stem, so "крипта" also stops "криптовалюту" and "накрутка" stops
+ * "накрутку". Only these: a stem of an arbitrary word would over-match. Mirrors
+ * telegram-worker/src/check_account.py::MINUS_JUNK_STEMS.
+ */
+const MINUS_JUNK_STEMS: Readonly<Record<string, string>> = {
+  "крипта": "крипт",
+  "криптовалюта": "криптовалют",
+  "накрутка": "накрутк",
+  "вакансия": "ваканси",
+  "гадание": "гадани",
+  "эзотерика": "эзотерик",
+};
+
 function minusTermPattern(term: string): RegExp {
   const cached = minusPatternCache.get(term);
   if (cached) return cached;
   const phrase = term
     .split(/\s+/)
-    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .map((w) => {
+      const stem = MINUS_JUNK_STEMS[w];
+      // A stem inside a phrase must swallow its ending before the next word.
+      return stem ? `${stem}[\\p{L}\\p{N}]*` : w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    })
     .join("\\s+");
   // Word-start match: "нал" must not hit "канал", "бот" must not hit "работа".
   const re = new RegExp(`(?<![\\p{L}\\p{N}])${phrase}`, "iu");

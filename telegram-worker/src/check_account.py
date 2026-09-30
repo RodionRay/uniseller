@@ -1053,6 +1053,24 @@ class MinusMatcher:
     combined: re.Pattern[str] | None
 
 
+# Closed junk words matched by stem ("крипта" also stops "криптовалюту"); mirrors
+# lib/lead-filter.ts::MINUS_JUNK_STEMS. Only these: a stem of an arbitrary word would over-match.
+MINUS_JUNK_STEMS: dict[str, str] = {
+    "крипта": "крипт",
+    "криптовалюта": "криптовалют",
+    "накрутка": "накрутк",
+    "вакансия": "ваканси",
+    "гадание": "гадани",
+    "эзотерика": "эзотерик",
+}
+
+
+def _minus_word_pattern(word: str) -> str:
+    stem = MINUS_JUNK_STEMS.get(word)
+    # A stem inside a phrase must swallow its ending before the next word.
+    return re.escape(stem) + r"[^\W_]*" if stem else re.escape(word)
+
+
 def _normalize_minus_text(text: str) -> str:
     return (text or "").lower().replace("ё", "е")
 
@@ -1070,7 +1088,7 @@ def compile_minus_terms(terms: list[str]) -> MinusMatcher:
     for term in head:
         if not MIN_MINUS_TERM_LENGTH <= len(term) <= MAX_MINUS_TERM_LENGTH:
             continue
-        phrase = r"\s+".join(re.escape(w) for w in term.split())
+        phrase = r"\s+".join(_minus_word_pattern(w) for w in term.split())
         # (?<![^\W_]) = not preceded by a letter/digit (underscore does not count, as in the TS core)
         compiled.append((term, re.compile(r"(?<![^\W_])" + phrase)))
         alternatives.append(phrase)

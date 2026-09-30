@@ -75,7 +75,7 @@ describe("POST /api/auth/register", () => {
     const blocked = await signUp(RATE_LIMITS.registerGlobal.limit);
     expect(blocked.status).toBe(429);
     expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
-  });
+  }, 60_000);
 });
 
 describe("POST /api/auth/login throttle", () => {

@@ -31,6 +31,21 @@ export const RATE_LIMITS = {
   assistantAnonGlobal: { name: "assistant-anon-global", limit: 500, windowSec: DAY },
 } as const satisfies Record<string, RateLimitRule>;
 
+const DEFAULT_ASSISTANT_USER_DAILY_LIMIT = 200;
+
+/**
+ * Daily cap per signed-in user on the paid assistant key.
+ * `ASSISTANT_USER_DAILY_LIMIT` overrides the default; invalid values fall back to it.
+ */
+export function assistantUserDailyRule(): RateLimitRule {
+  const configured = Number(process.env.ASSISTANT_USER_DAILY_LIMIT);
+  const limit =
+    Number.isInteger(configured) && configured > 0
+      ? configured
+      : DEFAULT_ASSISTANT_USER_DAILY_LIMIT;
+  return { name: "assistant-user", limit, windowSec: DAY };
+}
+
 let tableReady = false;
 
 async function ensureTable(): Promise<void> {

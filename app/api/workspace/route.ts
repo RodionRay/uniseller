@@ -5,7 +5,7 @@ import {acquireLock,releaseLock,type LockHandle} from '@/lib/locks';
 import {patchRecordData,writeRecordDiff} from '@/lib/processes/record-patch';
 import {canRunWorkspaceAction} from '@/lib/processes/workspace-access';
 import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
-import {mergeRefreshedSession} from '@/lib/processes/session-refresh';
+import {mergeRefreshedSession,stripSessionMaterial} from '@/lib/processes/session-refresh';
 import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
 import {sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
@@ -622,7 +622,8 @@ async function accountWorkerPost(owner:string,accountId:string,path:string,body:
   const result=await workerPost(path,{...body,accountId},timeoutMs);
   await persistRefreshedSession(owner,accountId,result);
   await applyFloodCooldown(owner,accountId,result);
-  return result;
+  // Callers echo the result to the browser: session material stops here, once persisted.
+  return stripSessionMaterial(result);
  }finally{
   await releaseQuietly(owner,lease);
  }

@@ -154,14 +154,16 @@ async function tryJoin(
       { action: "join_group", id },
       timeoutMs,
     );
-    if (j?.ok || j?.pending) return { joined: 1, rejoinId: "" };
-    if (j?.rejoinItem?.id) return { joined: 0, rejoinId: String(j.rejoinItem.id) };
-    return { joined: 0, rejoinId: "" };
+    if (j?.ok || j?.pending) return { joined: 1, rejoinId: "", error: "" };
+    const error = String(j?.error || j?.result?.error || "не вступил").slice(0, 160);
+    if (j?.rejoinItem?.id) return { joined: 0, rejoinId: String(j.rejoinItem.id), error };
+    return { joined: 0, rejoinId: "", error };
   } catch (e) {
     const data = (e as any)?.data;
-    if (data?.rejoinItem?.id) return { joined: 0, rejoinId: String(data.rejoinItem.id) };
+    const error = String(data?.error || (e as Error)?.message || e).slice(0, 160);
+    if (data?.rejoinItem?.id) return { joined: 0, rejoinId: String(data.rejoinItem.id), error };
     if (isAbort(e)) throw e;
-    return { joined: 0, rejoinId: "" };
+    return { joined: 0, rejoinId: "", error };
   }
 }
 
@@ -307,6 +309,7 @@ async function tickOwner(
       try {
         const r = await tryJoin(origin, cookie, item.id, opTimeout(JOIN_TIMEOUT_MS));
         joined += r.joined;
+        if (r.error) errors.push(`join ${item.name || item.id.slice(0, 8)}: ${r.error}`);
         if (r.rejoinId && r.rejoinId !== item.id) {
           extraReassigned++;
           pendingJoins.add(r.rejoinId);
@@ -417,11 +420,16 @@ async function tickOwner(
       }
     }
 
+    const summary =
+      `Автообход: вступил ${joined}/${Math.min(rejoin.length, MAX_JOINS)}, ` +
+      `в очереди ${rejoin.length}, возвращено ${Number(pack.restored) || 0}, ` +
+      `просканировано ${scanned}, лидов +${added}` +
+      (errors.length ? ` · ошибки: ${errors.slice(0, 3).join(" | ")}` : "");
     try {
       await workspace(
         origin,
         cookie,
-        { action: "mark_auto_rescan" },
+        { action: "mark_auto_rescan", summary, hasErrors: errors.length > 0 },
         Math.min(MARK_TIMEOUT_MS, Math.max(3_000, left())),
       );
     } catch (e) {
@@ -433,7 +441,7 @@ async function tickOwner(
       stoppedEarly ||
       due > ids.length ||
       extraReassigned > 0 ||
-      (pendingJoins.size > 0 && joined > 0);
+      pendingJoins.size > 0;
     return {
       ok: true,
       scanned,

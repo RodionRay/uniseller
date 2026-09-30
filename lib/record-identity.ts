@@ -102,12 +102,18 @@ export function duplicateReason(kind: string, incoming: any, existing: any): str
   return null;
 }
 
-export function findDuplicate<T extends { id: string; data: any }>(
+export function findDuplicate<T extends { id: string; data: any; kind?: string }>(
   kind: string,
   incoming: any,
   rows: T[],
   excludeId?: string,
 ): T | undefined {
   if (!isDuplicateKind(kind)) return undefined;
-  return rows.find((row) => row.id !== excludeId && !!duplicateReason(kind, incoming, row.data));
+  return rows.find(
+    (row) =>
+      row.id !== excludeId &&
+      // Нельзя сверять audience_task с group и т.п. — один t.me ключ, разные сущности
+      (row.kind == null || row.kind === kind) &&
+      !!duplicateReason(kind, incoming, row.data),
+  );
 }

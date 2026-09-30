@@ -61,6 +61,7 @@ beforeEach(() => {
   resetHarness();
   vi.stubEnv("CRON_SECRET", CRON_SECRET);
   vi.stubEnv("SESSION_SECRET", SESSION_SECRET);
+  vi.stubEnv("APP_URL", "https://crm.example.com");
   vi.spyOn(console, "error").mockImplementation(() => undefined);
 });
 afterEach(() => {
@@ -114,5 +115,35 @@ describe("cron auto-rescan (REQ-B7)", () => {
     vi.stubEnv("NODE_ENV", "development");
     vi.stubEnv("CRON_SECRET", "");
     expect((await POST(cronRequest(SESSION_SECRET))).status).toBe(503);
+  });
+});
+
+describe("auto-rescan self-call origin", () => {
+  function spoofedHost() {
+    return new Request("http://evil.example/api/cron/auto-rescan", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CRON_SECRET}`, host: "evil.example" },
+      body: "{}",
+    });
+  }
+
+  // Minted session cookies must go only to the app itself, never to a host taken from the request.
+  it("sends minted sessions to APP_URL whatever the request host", async () => {
+    mockWorkspace();
+    await POST(spoofedHost());
+    const fetchMock = vi.mocked(fetch);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect(new URL(String(url)).origin).toBe("https://crm.example.com");
+      expect(new Headers(init?.headers).get("origin")).toBe("https://crm.example.com");
+    }
+  });
+
+  it("refuses to run without APP_URL instead of trusting the request host", async () => {
+    mockWorkspace();
+    vi.stubEnv("APP_URL", "");
+    const res = await POST(spoofedHost());
+    expect(res.status).toBe(503);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 });

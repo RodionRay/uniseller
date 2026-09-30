@@ -5,6 +5,7 @@ import {
   readEnv,
   sessionCookieName,
 } from "@/lib/auth";
+import { appOrigin } from "@/lib/env";
 import { listUserIdsForCron } from "@/lib/users";
 import { constantTimeEqual } from "@/lib/security/secret-compare";
 import { database } from "@/lib/server-store";
@@ -164,7 +165,11 @@ export async function POST(req: Request) {
     return reply({ error: "Unauthorized" }, 401);
   }
 
-  const origin = new URL(req.url).origin;
+  // Minted session cookies go only to the configured app origin, never to the request's host.
+  const origin = appOrigin();
+  if (!origin) {
+    return reply({ error: "APP_URL не настроен" }, 503);
+  }
   const force =
     new URL(req.url).searchParams.get("force") === "1" ||
     (await req

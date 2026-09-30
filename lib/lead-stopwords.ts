@@ -5,6 +5,11 @@
  * product's own vocabulary ("остатков", "озон", "селлер", "нал", "бот" …) to the stop-lists, and
  * every scan then dropped exactly the messages we look for. A minus candidate is rejected here when
  * it is short, generic, marketplace context, or overlaps the positive settings of the assistant.
+ *
+ * The same filter runs at read time ({@link scanStopTerms}), so it also drops what older auto-learning
+ * left behind: everyday chat words ("список", "личку", "пишите"), date fragments ("2026 года") and
+ * n-gram shards of rejected messages ("почему решили", "тариф лучше"). What auto-learning may add
+ * from now on is narrower still: {@link learnableMinusTerms}.
  */
 
 import {
@@ -57,6 +62,36 @@ const GENERIC_WORDS = new Set([
   // function words
   "для", "при", "про", "без", "или", "это", "эти", "тут", "там", "уже", "еще", "все", "вот",
   "так", "тоже", "также", "очень", "если", "чтобы", "меня", "мне", "нас", "вас", "вам", "нам",
+  // everyday chat vocabulary: present in requests and chatter alike
+  "список", "списка", "списке", "списком", "списки", "личку", "личка", "личке", "лс", "пишите",
+  "напишите", "пиши", "напиши", "пишу", "фото", "фотки", "фотографии", "оплата", "оплату", "оплаты",
+  "новости", "новость", "клиент", "клиента", "клиенту", "клиенты", "клиентов", "человек", "люди",
+  "сообщение", "сообщения", "ссылка", "ссылку", "группа", "группе", "чат", "чате", "канал", "тема",
+  "теме", "вопросы", "ответ", "ответы", "оставлять", "оставить", "оставьте", "сегодня", "завтра",
+  "вчера", "сейчас",
+]);
+
+/**
+ * Sentence glue: question words, comparatives, short adjectives, auxiliaries, pronouns. A phrase that
+ * contains one is a shard cut out of a sentence ("почему решили", "корова способна", "тариф лучше"),
+ * never a topic, so it only ever matched the one message it was cut from.
+ */
+const GLUE_WORDS = new Set([
+  "кто", "что", "как", "где", "когда", "почему", "зачем", "какой", "какая", "какое", "какие", "сколько",
+  "лучше", "хуже", "больше", "меньше", "дешевле", "дороже", "быстрее", "проще", "сложнее",
+  "способна", "способен", "способны", "готов", "готова", "готовы", "должен", "должна", "должны",
+  "можно", "нужно", "надо", "было", "была", "были", "будет", "будут", "решили", "решил", "решила",
+  "сделал", "сделали", "сказал", "сказали", "хотел", "хотели", "стал", "стали", "который", "которая",
+  "которые", "которых", "этот", "эта", "этого", "этом", "свой", "свои", "наш", "ваш", "мой", "твой",
+  "просто", "только", "именно", "даже", "вообще", "реально", "сразу", "потом", "теперь", "тоже",
+]);
+
+/** Calendar words: with numbers they form date fragments ("2026 года", "сентября 2026"), never a topic. */
+const DATE_WORDS = new Set([
+  "год", "года", "году", "годов", "лет", "г", "гг",
+  "январь", "января", "февраль", "февраля", "март", "марта", "апрель", "апреля", "май", "мая",
+  "июнь", "июня", "июль", "июля", "август", "августа", "сентябрь", "сентября", "октябрь", "октября",
+  "ноябрь", "ноября", "декабрь", "декабря",
 ]);
 
 /** Marketplace / seller context: the audience's background vocabulary (closed list, whole words). */
@@ -66,8 +101,22 @@ const CONTEXT_WORDS = new Set([
   "маркетплейсе", "маркетплейсы", "маркетплейсов", "маркетплейсам", "маркетплейсах", "мегамаркет",
   "megamarket", "селлер", "селлера", "селлеру", "селлеры", "селлеров", "селлерам", "селлерами",
   "seller", "sellers", "товар", "товара", "товары", "товаров", "товаре", "товарам", "склад",
-  "склада", "складе", "склады", "складов",
+  "склада", "складе", "склады", "складов", "карточка", "карточки", "карточек", "карточку", "карточке",
+  "карточкам", "карточками", "инфографика", "инфографики", "инфографику", "инфографикой", "отзыв",
+  "отзыва", "отзывы", "отзывов", "отзывам", "заказ", "заказа", "заказы", "заказов",
 ]);
+
+/**
+ * Single words that are off-topic for any seller audience (spam, crypto, esoterics, jobs, travel).
+ * Auto-learning adds a single word only from this lexicon; everything else must be a phrase.
+ */
+const OFF_TOPIC_WORD_RE =
+  /^(?:ваканси\p{L}*|резюме|казино|крипт\p{L}*|usdt|usdc|btc|биткоин\p{L}*|bitcoin|форекс|forex|трейдинг\p{L}*|таро|гадани\p{L}*|гадалк\p{L}*|астролог\p{L}*|нумеролог\p{L}*|эзотерик\p{L}*|накрутк\p{L}*|букмекер\p{L}*|беттинг\p{L}*|микрозайм\p{L}*|займ\p{L}*|бали|visa|рупи[ийяюе]|эскорт\p{L}*|порно\p{L}*|интим\p{L}*)$/u;
+
+/** Auto-learning takes at most this many terms per action; the list is capped by scan anyway. */
+export const MAX_LEARNED_MINUS_TERMS = 8;
+/** Longer learned "phrases" are pasted message fragments, not stop phrases. */
+const MAX_LEARNED_PHRASE_WORDS = 4;
 
 function wordsOf(text: string): string[] {
   return normalizeYo(text.toLowerCase())
@@ -102,7 +151,8 @@ function protectedVocabulary(settings: StopListSettings): ProtectedVocabulary {
 }
 
 function isContentWord(word: string): boolean {
-  return word.length >= MIN_CONTENT_WORD_LENGTH && !GENERIC_WORDS.has(word);
+  if (word.length < MIN_CONTENT_WORD_LENGTH || GENERIC_WORDS.has(word)) return false;
+  return !DATE_WORDS.has(word) && !/^\d+$/u.test(word);
 }
 
 /** Same 5-letter stem ("остатков" ~ "остатки"), a fragment of a protected word ("склад" in "мойсклад"), or context. */
@@ -117,7 +167,9 @@ function isProtectedWord(word: string, vocab: ProtectedVocabulary): boolean {
 function rejectsCandidate(candidate: string, vocab: ProtectedVocabulary): boolean {
   if (candidate.length < MIN_CANDIDATE_LENGTH || candidate.length > MAX_MINUS_TERM_LENGTH) return true;
   if (WEAK_PLUS_TERMS.has(candidate)) return true;
-  const content = wordsOf(candidate).filter(isContentWord);
+  const words = wordsOf(candidate);
+  if (words.length > 1 && words.some((w) => GLUE_WORDS.has(w))) return true;
+  const content = words.filter(isContentWord);
   if (!content.length) return true;
   // The whole candidate sits inside a positive term ("синхронизация остатков" ⊃ "остатков").
   if (vocab.terms.some((p) => p.includes(candidate))) return true;
@@ -150,6 +202,25 @@ export function sanitizeMinusTerms(
     if (!rejectsCandidate(key, vocab)) out.push(original);
   }
   return out;
+}
+
+/**
+ * What auto-learning (reject / train actions) may append to the stop-lists: sanitized candidates that
+ * are either a short phrase (2–{@link MAX_LEARNED_PHRASE_WORDS} words) or a single clearly off-topic
+ * word, at most {@link MAX_LEARNED_MINUS_TERMS}. An ordinary single word from a rejected message
+ * ("список", "корова") is never learned: it hits every chat that happens to use it.
+ */
+export function learnableMinusTerms(
+  candidates: readonly string[],
+  settings: StopListSettings,
+): string[] {
+  return sanitizeMinusTerms(candidates, settings)
+    .filter((term) => {
+      const words = wordsOf(term);
+      if (words.length === 1) return OFF_TOPIC_WORD_RE.test(words[0] as string);
+      return words.length <= MAX_LEARNED_PHRASE_WORDS;
+    })
+    .slice(0, MAX_LEARNED_MINUS_TERMS);
 }
 
 function csvTerms(raw: string): string[] {

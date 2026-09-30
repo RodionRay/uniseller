@@ -22,7 +22,7 @@ import {
  type LeadCoreSettings,
 } from '@/lib/lead-core';
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew,parseKeywordCsv} from '@/lib/ai-keywords';
-import {sanitizeMinusTerms,scanStopTerms} from '@/lib/lead-stopwords';
+import {learnableMinusTerms,sanitizeMinusTerms,scanStopTerms} from '@/lib/lead-stopwords';
 import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,floodWaitSeconds,generateTelegramUsername,hasChatQuota,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isDayLimitCooldown,isFloodCooldown,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeStatusFilters,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
 import {canonicalizeTgUrl,duplicateReason,isDuplicateKind,telegramEntityKey} from '@/lib/record-identity';
@@ -2618,7 +2618,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   const learnedKeywords=mergeKeywordsPreferNew(settings.keywords||'',plusAdd,8000);
   const learnedExamples=appendLearnExamples(settings.learnExamples||'',learnBits).slice(0,4000);
   const learnedSignals=mergeKeywordsPreferNew(settings.hotSignals||'',plusAdd.slice(0,8),4000);
-  minusAdd=sanitizeMinusTerms(minusAdd,{...settings,keywords:learnedKeywords,learnExamples:learnedExamples,hotSignals:learnedSignals});
+  minusAdd=learnableMinusTerms(minusAdd,{...settings,keywords:learnedKeywords,learnExamples:learnedExamples,hotSignals:learnedSignals});
   const next={
    ...settings,
    keywords:learnedKeywords,
@@ -2663,8 +2663,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
     }
    }catch{/* heuristic only */}
   }
-  // Не пускать в стоп-лист слова продукта/плюса/контекста маркетплейсов — иначе скан режет целевые лиды
-  minusAdd=sanitizeMinusTerms(minusAdd,settings);
+  // Только фразы и явно чужие слова: частые слова игнора («список», «личку») и слова продукта режут целевые лиды
+  minusAdd=learnableMinusTerms(minusAdd,settings);
   const next={
    ...settings,
    minusKeywords:mergeKeywordsPreferNew(settings.minusKeywords||'',minusAdd,8000),
@@ -2696,8 +2696,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
   };
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(leadNext),owner,id,'lead').run();
 
-  // 2) Стоп-слова из этого сообщения
-  let minusAdd=extractStopTermsFromMessage(msg,{max:8,plusKeywords:settings.keywords||''});
+  // 2) Стоп-слова: из текста — только отдельные слова (n-граммы сообщения — обрывки фраз, не учим), от AI — фразы
+  let minusAdd=extractStopTermsFromMessage(msg,{max:40,plusKeywords:settings.keywords||''}).filter(t=>!/\s/.test(t));
   const apiKey=await resolveApiKey(owner,config);
   if(apiKey){
    try{
@@ -2718,16 +2718,11 @@ export async function POST(req:Request){const session=await getSessionUser();con
     }
    }catch{/* heuristic only */}
   }
-  // Без коротких/общих слов, контекста маркетплейсов и терминов продукта (уникальные, порядок сохранён)
+  // Только фразы и явно чужие слова; без общих слов, дат, обрывков, контекста маркетплейсов и терминов продукта
   const minusCandidates=minusAdd.map(t=>String(t||'').trim().slice(0,60)).filter(Boolean);
-  minusAdd=sanitizeMinusTerms(minusCandidates,settings).slice(0,10);
-  // UI: «ничего не добавлено — слова пересекаются с продуктом» vs «уже были в минусе»
+  minusAdd=learnableMinusTerms(minusCandidates,settings);
+  // UI: «ничего не добавлено — слова общие или пересекаются с продуктом» vs «новых стоп-слов нет»
   const minusSkippedAsProduct=minusAdd.length?0:minusCandidates.length;
-  // Если всё уже было в минусе — всё равно добавим короткую цитату-фразу из сообщения
-  if(!minusAdd.length){
-   const clip=msg.replace(/\s+/g,' ').trim().slice(0,48).toLowerCase();
-   if(clip.length>=8)minusAdd=sanitizeMinusTerms([clip],settings);
-  }
 
   const next={
    ...settings,

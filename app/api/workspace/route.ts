@@ -4219,6 +4219,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      }
     }
 
+    // accessHash сессионный — валиден только для слота, который видел peer
+    const accessHash=cand.preferredAccountId&&cand.preferredAccountId===activeAccountId?String(cand.accessHash||''):'';
     let result=await workerPost('/send-message',{
      ...payload,
      mode:deliveryMode,

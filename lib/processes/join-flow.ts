@@ -270,6 +270,8 @@ export type MissingTrackedGroup = {
   joinStateError?: string;
   usernameMissing?: boolean;
   joinMissingAccounts?: unknown;
+  /** Accounts that answered «account blind» on this group: skipped on retries, never counted as a dead link. */
+  joinBlindAccounts?: unknown;
   joinDead?: boolean;
 };
 
@@ -308,11 +310,38 @@ export function recordUsernameMissing(
 
 /**
  * The worker says «account blind» when the control @telegram does not resolve either — but a dead @username
- * made every farm account look blind (e2e 2026-09-30). Trust the verdict only from the group's first witness;
- * later accounts are counted as «не видит @» for the group, so one bad link blinds at most one account.
+ * made every farm account look blind (e2e 2026-09-30). Trust the verdict only from the group's first witness,
+ * so one link blinds at most one account.
  */
 export function trustAccountBlind(group: MissingTrackedGroup, accountId: string): boolean {
-  return missingAccountsOf(group).every((id) => id === String(accountId || ""));
+  const self = String(accountId || "");
+  return [...missingAccountsOf(group), ...blindAccountsOf(group)].every((id) => id === self);
+}
+
+export function blindAccountsOf(group: MissingTrackedGroup): string[] {
+  const raw = Array.isArray(group.joinBlindAccounts) ? group.joinBlindAccounts : [];
+  return [...new Set(raw.map((x) => String(x || "")).filter(Boolean))].slice(0, 20);
+}
+
+/**
+ * Blind answers are kept apart from «не видит @»: a really blind farm (proxy region, Telegram limit) must not
+ * turn live groups into dead links — only a real «не видит @» counts towards USERNAME_DEAD_AFTER_ACCOUNTS.
+ */
+export function recordBlindWitness(group: MissingTrackedGroup, accountId: string): { joinBlindAccounts: string[] } {
+  return { joinBlindAccounts: [...new Set([...blindAccountsOf(group), String(accountId || "")].filter(Boolean))] };
+}
+
+/** Accounts not to retry this group with: those that could not see it and those that were blind on it. */
+export function triedAccountsOf(group: MissingTrackedGroup): Set<string> {
+  return new Set([...missingAccountsOf(group), ...blindAccountsOf(group)]);
+}
+
+/**
+ * Every usable account is blind on the group and none really missed it: wait out the blind cooldown, then
+ * retry with a clean list (at most one more account blinded per cooldown).
+ */
+export function blindDeferPatch(now = Date.now()): { joinBlindAccounts: string[]; joinNextAt: string; joinState: string; joinStateAt: string } {
+  return { joinBlindAccounts: [], joinNextAt: new Date(now + ACCOUNT_BLIND_COOLDOWN_MS).toISOString(), joinState: "", joinStateAt: "" };
 }
 
 /** Group leaves the auto-queue as a dead link (owner approval or a new URL brings it back). */

@@ -62,25 +62,44 @@ describe('мёртвый @username не слепит всю ферму',()=>{
     vi.unstubAllEnvs();
   });
 
-  it('слепым помечается не больше одного аккаунта, группа засчитывает каждого и умирает',async()=>{
-    for(let i=0;i<ACCS.length;i++){
+  it('слепым помечается не больше одного аккаунта; одни «слепые» ответы ссылку мёртвой не делают',async()=>{
+    for(let i=0;i<ACCS.length+2;i++){
       await POST(postRequest({action:'join_group',id:GROUP}));
       skipPacing();
     }
 
     const blind=ACCS.filter(id=>isAccountResolveBlind(rec(id)));
     expect(blind.length).toBeLessThanOrEqual(1);
-    expect(rec(GROUP).joinDead).toBe(true);
+    // Слепая ферма (прокси/регион) не должна убивать живые группы: откладываем, а не хороним.
+    expect(rec(GROUP).joinDead||false).toBe(false);
     expect(joinCalls).toBeLessThanOrEqual(ACCS.length);
   },15_000);
 
-  it('после смерти ссылки воркер больше не зовётся',async()=>{
-    for(let i=0;i<ACCS.length+2;i++){
+  it('отложенная из-за слепоты группа ждёт отлёжку, а не долбит ферму',async()=>{
+    for(let i=0;i<ACCS.length+1;i++){
+      await POST(postRequest({action:'join_group',id:GROUP}));
+      if(i<ACCS.length-1)skipPacing();
+    }
+
+    expect(Date.parse(rec(GROUP).joinNextAt)).toBeGreaterThan(Date.now()+5*3600_000);
+  },15_000);
+
+  it('реальное «не видит @» плюс «слепые» ответы — ссылка мёртвая',async()=>{
+    let n=0;
+    vi.stubGlobal('fetch',vi.fn(async(url:string)=>{
+      if(!String(url).endsWith('/join-group'))return Response.json({ok:false,error:'not stubbed'},{status:500});
+      joinCalls++;
+      return Response.json(n++===0
+        ?{ok:false,status:'error',join:'missing',usernameMissing:true,error:'Слот не видит @dead_link_chat'}
+        :BLIND_ON_DEAD_LINK);
+    }));
+    for(let i=0;i<ACCS.length+1;i++){
       await POST(postRequest({action:'join_group',id:GROUP}));
       skipPacing();
     }
 
-    expect(joinCalls).toBeLessThanOrEqual(ACCS.length);
+    expect(rec(GROUP).joinDead).toBe(true);
+    expect(ACCS.filter(id=>isAccountResolveBlind(rec(id)))).toHaveLength(0);
   },15_000);
 });
 

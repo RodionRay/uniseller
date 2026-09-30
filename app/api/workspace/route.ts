@@ -8,7 +8,7 @@ import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
 import {mergeRefreshedSession,stripSessionMaterial} from '@/lib/processes/session-refresh';
 import {appTimeoutForWorker,proxyCheckTimeoutMs,workerSlots} from '@/lib/processes/worker-timeouts';
 import {catalogForProject,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
-import {JOIN_SUCCESS_PATCH,type JoinAccountState,type JoinProxyState,evaluateAccountJoinReadiness,isJoinFarmCandidate,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,classifyJoinFailure,deadLinkPatch,isAccountBlindResult,isAccountResolveBlind,isUsernameMissingResult,joinFailurePatch,missingAccountsOf,planGroupHeal,recordUsernameMissing,sanitizeJoinStateError,seedMissingAccounts,trustAccountBlind} from '@/lib/processes/join-flow';
+import {JOIN_SUCCESS_PATCH,type JoinAccountState,type JoinProxyState,evaluateAccountJoinReadiness,isJoinFarmCandidate,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,classifyJoinFailure,deadLinkPatch,isAccountBlindResult,isAccountResolveBlind,isUsernameMissingResult,joinFailurePatch,missingAccountsOf,planGroupHeal,recordUsernameMissing,sanitizeJoinStateError,seedMissingAccounts,trustAccountBlind,recordBlindWitness,triedAccountsOf,blindDeferPatch} from '@/lib/processes/join-flow';
 import {buildRelevanceProfile,compareJoinPriority,joinGateFor,rescoreGroup,seedRejoin,type JoinGateState} from '@/lib/join-relevance';
 import {JOIN_RESERVE_MS,accountJoinWaitSec,channelsTooMuchPatch,joinAttemptPatch,farmThroughput,joinErrorPatch,joinFloodPatch,joinSuccessPatch,planJoinFarm,type FarmAccount} from '@/lib/join-pacing';
 import {database,seal,unseal} from '@/lib/server-store';
@@ -1462,7 +1462,7 @@ async function patchAccount(owner:string,accountId:string,patch:Record<string,un
 
 /** Владелец одобрил вступление: снимаем «мёртвую ссылку» и отказ — это явная повторная попытка. */
 function approvedJoinPatch(gdata:any){
- return {...gdata,joinDecision:'approved',joinWanted:true,joinDead:false,joinMissingAccounts:[],...(gdata.joinDead||gdata.joinGaveUp?JOIN_SUCCESS_PATCH:{})};
+ return {...gdata,joinDecision:'approved',joinWanted:true,joinDead:false,joinMissingAccounts:[],joinBlindAccounts:[],...(gdata.joinDead||gdata.joinGaveUp?JOIN_SUCCESS_PATCH:{})};
 }
 
 /** Ошибка вступления на стороне аккаунта: +1 к серии; на пороге — пауза автовступлений (lib/join-pacing). */
@@ -1517,7 +1517,7 @@ async function healDeadGroupAccounts(owner:string){
    const aid=String(d.accountId||'');
    const prev=String(d.joinedAccountId||'');
    const action=planGroupHeal({
-    // «Целевая» = пропущена фильтром релевантности (авто / одобрена / восстановление членства).
+    // «Целевая» = пропущена фильтром релевантности (поставлена владельцем / одобрена / восстановление членства).
     group:{...d,joinWanted:joinGateFor(d).allow},
     accountStatus:aid&&accStatus.has(aid)?accStatus.get(aid)!:null,
     previousAccountStatus:prev&&accStatus.has(prev)?accStatus.get(prev)!:null,
@@ -1546,7 +1546,7 @@ async function healDeadGroupAccounts(owner:string){
     enqueue(gid,name,d);
     continue;
    }
-   // Вступившие группы фильтр не трогает; невступившие — только разрешённые гейтом (авто / одобрено).
+   // Вступившие группы фильтр не трогает; невступившие — только разрешённые гейтом (поставлены владельцем / одобрены).
    const gate=joinGateFor(d);
    if(action==='reassign'){
     if(!liveIds.length)continue;
@@ -2052,7 +2052,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    // Группа ещё не оценена (добавлена после автопочинки) или настройки менялись — оцениваем сейчас.
    const scored=rescoreGroup(gdata,await loadRelevanceProfile(owner));
    if(scored)gdata={...gdata,joinRelevance:scored.joinRelevance};
-   // Фильтр релевантности: вступаем только в «авто» и одобренные владельцем (lib/join-relevance).
+   // Фильтр релевантности: вступаем только в поставленные владельцем в очередь; «Рекомендуем» ждёт его (lib/join-relevance).
    const gate=joinGateFor(gdata);
    if(!gate.allow){
     if(gdata.joinState||scored){
@@ -2092,7 +2092,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    adata=reserved;
   }else{
    // Параллельно по аккаунтам, последовательно на аккаунт и прокси: свой слот, если готов, иначе ферма.
-   const exclude=new Set(missingAccountsOf(gdata));
+   const exclude=triedAccountsOf(gdata);
    const plan=planJoinFarm(farm,{exclude});
    const ready=plan.filter(c=>c.waitSec===0);
    ready.sort((x,y)=>Number(y.id===String(gdata.accountId))-Number(x.id===String(gdata.accountId)));
@@ -2114,6 +2114,12 @@ export async function POST(req:Request){const session=await getSessionUser();con
     if(!plan.length&&exclude.size&&planJoinFarm(farm).length){
      // Пусто только из-за аккаунтов, которые уже не видели @ этой группы: это ссылка, а не лимит фермы.
      const untried=farm.filter(a=>isAccountUsable(a.data)&&!exclude.has(a.id));
+     if(!untried.length&&!missingAccountsOf(gdata).length){
+      // Все пробовавшие были «слепы», реального «не видит @» нет: это ферма, а не ссылка — ждём отлёжку.
+      const deferred={...gdata,...blindDeferPatch()};
+      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(deferred),owner,id,'group').run();
+      return reply({error:'Все аккаунты фермы слепы на @username этой группы — повторим после отлёжки',deferred:true,accountBlind:true,group:deferred},409);
+     }
      if(!untried.length){
       const msg=`Ссылка не открывается: все ${exclude.size} рабочих аккаунта не видят группу — проверьте ссылку`;
       const dead={...gdata,...deadLinkPatch(msg)};
@@ -2169,7 +2175,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    const result=await accountWorkerPost(owner,accountId,'/join-group',{...payload,url:gdata.url});
    const frozen=result.status==='frozen'||result.join==='frozen'||/FROZEN|заморожен/i.test(String(result.error||''));
    const flood=floodWaitSeconds(result)>0||result.join==='flood'||/FloodWait/i.test(String(result.error||''));
-   // Слеп аккаунт, а не группа — попытку группе не засчитываем (иначе живые группы уходят в отказ)
+   // Слеп аккаунт, а не группа — в «не видит @» не засчитываем (иначе живые группы уходят в отказ), только в joinBlindAccounts
    const accountBlind=isAccountBlindResult(result);
    // Сессия/прокси/коннект упали — вина аккаунта, не группы (frozen обрабатывается ниже)
    const sessionFault=!frozen&&!result.ok&&JOIN_ACCOUNT_FAULT_STATUSES.includes(String(result.status||''));
@@ -2199,9 +2205,10 @@ export async function POST(req:Request){const session=await getSessionUser();con
    };
    // «Слот не видит @»: считаем разные аккаунты; после K — ссылка мёртвая, ферму больше не жжём.
    let deadLink=false;
-   // «Слеп аккаунт» от второго и следующих аккаунтов на той же ссылке — это мёртвая ссылка, а не ферма.
+   // «Слеп аккаунт» верим только от первого пробовавшего эту группу: мёртвая ссылка слепит не больше одного аккаунта.
    const blindTrusted=accountBlind&&trustAccountBlind(gdata,accountId);
-   if(!joinedOk&&(accountBlind||isUsernameMissingResult(result))){
+   if(accountBlind)next={...next,...recordBlindWitness(gdata,accountId)};
+   if(!joinedOk&&!accountBlind&&isUsernameMissingResult(result)){
     const step=recordUsernameMissing(gdata,accountId,String(result.error||''));
     next={...next,...step.patch};
     deadLink=step.dead;
@@ -5568,7 +5575,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    // Новая ссылка/название → оценку пересчитает автопочинка; исправленная ссылка снова пробуется.
    if(sameUrl&&String(prev.name||'')===data.name&&prev.joinRelevance!==undefined)data.joinRelevance=prev.joinRelevance;
    if(sameUrl){
-    for(const k of ['joinDead','joinMissingAccounts'])if(prev[k]!==undefined)data[k]=prev[k];
+    for(const k of ['joinDead','joinMissingAccounts','joinBlindAccounts'])if(prev[k]!==undefined)data[k]=prev[k];
    }
   }catch{/* */}
  }

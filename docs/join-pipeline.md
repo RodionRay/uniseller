@@ -99,10 +99,12 @@ goes only to an untried account (join: farm `exclude`; scan: rotation). After
 `USERNAME_DEAD_AFTER_ACCOUNTS` = 3 the group is marked `joinDead` and leaves the auto-queue with the
 reason «Ссылка не открывается …». Approving it (or editing its link) clears the mark and retries.
 `seedMissingAccounts` migrates groups that failed before tracking existed.
-The worker's «account blind» verdict (control @telegram does not resolve either) is counted for the group
-too, and trusted only from the group's first witness (`trustAccountBlind`): later accounts get a half gap
-instead of the 6 h `resolveBlindUntil`, so one dead link blinds at most one account (e2e 2026-09-30:
-@marketplace_wbchat blinded 3 accounts). When every usable account is
+The worker's «account blind» verdict (control @telegram does not resolve either) is trusted only from the
+group's first witness (`trustAccountBlind`, 6 h `resolveBlindUntil`); later accounts get a half gap, so one dead
+link blinds at most one account (e2e 2026-09-30: @marketplace_wbchat blinded 3). Blind answers go to
+`joinBlindAccounts` (`recordBlindWitness`), not to the dead-link count: they are skipped on retries
+(`triedAccountsOf`), and when only blind accounts tried the group it is deferred for the blind cooldown with a
+clean list (`blindDeferPatch`), never marked dead — a really blind farm must not bury live groups. When every usable account is
 already in the tried list the group is marked dead at once (small farms); when untried accounts exist but
 are capped/paused the group is deferred (`409 {deferred:true}`, retried in 30 min) — never reported as a
 farm-wide limit.

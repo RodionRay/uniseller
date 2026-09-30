@@ -13,6 +13,8 @@ export const WORK_DIR_PREFIX = "uniseller-acc-";
 export const MIN_TOKEN_LENGTH = 32;
 const DEFAULT_MAX_BODY_BYTES = 6_000_000;
 const DEFAULT_MAX_CONCURRENCY = 4;
+// Requests beyond the running slots wait here; the UI fires ~8 proxy checks at once.
+const DEFAULT_MAX_QUEUE = 64;
 const DEFAULT_MAX_STDOUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5_000;
 const GENERIC_WORKER_ERROR = "Ошибка воркера (нет ответа)";
@@ -60,6 +62,7 @@ export function resolveConfig(env) {
     port: Number(env.TG_WORKER_PORT || 8790),
     extraHosts,
     maxConcurrency: positiveInt(env.TG_WORKER_MAX_CONCURRENCY, DEFAULT_MAX_CONCURRENCY),
+    maxQueue: nonNegativeInt(env.TG_WORKER_MAX_QUEUE, DEFAULT_MAX_QUEUE),
     maxBodyBytes: positiveInt(env.TG_WORKER_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES),
   };
 }
@@ -68,6 +71,13 @@ export function resolveConfig(env) {
 function positiveInt(raw, fallback) {
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+/** @param {string | undefined} raw @param {number} fallback */
+function nonNegativeInt(raw, fallback) {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
 /**
@@ -264,6 +274,22 @@ function isJson(contentType) {
  */
 export function createWorkerServer(config, deps) {
   let active = 0;
+  /** @type {Array<() => void>} */
+  const waiters = [];
+  const queueFull = () => active >= config.maxConcurrency && waiters.length >= config.maxQueue;
+  /** Resolves when a Python slot is free; FIFO. */
+  const acquire = () => {
+    if (active < config.maxConcurrency) {
+      active += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => waiters.push(() => resolve(undefined)));
+  };
+  const release = () => {
+    const next = waiters.shift();
+    if (next) next();
+    else active -= 1;
+  };
 
   /** @param {import("node:http").IncomingMessage} req */
   const hostAllowed = (req) => {
@@ -301,29 +327,30 @@ export function createWorkerServer(config, deps) {
       req.resume();
       return send(413, { ok: false, error: "Payload too large" }, { Connection: "close" });
     }
-    if (active >= config.maxConcurrency) {
+    if (queueFull()) {
       req.resume();
       return send(429, { ok: false, error: "Воркер занят, повторите позже" }, { "Retry-After": "5" });
     }
-    active += 1;
+    // Read the body before queueing so a waiting request can't hit requestTimeout.
+    let payload;
     try {
       const raw = await readBody(req, config.maxBodyBytes);
       if (raw === null) return send(413, { ok: false, error: "Payload too large" }, { Connection: "close" });
-      let payload;
-      try {
-        payload = JSON.parse(raw.toString("utf8"));
-      } catch {
-        return send(400, { ok: false, error: "Invalid JSON" });
-      }
-      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        return send(400, { ok: false, error: "Invalid JSON" });
-      }
-      payload.action = action;
+      payload = JSON.parse(raw.toString("utf8"));
+    } catch {
+      return send(400, { ok: false, error: "Invalid JSON" });
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return send(400, { ok: false, error: "Invalid JSON" });
+    }
+    payload.action = action;
+    await acquire();
+    try {
       return send(200, await deps.runPython(payload, timeoutForAction(/** @type {string} */ (action))));
     } catch {
       return send(500, { ok: false, error: GENERIC_WORKER_ERROR });
     } finally {
-      active -= 1;
+      release();
     }
   });
   // Slow senders must not pin a concurrency slot while the body trickles in.

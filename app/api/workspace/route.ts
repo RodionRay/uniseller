@@ -418,6 +418,8 @@ async function runProxyCheck(owner:string,id:string){
  const input={host:data.host,port:Number(data.port),protocol:data.protocol==='http'?'http':'socks5' as const,username:data.username||'',password};
  // Только через tg-worker: в vinext/CF исходящий TCP к прокси даёт jsg.Error
  let result:{ok:boolean;latencyMs:number;exitIp?:string;error?:string;telegramOk?:boolean;protocol?:string;warning?:string};
+ // Worker busy/down/timeout says nothing about the proxy: keep its previous status.
+ let inconclusive=false;
  try{
   const wr=await workerPost('/check-proxy',input,15_000);
   result={
@@ -432,6 +434,7 @@ async function runProxyCheck(owner:string,id:string){
  }catch(e){
   const msg=String((e as Error).message||e);
   const workerDown=/ECONNREFUSED|fetch failed|AbortError|timeout|воркер/i.test(msg);
+  inconclusive=workerDown;
   result={
    ok:false,
    latencyMs:0,
@@ -449,18 +452,20 @@ async function runProxyCheck(owner:string,id:string){
    error:'Сбой проверки в среде кабинета. Нужен Telegram-воркер (он стартует с npm run dev) и верный логин/пароль прокси.',
   };
  }
- const next={
-  ...data,
-  status:result.ok?'active':'inactive',
-  protocol:result.protocol||data.protocol||'socks5',
-  exitIp:result.exitIp||data.exitIp||'',
-  lastChecked:new Date().toISOString(),
-  checkError:result.ok
-   ?(result.telegramOk===false?(result.warning||result.error||'').slice(0,500):'')
-   :(result.error||'Ошибка проверки').slice(0,500),
-  telegramOk:result.ok?result.telegramOk!==false:false,
-  checkingAt:'',
- };
+ const next=inconclusive
+  ?{...data,checkError:(result.error||'Проверка не выполнена').slice(0,500),checkingAt:''}
+  :{
+   ...data,
+   status:result.ok?'active':'inactive',
+   protocol:result.protocol||data.protocol||'socks5',
+   exitIp:result.exitIp||data.exitIp||'',
+   lastChecked:new Date().toISOString(),
+   checkError:result.ok
+    ?(result.telegramOk===false?(result.warning||result.error||'').slice(0,500):'')
+    :(result.error||'Ошибка проверки').slice(0,500),
+   telegramOk:result.ok?result.telegramOk!==false:false,
+   checkingAt:'',
+  };
  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'proxy').run();
  return {id,ok:result.ok,exitIp:next.exitIp,latencyMs:result.latencyMs,error:result.error||result.warning,telegramOk:next.telegramOk,protocol:next.protocol,status:next.status as string};
 }

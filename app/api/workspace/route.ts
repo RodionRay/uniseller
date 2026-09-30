@@ -40,6 +40,7 @@ import {
  type MailingSourceKind,
 } from '@/lib/mailing';
 import {checkProxyTarget} from '@/lib/security/net-guard';
+import {proxyCheckTimeoutMs,workerSlots} from '@/lib/worker-timeouts';
 import {authorizeWorkspaceAction,keepOwnerSecretsOnSave,visibleRecordsFor,type WorkspaceActor} from '@/lib/security/workspace-authz';
 import {ALL_CRM_ACCESS} from '@/lib/staff-types';
 import {env} from 'cloudflare:workers';
@@ -391,7 +392,8 @@ function workerToken(){
  return (env as unknown as {TG_WORKER_TOKEN?:string}).TG_WORKER_TOKEN||process.env.TG_WORKER_TOKEN||'';
 }
 
-async function runProxyCheck(owner:string,id:string){
+/** @param batchSize checks sent to the worker at the same time (they queue beyond its slots) */
+async function runProxyCheck(owner:string,id:string,batchSize=1){
  const db=database();
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'proxy').first();
  if(!row)return {id,ok:false as const,error:'Прокси не найден',latencyMs:0,status:'inactive' as const};
@@ -421,7 +423,7 @@ async function runProxyCheck(owner:string,id:string){
  // Worker busy/down/timeout says nothing about the proxy: keep its previous status.
  let inconclusive=false;
  try{
-  const wr=await workerPost('/check-proxy',input,15_000);
+  const wr=await workerPost('/check-proxy',input,proxyCheckTimeoutMs(batchSize,workerSlots(process.env.TG_WORKER_MAX_CONCURRENCY)));
   result={
    ok:!!wr.ok,
    latencyMs:Number(wr.latencyMs)||0,
@@ -1498,7 +1500,7 @@ export async function POST(req:Request){const actor=await readActor();if(!actor)
   const results:Awaited<ReturnType<typeof runProxyCheck>>[]=[];
   for(let i=0;i<ids.length;i+=concurrency){
    const batch=ids.slice(i,i+concurrency);
-   const part=await Promise.all(batch.map(id=>runProxyCheck(owner,id)));
+   const part=await Promise.all(batch.map(id=>runProxyCheck(owner,id,batch.length)));
    results.push(...part);
   }
   const active=results.filter(r=>r.ok).length;

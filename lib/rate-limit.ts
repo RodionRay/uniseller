@@ -38,6 +38,15 @@ export function createRateLimiter(
     return row;
   }
 
+  /** Housekeeping only: the attempt is already counted, so a failure must not fail `hit`. */
+  async function dropStaleRows(at: number) {
+    try {
+      await db.prepare("DELETE FROM rate_limits WHERE window_start < ?").bind(at - STALE_ROW_MS).run();
+    } catch (error) {
+      console.error("[rate-limit] stale-row cleanup failed:", (error as Error)?.message ?? error);
+    }
+  }
+
   return {
     async hit(key, rule) {
       const at = now();
@@ -55,13 +64,8 @@ export function createRateLimiter(
           .bind(key, at, expired, expired)
           .first<{ count: number }>();
         const count = row?.count ?? 1;
-        if (count === 1) {
-          // A new window is rare enough to carry the cleanup of abandoned keys.
-          await db
-            .prepare("DELETE FROM rate_limits WHERE window_start < ?")
-            .bind(at - STALE_ROW_MS)
-            .run();
-        }
+        // A new window is rare enough to carry the cleanup of abandoned keys.
+        if (count === 1) await dropStaleRows(at);
         return count;
       } catch (error) {
         logFailure("hit", error);

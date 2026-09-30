@@ -5,6 +5,8 @@ const db = createTestD1();
 vi.mock("@/lib/server-store", () => ({ database: () => db }));
 
 import { consumeRateLimit, consumeRateLimits } from "@/lib/security/rate-limit";
+import { createRateLimiter } from "@/lib/rate-limit";
+import type { D1LikeDatabase } from "@/lib/db";
 import { trustedClientIp } from "@/lib/security/client-ip";
 
 const RULE = { name: "t", limit: 2, windowSec: 60 };
@@ -50,6 +52,33 @@ describe("consumeRateLimit", () => {
     await consumeRateLimit(RULE, "person@example.com", T0);
     const rows = await db.prepare("SELECT key FROM rate_limits").bind().all();
     expect(JSON.stringify(rows.results)).not.toContain("person@example.com");
+  });
+});
+
+describe("createRateLimiter.hit", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  // The attempt is already counted; a failed housekeeping DELETE must not turn it into
+  // "store unavailable" (0), which callers answer with 503.
+  it("returns the counted attempt when the stale-row cleanup fails", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const failingCleanup: D1LikeDatabase = {
+      prepare: (sql) => ({
+        bind: () => ({
+          all: async () => ({ results: [] }),
+          first: async <T,>() => ({ count: 1 }) as T,
+          run: async () => {
+            if (sql.startsWith("DELETE")) throw new Error("database is locked");
+            return { meta: { changes: 0 } };
+          },
+        }),
+      }),
+    };
+
+    const count = await createRateLimiter(failingCleanup, () => T0).hit("k", { max: 5, windowMs: 60_000 });
+
+    expect(count).toBe(1);
+    expect(errors).toHaveBeenCalledOnce();
   });
 });
 

@@ -62,7 +62,9 @@
   `wrangler dev --local`, который пропускает присланный клиентом `CF-Connecting-IP`) — `TRUSTED_IP_HEADER=none`.
   Docker так и поставляется; с Caddy из `deploy/Caddyfile` (перезаписывает `X-Real-IP`) — `TRUSTED_IP_HEADER=x-real-ip`.
 - Без доверенного IP лимиты по IP пропускаются (а не сводятся в один общий ключ, которым один клиент заблокировал бы всех);
-  лимиты по email (10 попыток на email + IP или email за 15 минут, 100 на email), по пользователю и общие действуют.
+  лимиты по email (10 попыток на email + IP или email за 15 минут, 100 на email), по пользователю и общие на весь
+  сервис действуют всегда: `register-global` (50 регистраций в час), `contact-global` (100 заявок в сутки),
+  `assistant-anon-global` (500 вопросов без входа в сутки).
   Счётчики лежат в таблице `rate_limits` (`drizzle/0003`), ключи — хэши email/IP.
 - Ассистент для вошедших: `ASSISTANT_USER_DAILY_LIMIT` вопросов в день (200), дальше `429` с `Retry-After`.
 

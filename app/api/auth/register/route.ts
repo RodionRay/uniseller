@@ -38,6 +38,7 @@ export async function POST(req: Request) {
     }
     const limit = await consumeRateLimits([
       [RATE_LIMITS.registerPerIp, trustedClientIp(req)],
+      [RATE_LIMITS.registerGlobal, "all"],
     ]);
     if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
     const body = (await req.json()) as {

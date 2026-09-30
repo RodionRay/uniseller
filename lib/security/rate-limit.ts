@@ -24,13 +24,17 @@ const DAY = 24 * HOUR;
  * trusted) is the tight guess limit and is cleared by a successful login, so
  * guesses from one network do not lock the owner out elsewhere;
  * `loginPerEmail` is a high ceiling against guessing spread over many IPs.
+ * `*Global` rules use one shared bucket and always apply, so a flood is
+ * capped even when no client IP is trusted and per-IP rules are skipped.
  */
 export const RATE_LIMITS = {
   loginPerIp: { name: "login-ip", limit: 20, windowSec: 15 * MINUTE },
   loginPerEmailIp: { name: "login-email-ip", limit: 10, windowSec: 15 * MINUTE },
   loginPerEmail: { name: "login-email", limit: 100, windowSec: 15 * MINUTE },
   registerPerIp: { name: "register-ip", limit: 5, windowSec: HOUR },
+  registerGlobal: { name: "register-global", limit: 50, windowSec: HOUR },
   contactPerIp: { name: "contact-ip", limit: 5, windowSec: HOUR },
+  contactGlobal: { name: "contact-global", limit: 100, windowSec: DAY },
   assistantAnonPerIp: { name: "assistant-anon-ip", limit: 30, windowSec: DAY },
   assistantAnonGlobal: { name: "assistant-anon-global", limit: 500, windowSec: DAY },
 } as const satisfies Record<string, RateLimitRule>;

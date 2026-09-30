@@ -47,6 +47,17 @@ describe("POST /api/contact rate limit", () => {
     expect((await submit(contactRequest(validForm))).status).toBe(429);
     expect((await submit(contactRequest(validForm, "198.51.100.9"))).status).toBe(200);
   });
+
+  // Without a trusted IP the per-IP rule is skipped; the global ceiling must still hold.
+  it.each([undefined, "none"])("throttles globally when TRUSTED_IP_HEADER=%j", async (value) => {
+    vi.stubEnv("TRUSTED_IP_HEADER", value);
+    for (let i = 0; i < RATE_LIMITS.contactGlobal.limit; i++) {
+      expect((await submit(contactRequest(validForm, `203.0.113.${i % 250}`))).status).toBe(200);
+    }
+    const blocked = await submit(contactRequest(validForm, "198.51.100.9"));
+    expect(blocked.status).toBe(429);
+    expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
+  });
 });
 
 describe("POST /api/contact Telegram notify", () => {

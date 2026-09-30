@@ -62,6 +62,20 @@ describe("POST /api/auth/register", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("set-cookie")).toContain("uniseller_session=");
   });
+
+  // Without a trusted IP the per-IP rule is skipped; the global ceiling must still hold.
+  it.each([undefined, "none"])("throttles sign-ups globally when TRUSTED_IP_HEADER=%j", async (value) => {
+    vi.stubEnv("REGISTRATION_OPEN", "true");
+    vi.stubEnv("TRUSTED_IP_HEADER", value);
+    const signUp = (i: number) =>
+      register(jsonRequest("/api/auth/register", { email: `u${i}@b.co`, password: "12345678" }, `203.0.113.${i % 250}`));
+    for (let i = 0; i < RATE_LIMITS.registerGlobal.limit; i++) {
+      expect((await signUp(i)).status).toBe(200);
+    }
+    const blocked = await signUp(RATE_LIMITS.registerGlobal.limit);
+    expect(blocked.status).toBe(429);
+    expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
+  });
 });
 
 describe("POST /api/auth/login throttle", () => {

@@ -32,8 +32,10 @@ jobs:
         run: npx tsc --noEmit
       - name: Unit tests
         run: npx vitest run
-      - name: Worker Python unit tests (stdlib only, no telethon needed)
-        run: python3 -m unittest discover -s telegram-worker/tests
+      - name: Worker Python unit tests (only Telethon needed, test_resolve_blind imports it)
+        run: |
+          python3 -m pip install --quiet "$(grep -i "^telethon==" telegram-worker/requirements.txt)"
+          python3 -m unittest discover -s telegram-worker/tests
       - name: Build
         run: npm run build
       - name: Dependency audit

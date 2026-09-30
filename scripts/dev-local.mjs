@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync, readdirSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { workerReuseVerdict } from "./dev-worker-reuse.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const webPort = Number(process.env.PORT || 5173);
@@ -240,13 +241,13 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 const workerFree = await portFree(workerPort);
 let reuseWorker = false;
 if (!workerFree) {
-  const probe = await probeWorker(workerPort);
-  if (probe === "ours") {
+  const verdict = workerReuseVerdict(await probeWorker(workerPort), generatedSecrets);
+  if (verdict === "reuse") {
     reuseWorker = true;
     log(`Telegram-воркер уже на :${workerPort} — переиспользую (не перезапускаю)`);
-  } else if (probe === "stale") {
+  } else if (verdict === "stale") {
     log(
-      `на :${workerPort} старый воркер с другим TG_WORKER_TOKEN — остановите его или задайте TG_WORKER_TOKEN в .env`,
+      `на :${workerPort} старый воркер с другими секретами (TG_WORKER_TOKEN/CRON_SECRET) — остановите его или задайте TG_WORKER_TOKEN и CRON_SECRET в .env`,
     );
     process.exit(1);
   } else {

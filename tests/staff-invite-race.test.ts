@@ -43,6 +43,23 @@ describe('acceptInvite: одно приглашение — один сотру�
     expect(again).toEqual({ok:false,error:'Приглашение уже использовано'});
   });
 
+  it('параллельные accept в два разных кабинета дают одно членство',async()=>{
+    const first=await createInvite({workspaceOwnerId:'owner-1',role:'viewer'});
+    const second=await createInvite({workspaceOwnerId:'owner-2',role:'viewer'});
+
+    const results=await Promise.all([
+      acceptInvite({token:first.token,userId:'user-a'}),
+      acceptInvite({token:second.token,userId:'user-a'}),
+    ]);
+
+    expect(results.filter((r)=>r.ok)).toHaveLength(1);
+    const members=t.sqlite.prepare('SELECT workspace_owner_id FROM workspace_members WHERE user_id=?').all('user-a') as {workspace_owner_id:string}[];
+    expect(members).toHaveLength(1);
+    const losing=results[0]!.ok?second:first;
+    const row=t.sqlite.prepare('SELECT accepted_by FROM workspace_invites WHERE id=?').get(losing.id) as {accepted_by:string|null};
+    expect(row.accepted_by).toBeNull();
+  });
+
   it('отказ из-за членства в другом кабинете не сжигает приглашение',async()=>{
     const other=await createInvite({workspaceOwnerId:'owner-2',role:'viewer'});
     await acceptInvite({token:other.token,userId:'user-a'});

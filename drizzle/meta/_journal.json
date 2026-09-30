@@ -22,6 +22,13 @@
       "when": 1790741977258,
       "tag": "0002_workspace_contact",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790742636336,
+      "tag": "0003_rate_limits",
+      "breakpoints": true
     }
   ]
 }

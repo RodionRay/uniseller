@@ -18,6 +18,7 @@ const ERRORS: Record<string, string> = {
   oauth: "Не удалось войти через соцсеть. Проверьте настройки провайдера.",
   denied: "Вход через соцсеть отменён.",
   state: "Сессия входа устарела. Попробуйте ещё раз.",
+  closed: "Кабинет для этого аккаунта не найден. Регистрация закрыта — доступ выдаёт администратор.",
 };
 
 type Providers = {
@@ -26,6 +27,16 @@ type Providers = {
   vk: boolean;
   telegram: boolean;
   telegramBot: string;
+  registrationOpen: boolean;
+};
+
+const NO_PROVIDERS: Providers = {
+  google: false,
+  yandex: false,
+  vk: false,
+  telegram: false,
+  telegramBot: "",
+  registrationOpen: false,
 };
 
 export function AuthForm({ mode }: { mode: "login" | "register" }) {
@@ -45,17 +56,9 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
 
   useEffect(() => {
     fetch("/api/auth/providers")
-      .then((r) => r.json())
+      .then((r) => r.json() as Promise<Providers>)
       .then(setProviders)
-      .catch(() =>
-        setProviders({
-          google: false,
-          yandex: false,
-          vk: false,
-          telegram: false,
-          telegramBot: "",
-        }),
-      );
+      .catch(() => setProviders(NO_PROVIDERS));
   }, []);
 
   useEffect(() => {
@@ -106,6 +109,26 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
   const anySocial =
     providers &&
     (providers.google || providers.yandex || providers.vk || providers.telegram);
+  const registrationClosed = providers !== null && !providers.registrationOpen;
+
+  if (mode === "register" && registrationClosed) {
+    return (
+      <main className="login-shell">
+        <div className="login-card">
+          <UniLabLogo href="/" />
+          <h1>Регистрация закрыта</h1>
+          <p className="muted">
+            Кабинеты создаёт администратор. Если доступ уже выдан — войдите.
+          </p>
+          <p className="us-auth-switch">
+            <Link href={`/login?return_to=${encodeURIComponent(returnTo)}`}>
+              Войти
+            </Link>
+          </p>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="login-shell">
@@ -210,7 +233,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
                 Войти
               </Link>
             </>
-          ) : (
+          ) : registrationClosed ? null : (
             <>
               Нет аккаунта?{" "}
               <Link href={`/register?return_to=${encodeURIComponent(returnTo)}`}>

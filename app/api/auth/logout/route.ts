@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { sessionCookieName, sessionCookieOptions } from "@/lib/auth";
+import { isSameOriginRequest, requestOrigin } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -11,7 +12,7 @@ function safeReturnTo(value: string | null): string {
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const returnTo = safeReturnTo(url.searchParams.get("return_to"));
-  const response = NextResponse.redirect(new URL(returnTo, url.origin), 302);
+  const response = NextResponse.redirect(new URL(returnTo, requestOrigin(req)), 302);
   response.cookies.set(sessionCookieName(), "", {
     ...sessionCookieOptions(0),
     maxAge: 0,
@@ -20,9 +21,7 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  const url = new URL(req.url);
-  if (origin && origin !== url.origin) {
+  if (!isSameOriginRequest(req)) {
     return NextResponse.json(
       { error: "Недопустимый источник запроса" },
       { status: 403 },

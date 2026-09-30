@@ -22,6 +22,7 @@ const MIGRATION_TABLES = {
   "0000_even_hydra.sql": ["records"],
   "0001_users_oauth.sql": ["users", "oauth_accounts"],
   "0002_workspace_contact.sql": ["contact_messages", "workspace_invites", "workspace_members"],
+  "0003_rate_limits.sql": ["rate_limits"],
 };
 
 const dryRun = process.argv.includes("--dry-run");

@@ -1,4 +1,4 @@
-import { sqliteTable, text, index, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const records = sqliteTable(
   "records",
@@ -82,3 +82,14 @@ export const contactMessages = sqliteTable("contact_messages", {
   message: text("message").notNull(),
   created: text("created").notNull(),
 });
+
+/** Fixed-window counters for login/contact throttling (lib/rate-limit.ts). */
+export const rateLimits = sqliteTable(
+  "rate_limits",
+  {
+    key: text("key").primaryKey(),
+    count: integer("count").notNull(),
+    windowStart: integer("window_start").notNull(),
+  },
+  (t) => [index("idx_rate_limits_window").on(t.windowStart)],
+);

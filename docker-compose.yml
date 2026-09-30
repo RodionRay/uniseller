@@ -2,6 +2,7 @@ services:
   uniseller:
     build: .
     ports:
+      # Host-side loopback only; the app binds 0.0.0.0 inside the container (see Dockerfile).
       - "127.0.0.1:5173:5173"
     env_file:
       - .env

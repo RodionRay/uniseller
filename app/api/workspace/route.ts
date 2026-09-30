@@ -40,6 +40,8 @@ import {
  type MailingSourceKind,
 } from '@/lib/mailing';
 import {checkProxyTarget} from '@/lib/security/net-guard';
+import {authorizeWorkspaceAction,keepOwnerSecretsOnSave,visibleRecordsFor,type WorkspaceActor} from '@/lib/security/workspace-authz';
+import {ALL_CRM_ACCESS} from '@/lib/staff-types';
 import {env} from 'cloudflare:workers';
 import {z} from 'zod';
 export const dynamic='force-dynamic';
@@ -367,15 +369,17 @@ function internalError(context:string,e:unknown,publicMessage:string){
  return publicMessage;
 }
 
-async function readOwner(){
+async function readActor():Promise<WorkspaceActor|undefined>{
   const u=await getSessionUser();
   if(!u?.userId)return;
   try{
     const {resolveWorkspaceContext}=await import('@/lib/staff');
     const ctx=await resolveWorkspaceContext(u.userId);
-    return ctx.ownerId;
-  }catch{
-    return u.userId;
+    return {userId:u.userId,ownerId:ctx.ownerId,isOwner:ctx.isOwner,role:ctx.role,access:ctx.access};
+  }catch(e){
+    // Staff tables unavailable: fall back to the user's own (possibly empty) workspace, never the employer's.
+    console.error('[workspace] resolve context:',String((e as Error)?.message||e).slice(0,300));
+    return {userId:u.userId,ownerId:u.userId,isOwner:true,role:'owner',access:ALL_CRM_ACCESS};
   }
 }
 
@@ -1399,15 +1403,10 @@ function sameMailingPeer(lead:any,msg:any){
 }
 
 export async function GET(){const session=await getSessionUser();if(!session?.userId)return reply({error:'Войдите в рабочее пространство'},401);
- let owner=session.userId;
- let workspace:{ownerId:string;isOwner:boolean;role:string;access:Record<string,boolean>}={ownerId:session.userId,isOwner:true,role:'owner',access:{}};
- try{
-  const {resolveWorkspaceContext,CRM_ACCESS_KEYS}=await import('@/lib/staff');
-  const ctx=await resolveWorkspaceContext(session.userId);
-  owner=ctx.ownerId;
-  workspace={ownerId:ctx.ownerId,isOwner:ctx.isOwner,role:ctx.role,access:ctx.access};
-  for(const k of CRM_ACCESS_KEYS){if(workspace.access[k]==null)workspace.access[k]=ctx.isOwner}
- }catch{/* */}
+ const actor=await readActor();
+ if(!actor)return reply({error:'Войдите в рабочее пространство'},401);
+ const owner=actor.ownerId;
+ const workspace={ownerId:actor.ownerId,isOwner:actor.isOwner,role:actor.role,access:actor.access};
  try{
  // Снять залипшие «Проверяется», чтобы UI не блокировался
  try{await healStuckAccountChecks(owner,180_000)}catch{/* */}
@@ -1419,18 +1418,22 @@ export async function GET(){const session=await getSessionUser();if(!session?.us
  try{const h=await fetch(workerUrl()+'/health',{signal:AbortSignal.timeout(1500)});telegramConnected=h.ok}catch{telegramConnected=false}
  const envKey=!!envAiApiKey();
  return reply({
-  records:result.results.map((r:any)=>({
+  records:visibleRecordsFor(actor,result.results.map((r:any)=>({
    ...r,
    data:JSON.parse(r.data),
    hasSecret:r.kind==='settings'?!!(r.hasSecret||envKey):!!r.hasSecret,
-  })),
+  }))),
   telegramConnected,
   ai:{provider:process.env.AI_PROVIDER||'deepseek',hasEnvKey:envKey},
   workspace,
   me:{userId:session.userId,email:session.email,name:session.displayName},
  });
 }catch(e){internalError('GET',e,'');return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
-export async function POST(req:Request){const owner=await readOwner();if(!owner)return reply({error:'Войдите в рабочее пространство'},401);const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);const db=database();
+export async function POST(req:Request){const actor=await readActor();if(!actor)return reply({error:'Войдите в рабочее пространство'},401);const owner=actor.ownerId;const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);
+ if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'Некорректный запрос'},400);
+ const authz=authorizeWorkspaceAction(actor,b.action,b.kind);
+ if(!authz.ok)return reply({error:authz.error},403);
+ const db=database();
  if(b.action==='draft'){
   const id=z.string().uuid().parse(b.id);
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();
@@ -4568,6 +4571,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   data.apiBase='https://api.deepseek.com';
   data.keywords=sanitizeLeadKeywords(String(data.keywords||''));
   data.minusKeywords=ensureJunkMinus(String(data.minusKeywords||''));
+  if(existing){try{Object.assign(data,keepOwnerSecretsOnSave(actor,data,JSON.parse(existing.data)))}catch{/* битые старые настройки — перезаписываем */}}
   if(!String(data.leadCriteria||'').trim()){
    data.leadCriteria='Целевой лид ЯВНО ищет сервис/инструмент/подрядчика под ваш продукт (остатки, синхронизация, цены, отзывы, кабинеты, 1С/МойСклад) и готов обсуждать демо или внедрение. Не лид: обычный чат селлеров, жалобы без запроса сервиса, чужая реклама.';
   }

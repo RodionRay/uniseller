@@ -5,25 +5,37 @@ import {
   sessionCookieName,
   sessionCookieOptions,
 } from "@/lib/auth";
-import { telegramEnabled, verifyTelegramAuth } from "@/lib/oauth";
+import {
+  telegramEnabled,
+  telegramStateCookieCleared,
+  telegramStateValid,
+  verifyTelegramAuth,
+} from "@/lib/oauth";
 import { upsertOAuthUser } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
-function payloadFromSearch(url: URL): Record<string, string> {
-  const data: Record<string, string> = {};
-  for (const [k, v] of url.searchParams) {
-    if (k === "return_to") continue;
-    data[k] = v;
-  }
-  return data;
+function withStateCleared(res: NextResponse): NextResponse {
+  const cleared = telegramStateCookieCleared();
+  res.cookies.set(cleared.name, cleared.value, cleared.options);
+  return res;
 }
 
-async function finish(req: Request, data: Record<string, string>, returnTo: string) {
+function fail(req: Request): NextResponse {
+  return withStateCleared(
+    NextResponse.redirect(new URL("/login?error=oauth", new URL(req.url).origin)),
+  );
+}
+
+/**
+ * `state` must match the signed cookie issued by /api/auth/providers when the
+ * login page rendered the widget; this blocks login CSRF with someone else's
+ * Telegram payload. Replays are limited by the 5-minute auth_date window.
+ */
+async function finish(req: Request, data: Record<string, string>) {
   const url = new URL(req.url);
-  if (!telegramEnabled()) {
-    return NextResponse.redirect(new URL("/login?error=oauth", url.origin));
-  }
+  if (!telegramEnabled()) return fail(req);
+  if (!(await telegramStateValid(req, data.state))) return fail(req);
   const profile = await verifyTelegramAuth(data);
   const user = await upsertOAuthUser({
     provider: "telegram",
@@ -38,31 +50,32 @@ async function finish(req: Request, data: Record<string, string>, returnTo: stri
     displayName: user.name,
   });
   const res = NextResponse.redirect(
-    new URL(safeRelativeReturnPath(returnTo), url.origin),
+    new URL(safeRelativeReturnPath(data.return_to || "/app"), url.origin),
   );
   res.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-  return res;
+  return withStateCleared(res);
 }
 
 export async function GET(req: Request) {
-  const url = new URL(req.url);
   try {
     return await finish(
       req,
-      payloadFromSearch(url),
-      url.searchParams.get("return_to") || "/app",
+      Object.fromEntries(new URL(req.url).searchParams),
     );
   } catch {
-    return NextResponse.redirect(new URL("/login?error=oauth", url.origin));
+    return fail(req);
   }
 }
 
 export async function POST(req: Request) {
-  const url = new URL(req.url);
   try {
-    const body = (await req.json()) as Record<string, string>;
-    return await finish(req, body, body.return_to || "/app");
+    const body = (await req.json()) as Record<string, unknown>;
+    const data: Record<string, string> = {};
+    for (const [k, v] of Object.entries(body)) {
+      if (typeof v === "string" || typeof v === "number") data[k] = String(v);
+    }
+    return await finish(req, data);
   } catch {
-    return NextResponse.redirect(new URL("/login?error=oauth", url.origin));
+    return fail(req);
   }
 }

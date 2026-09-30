@@ -30,6 +30,7 @@ type Providers = {
   vk: boolean;
   telegram: boolean;
   telegramBot: string;
+  telegramState: string;
 };
 
 export function AuthForm({ mode }: { mode: "login" | "register" }) {
@@ -49,7 +50,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
 
   useEffect(() => {
     fetch("/api/auth/providers")
-      .then((r) => r.json())
+      .then((r) => r.json() as Promise<Providers>)
       .then(setProviders)
       .catch(() =>
         setProviders({
@@ -58,13 +59,24 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
           vk: false,
           telegram: false,
           telegramBot: "",
+          telegramState: "",
         }),
       );
   }, []);
 
   useEffect(() => {
     const el = tgRef.current;
-    if (!el || !providers?.telegram || !providers.telegramBot) return;
+    if (
+      !el ||
+      !providers?.telegram ||
+      !providers.telegramBot ||
+      !providers.telegramState
+    ) {
+      return;
+    }
+    const authUrl = new URL("/api/auth/telegram", window.location.origin);
+    authUrl.searchParams.set("state", providers.telegramState);
+    authUrl.searchParams.set("return_to", returnTo);
     el.innerHTML = "";
     const s = document.createElement("script");
     s.src = "https://telegram.org/js/telegram-widget.js?22";
@@ -72,13 +84,10 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
     s.setAttribute("data-telegram-login", providers.telegramBot);
     s.setAttribute("data-size", "large");
     s.setAttribute("data-userpic", "false");
-    s.setAttribute(
-      "data-auth-url",
-      `${window.location.origin}/api/auth/telegram`,
-    );
+    s.setAttribute("data-auth-url", authUrl.toString());
     s.setAttribute("data-request-access", "write");
     el.appendChild(s);
-  }, [providers]);
+  }, [providers, returnTo]);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();

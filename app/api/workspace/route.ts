@@ -8,7 +8,7 @@ import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
 import {mergeRefreshedSession,stripSessionMaterial} from '@/lib/processes/session-refresh';
 import {appTimeoutForWorker} from '@/lib/processes/worker-timeouts';
 import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
-import {JOIN_SUCCESS_PATCH,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,isAccountBlindResult,isAccountResolveBlind,joinFailurePatch,planGroupHeal,sanitizeJoinStateError} from '@/lib/processes/join-flow';
+import {JOIN_SUCCESS_PATCH,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,earliestResolveBlindEnd,isAccountBlindResult,isAccountResolveBlind,joinFailurePatch,planGroupHeal,sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
 import {aiChatText,envAiApiKey,resolveAiConfig} from '@/lib/ai-client';
 import {buildProjectBrief,leadMessageFingerprint,normalizeLeadMessage,parseLeadTemperature,ratingFromTemperatures,strongPlusTerms,type LeadTemperature} from '@/lib/lead-filter';
@@ -3653,9 +3653,27 @@ export async function POST(req:Request){const session=await getSessionUser();con
   }
   const liveIds=accountIds.filter(aid=>{
    const a=accMap.get(aid);
-   return isAccountUsable(a)&&hasMemberInviteQuota(a);
+   return isAccountUsable(a)&&hasMemberInviteQuota(a)&&!isAccountResolveBlind(a);
   });
   if(!liveIds.length){
+   // Все рабочие слоты слепы на ResolveUsername — не логиним их по кругу, ждём конца отлёжки
+   const blind=earliestResolveBlindEnd(accountIds.map(aid=>accMap.get(aid)).filter(a=>isAccountUsable(a)));
+   if(blind){
+    const resumeIso=blind.resumeAt;
+    const next={
+     ...data,
+     status:'scheduled',
+     error:'',
+     nextAt:resumeIso,
+     tickLockUntil:'',
+     log:pushTaskLogs(data.log,[
+      {level:'warn',text:`Все аккаунты (${blind.count}) не резолвят @username — ограничены Telegram`},
+      {level:'info',text:`Задача остановлена и запустится автоматически ${formatRuWhen(resumeIso)}`},
+     ]),
+    };
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'invite_task').run();
+    return reply({ok:true,stopped:true,scheduled:true,accountBlind:true,task:next});
+   }
    const quotaHit=accountIds.filter(aid=>{
     const a=accMap.get(aid);
     return isAccountUsable(a)&&!hasMemberInviteQuota(a);
@@ -3753,6 +3771,10 @@ export async function POST(req:Request){const session=await getSessionUser();con
    const joinRes=await accountWorkerPost(owner,accountId,'/join-group',{...payload,url:data.targetUrl});
    if(!joinRes.ok&&joinRes.join!=='already'&&!/уже|already/i.test(String(joinRes.error||''))){
     const pause=randomPauseSec(data.pauseFromSec,data.pauseToSec);
+    if(isAccountBlindResult(joinRes)){
+     // Слот слеп — убираем из ротации на отлёжку, иначе задача логинит его каждый круг
+     await patchRecordData(db,{owner,kind:'account',id:accountId},{...accountBlindPatch(),error:String(joinRes.error||'').slice(0,500)});
+    }
     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} не смог вступить в группу: ${String(joinRes.error||'').slice(0,120)}`});
     logEntries.push({level:'info',text:`Ожидание ${pause} секунд`});
     const next=await persistInviteTask({

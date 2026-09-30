@@ -4,6 +4,7 @@ import {
   JOIN_MAX_ATTEMPTS,
   JOIN_SUCCESS_PATCH,
   accountBlindPatch,
+  earliestResolveBlindEnd,
   isAccountBlindResult,
   isAccountResolveBlind,
   joinFailurePatch,
@@ -92,5 +93,19 @@ describe("account resolve blindness", () => {
     expect(isAccountResolveBlind(acc, NOW + ACCOUNT_BLIND_COOLDOWN_MS)).toBe(false);
     expect(isAccountResolveBlind({}, NOW)).toBe(false);
     expect(isAccountResolveBlind({ resolveBlindUntil: "garbage" }, NOW)).toBe(false);
+  });
+
+  it("resumes an all-blind farm at the earliest cooldown end, ignoring expired or unmarked slots", () => {
+    const soon = new Date(NOW + 60_000).toISOString();
+    const later = new Date(NOW + 3_600_000).toISOString();
+    const expired = new Date(NOW - 1).toISOString();
+    expect(
+      earliestResolveBlindEnd(
+        [{ resolveBlindUntil: later }, { resolveBlindUntil: soon }, { resolveBlindUntil: expired }, {}],
+        NOW,
+      ),
+    ).toEqual({ count: 2, resumeAt: soon });
+    expect(earliestResolveBlindEnd([{}, { resolveBlindUntil: expired }], NOW)).toBeNull();
+    expect(earliestResolveBlindEnd([], NOW)).toBeNull();
   });
 });

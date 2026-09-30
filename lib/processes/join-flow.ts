@@ -212,6 +212,18 @@ export function accountBlindPatch(now = Date.now()): { resolveBlindUntil: string
   return { resolveBlindUntil: new Date(now + ACCOUNT_BLIND_COOLDOWN_MS).toISOString() };
 }
 
+/** Все слоты слепы → сколько их и когда кончается самая ранняя отлёжка; null, если слепых нет. */
+export function earliestResolveBlindEnd(
+  accounts: ReadonlyArray<{ resolveBlindUntil?: string | null } | null | undefined>,
+  now = Date.now(),
+): { count: number; resumeAt: string } | null {
+  const ends = accounts
+    .filter((a) => isAccountResolveBlind(a, now))
+    .map((a) => Date.parse(String(a?.resolveBlindUntil)));
+  if (!ends.length) return null;
+  return { count: ends.length, resumeAt: new Date(Math.min(...ends)).toISOString() };
+}
+
 export const JOIN_SUCCESS_PATCH: Required<JoinRetryFields> = {
   joinAttempts: 0,
   joinNextAt: "",

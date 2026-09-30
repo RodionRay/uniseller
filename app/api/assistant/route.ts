@@ -1,4 +1,5 @@
 import { getSessionUser } from "@/lib/auth";
+import { isSameOriginRequest } from "@/lib/env";
 import { envAiApiKey } from "@/lib/ai-client";
 import { database, unseal } from "@/lib/server-store";
 import {
@@ -50,8 +51,7 @@ async function loadOwnerProduct(
 
 export async function POST(req: Request) {
   try {
-    const origin = req.headers.get("origin");
-    if (origin && origin !== new URL(req.url).origin) {
+    if (!isSameOriginRequest(req)) {
       return reply({ error: "Недопустимый источник запроса" }, 403);
     }
     const bodyText = await req.text();

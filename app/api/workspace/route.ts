@@ -1,4 +1,5 @@
 import {getSessionUser} from '@/lib/auth';
+import {isSameOriginRequest} from '@/lib/env';
 import {CRM_ACCESS_KEYS,resolveWorkspaceContext,type WorkspaceContext} from '@/lib/staff';
 import {acquireLock,releaseLock,type LockHandle} from '@/lib/locks';
 import {patchRecordData,writeRecordDiff} from '@/lib/processes/record-patch';
@@ -1628,7 +1629,7 @@ export async function GET(){const session=await getSessionUser();if(!session?.us
   me:{userId:session.userId,email:session.email,name:session.displayName},
  });
 }catch(e){logActionError('GET',owner,e);return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
-export async function POST(req:Request){const session=await getSessionUser();const lookup=await lookupWorkspace(session?.userId);if(lookup.kind==='anonymous')return reply({error:'Войдите в рабочее пространство'},401);if(lookup.kind==='unavailable')return reply({error:WORKSPACE_UNAVAILABLE},503);const ctx=lookup.ctx;const owner=ctx.ownerId;const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);let action='';try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'Некорректный запрос'},400);action=String(b.action||'');if(!canRunWorkspaceAction(ctx,b))return reply({error:'Недостаточно прав для этого действия. Обратитесь к владельцу кабинета.',forbidden:true},403);const db=database();
+export async function POST(req:Request){const session=await getSessionUser();const lookup=await lookupWorkspace(session?.userId);if(lookup.kind==='anonymous')return reply({error:'Войдите в рабочее пространство'},401);if(lookup.kind==='unavailable')return reply({error:WORKSPACE_UNAVAILABLE},503);const ctx=lookup.ctx;const owner=ctx.ownerId;if(!isSameOriginRequest(req))return reply({error:'Недопустимый источник запроса'},403);let action='';try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'Некорректный запрос'},400);action=String(b.action||'');if(!canRunWorkspaceAction(ctx,b))return reply({error:'Недостаточно прав для этого действия. Обратитесь к владельцу кабинета.',forbidden:true},403);const db=database();
  if(b.action==='draft'){
   const id=z.string().uuid().parse(b.id);
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();

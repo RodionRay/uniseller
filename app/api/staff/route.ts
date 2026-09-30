@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isSameOriginRequest } from "@/lib/env";
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth";
 import { findUserById } from "@/lib/users";
@@ -141,8 +142,7 @@ async function handlePost(
 ) {
   const user = await getSessionUser();
   if (!user) return reply({ error: "Войдите в кабинет" }, 401);
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin)
+  if (!isSameOriginRequest(req))
     return reply({ error: "Недопустимый источник запроса" }, 403);
 
   let body: any;

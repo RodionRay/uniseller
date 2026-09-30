@@ -58,3 +58,33 @@ describe("staff API errors stay JSON (REQ-B6)", () => {
     expect(res.status).toBe(503);
   });
 });
+
+describe("same-origin check behind a reverse proxy", () => {
+  function fromOrigin(origin: string) {
+    return new Request("http://localhost/api/staff", {
+      method: "POST",
+      headers: { origin },
+      body: JSON.stringify({ action: "revoke_invite", id: "not-a-uuid" }),
+    });
+  }
+
+  it("accepts the public APP_URL origin although the proxied request URL is internal", async () => {
+    vi.stubEnv("APP_URL", "https://crm.example.com");
+    try {
+      const res = await POST(fromOrigin("https://crm.example.com"));
+      expect(res.status).not.toBe(403);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("still rejects a foreign origin", async () => {
+    vi.stubEnv("APP_URL", "https://crm.example.com");
+    try {
+      const res = await POST(fromOrigin("https://evil.example"));
+      expect(res.status).toBe(403);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});

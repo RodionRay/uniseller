@@ -77,6 +77,29 @@ export function appOrigin(read: EnvReader = readEnv): string | null {
   return new URL(raw).origin;
 }
 
+const LOOPBACK_HOSTNAME = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])$/;
+
+/**
+ * Origin for the app's calls to itself (cron self-calls carrying minted sessions):
+ * fixed config, never derived from a request. `INTERNAL_APP_ORIGIN` keeps them on a
+ * private network (Docker: http://web:5173); plain http only to loopback or a host
+ * in `TG_WORKER_CRON_HTTP_HOSTS`, the same allowlist the worker uses for CRON_SECRET.
+ * Unset → APP_URL; set but invalid → null (fail closed, no silent fallback).
+ */
+export function internalAppOrigin(read: EnvReader = readEnv): string | null {
+  const raw = read("INTERNAL_APP_ORIGIN");
+  if (!raw) return appOrigin(read);
+  if (!isHttpUrl(raw)) return null;
+  const url = new URL(raw);
+  if (url.protocol === "https:") return url.origin;
+  const httpHosts = (read("TG_WORKER_CRON_HTTP_HOSTS") ?? "")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+  const allowed = LOOPBACK_HOSTNAME.test(url.hostname) || httpHosts.includes(url.hostname);
+  return allowed ? url.origin : null;
+}
+
 /** Origin to trust for same-origin checks and absolute redirects. */
 export function requestOrigin(req: Request, read: EnvReader = readEnv): string {
   return appOrigin(read) ?? new URL(req.url).origin;

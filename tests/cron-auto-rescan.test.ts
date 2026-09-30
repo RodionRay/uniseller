@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { acquireLock } from "@/lib/locks";
 import { harness, resetHarness } from "./helpers/workspace-harness";
@@ -139,9 +141,39 @@ describe("auto-rescan self-call origin", () => {
     }
   });
 
+  // Self-calls stay on the compose network instead of hairpinning through the public proxy.
+  it("prefers INTERNAL_APP_ORIGIN for self-calls", async () => {
+    mockWorkspace();
+    vi.stubEnv("INTERNAL_APP_ORIGIN", "http://web:5173");
+    vi.stubEnv("TG_WORKER_CRON_HTTP_HOSTS", "web");
+    await POST(spoofedHost());
+    const fetchMock = vi.mocked(fetch);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect(new URL(String(url)).origin).toBe("http://web:5173");
+      expect(new Headers(init?.headers).get("origin")).toBe("http://web:5173");
+    }
+  });
+
+  it("refuses plain http to a host outside TG_WORKER_CRON_HTTP_HOSTS", async () => {
+    mockWorkspace();
+    vi.stubEnv("INTERNAL_APP_ORIGIN", "http://evil.example");
+    vi.stubEnv("TG_WORKER_CRON_HTTP_HOSTS", "web");
+    expect((await POST(spoofedHost())).status).toBe(503);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("wires the compose web service to itself over the private network", () => {
+    const compose = readFileSync(path.resolve(__dirname, "..", "docker-compose.yml"), "utf8");
+    const web = compose.slice(compose.indexOf("  web:"), compose.indexOf("  worker:"));
+    expect(web).toMatch(/^\s+INTERNAL_APP_ORIGIN: http:\/\/web:5173$/m);
+    expect(web).toMatch(/^\s+TG_WORKER_CRON_HTTP_HOSTS: web$/m);
+  });
+
   it("refuses to run without APP_URL instead of trusting the request host", async () => {
     mockWorkspace();
     vi.stubEnv("APP_URL", "");
+    vi.stubEnv("INTERNAL_APP_ORIGIN", "");
     const res = await POST(spoofedHost());
     expect(res.status).toBe(503);
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();

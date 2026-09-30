@@ -21,6 +21,10 @@ services:
       D1_PERSIST_DIR: /data/wrangler
       BACKUP_DIR: /data/backups
       TELEGRAM_WORKER_URL: http://worker:8790
+      # auto-rescan self-calls (with minted sessions) stay on the compose network,
+      # not through the public domain and Caddy; plain http is allowed only to these hosts.
+      INTERNAL_APP_ORIGIN: http://web:5173
+      TG_WORKER_CRON_HTTP_HOSTS: web
       # "none" unless the proxy in front overwrites a client-IP header (Caddy in deploy/ sets
       # X-Real-IP: TRUSTED_IP_HEADER=x-real-ip in .env enables per-IP limits; README).
       TRUSTED_IP_HEADER: ${TRUSTED_IP_HEADER:-none}

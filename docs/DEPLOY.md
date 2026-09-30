@@ -35,7 +35,7 @@ openssl rand -hex 32        # → CRON_SECRET
 **`ENCRYPTION_KEY` сохранить отдельно от сервера** (менеджер паролей). Бэкап базы без ключа бесполезен:
 пароли прокси, ключи и сессии в ней зашифрованы.
 
-`TELEGRAM_WORKER_URL`, `HOST`, `D1_PERSIST_DIR` задаются в `docker-compose.yml` и перекрывают `.env`.
+`TELEGRAM_WORKER_URL`, `INTERNAL_APP_ORIGIN`, `HOST`, `D1_PERSIST_DIR` задаются в `docker-compose.yml` и перекрывают `.env`.
 
 `web` читает весь `.env`. **Воркер `.env` целиком не получает** (он разбирает чужие `tdata`): compose
 передаёт ему только `TG_WORKER_TOKEN`, `CRON_SECRET` (без них `docker compose` откажется стартовать),
@@ -78,8 +78,10 @@ sudo sed -i 's/leads.example.com/ВАШ-ДОМЕН/' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 Сертификат выпускается автоматически. `Caddyfile` отвечает `404` на `/api/cron/*` снаружи: cron вызывает
-только воркер внутри сети compose; `/api/health` остаётся доступным. Автообход ходит в кабинет по `APP_URL`
-(`app/api/cron/auto-rescan/route.ts::POST`), поэтому домен должен открываться и изнутри контейнера `web`. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
+только воркер внутри сети compose; `/api/health` остаётся доступным. Автообход вызывает кабинет сам на себя
+по `INTERNAL_APP_ORIGIN=http://web:5173` (задан в `docker-compose.yml` вместе с `TG_WORKER_CRON_HTTP_HOSTS=web`;
+`lib/env.ts::internalAppOrigin`) — по сети compose, не через публичный домен. Без переменной используется `APP_URL`,
+без обеих или при недопустимом значении (http к хосту не из списка) автообход отвечает `503`. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
 `https://ВАШ-ДОМЕН/api/auth/<google|yandex|vk>/callback` — приложение строит его из `APP_URL`.
 
 Лимиты по IP (вход, регистрация, форма заявки, ассистент без входа) по умолчанию выключены

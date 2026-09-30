@@ -435,8 +435,16 @@ export type JoinPaceState = {
   lastJoinAt?: string;
   joinsToday?: number;
   joinsDay?: string;
+  /** Рандомизированный gap после вступления (lib/join-pacing). */
+  joinNextAt?: string;
+  /** FloodWait + запас (lib/join-pacing). */
+  floodUntil?: string;
   /** Конец FloodWait от Telegram на вступления: пауза темпа, не отлёжка. */
   joinFloodUntil?: string;
+  /** Пауза после серии ошибок. */
+  joinPausedUntil?: string;
+  /** CHANNELS_TOO_MUCH и т.п. */
+  joinBlockedUntil?: string;
 };
 
 /** Сколько секунд ждать до следующего join (пауза темпа или FloodWait). 0 = можно сейчас. */
@@ -444,16 +452,20 @@ export function joinWaitSec(
   state: JoinPaceState,
   now = Date.now(),
 ): number {
-  const floodUntil = Date.parse(String(state.joinFloodUntil || ""));
-  const floodWait = Number.isFinite(floodUntil) && floodUntil > now
-    ? Math.ceil((floodUntil - now) / 1000)
-    : 0;
-  const last = Date.parse(String(state.lastJoinAt || ""));
-  if (!Number.isFinite(last)) return floodWait;
-  const elapsed = (now - last) / 1000;
-  const need = JOIN_GAP_DEFAULT_SEC;
-  const paceWait = elapsed >= need ? 0 : Math.ceil(need - elapsed);
-  return Math.max(paceWait, floodWait);
+  const at = (iso?: string) => {
+    const t = Date.parse(String(iso || ""));
+    return Number.isFinite(t) ? t : 0;
+  };
+  const last = at(state.lastJoinAt);
+  const until = Math.max(
+    last ? last + JOIN_GAP_DEFAULT_SEC * 1000 : 0,
+    at(state.joinNextAt),
+    at(state.floodUntil),
+    at(state.joinFloodUntil),
+    at(state.joinPausedUntil),
+    at(state.joinBlockedUntil),
+  );
+  return until > now ? Math.ceil((until - now) / 1000) : 0;
 }
 
 export function normalizeJoinsToday(state: JoinPaceState): number {

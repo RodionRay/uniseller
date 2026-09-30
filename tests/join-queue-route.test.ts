@@ -1,0 +1,430 @@
+import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
+import {insertRecord,readData} from './helpers/d1-fake';
+import {ACCOUNT_ID,OWNER,fakeSeal,harness,mockWorker,post,resetHarness,seedAccount} from './helpers/workspace-harness';
+
+vi.mock('cloudflare:workers',()=>({env:{}}));
+vi.mock('@/lib/auth',async()=>{
+  const h=await import('./helpers/workspace-harness');
+  return {
+    readEnv:(name:string)=>process.env[name],
+    getSessionUser:async()=>h.harness.userId?{userId:h.harness.userId,email:'o@example.test',displayName:'O'}:null,
+  };
+});
+vi.mock('@/lib/server-store',async()=>{
+  const h=await import('./helpers/workspace-harness');
+  return {database:()=>h.harness.db,seal:h.fakeSeal,unseal:h.fakeUnseal};
+});
+vi.mock('@/lib/staff',async()=>{
+  const h=await import('./helpers/workspace-harness');
+  const types=await import('@/lib/staff-types');
+  return {...types,resolveWorkspaceContext:async()=>h.harness.ctx};
+});
+
+const {POST}=await import('@/app/api/workspace/route');
+
+const SETTINGS_ID='22222222-2222-4222-8222-222222222200';
+const SETTINGS={
+  name:'Проект',
+  product:'Облачная платформа для селлеров Wildberries, Ozon и Яндекс Маркет: остатки, заказы, цены, отзывы. Синхронизация с 1С и МойСклад.',
+  keywords:'остатки, синхронизация, мойсклад, несколько кабинетов, ищу сервис',
+  hotSignals:'ищу сервис, кто пользуется, синхронизация остатков',
+  leadCriteria:'Ищет сервис для синхронизации остатков и заказов нескольких кабинетов маркетплейсов',
+  audience:'Селлеры Wildberries, Ozon и Яндекс Маркет; интеграторы 1С и МойСклад',
+  minusKeywords:'вакансия',
+};
+
+const G_WB='a0000000-0000-4000-8000-000000000001';
+const G_OZON='a0000000-0000-4000-8000-000000000002';
+const G_SMM='a0000000-0000-4000-8000-000000000003';
+const G_JOINED_SMM='a0000000-0000-4000-8000-000000000004';
+const ACC2='11111111-1111-4111-8111-111111111112';
+
+function sqlite(){return harness.sqlite!}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose record JSON in assertions
+function group(id:string):any{return readData(sqlite(),id)}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose record JSON in assertions
+function account(id:string):any{return readData(sqlite(),id)}
+function addRecord(id:string,kind:string,data:Record<string,unknown>,secret:string|null=null){
+  insertRecord(sqlite(),{id,owner:OWNER,kind,data,secret});
+}
+function setData(id:string,data:Record<string,unknown>){
+  sqlite().prepare('UPDATE records SET data=? WHERE id=?').run(JSON.stringify(data),id);
+}
+function setCreated(id:string,created:string){
+  sqlite().prepare('UPDATE records SET created=? WHERE id=?').run(created,id);
+}
+function sealedSession(session:string){
+  return fakeSeal(JSON.stringify({kind:'tdata',zipBase64:session,apiId:1,apiHash:'h'}),OWNER);
+}
+function unjoined(name:string,url:string,extra:Record<string,unknown>={}){
+  return {name,url,accountId:ACCOUNT_ID,status:'setup',membership:'none',joinedAt:'',joinState:'queued',joinStateAt:'2026-09-30T10:00:00Z',joinStateError:'',...extra};
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose API JSON in assertions
+async function body(res:Response){return await res.json() as any}
+
+/** Worker stub: every /join-group answers `answer`; other calls fail like an offline worker. Returns called paths. */
+function stubWorker(answer:Record<string,unknown>){
+  return mockWorker((path)=>{
+    if(path==='/join-group')return answer;
+    throw new Error('offline');
+  });
+}
+
+/** Common seed: settings, owner's account (session sealed), in a fresh in-memory D1. */
+async function seedWorkspace(){
+  resetHarness();
+  insertRecord(sqlite(),{id:SETTINGS_ID,owner:OWNER,kind:'settings',data:SETTINGS});
+  await seedAccount(sqlite());
+}
+
+describe('workspace API: relevance gate before joining',()=>{
+  beforeEach(async()=>{
+    await seedWorkspace();
+    addRecord(G_WB,'group',unjoined('WB Official Chat','https://t.me/wb_official_chat_test'));
+    addRecord(G_OZON,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
+    addRecord(G_SMM,'group',unjoined('DNative — блог Ткачука про SMM','https://t.me/dnative',{source:'tgstat-blogs'}));
+    addRecord(G_JOINED_SMM,'group',{...unjoined('Бескромный','https://t.me/beskromny_test',{source:'tgstat-blogs'}),membership:'joined',joinedAt:'2026-09-20T10:00:00Z',joinState:'',status:'active'});
+  });
+  afterEach(()=>{
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it('heal queues only relevant groups, best first, and parks off-niche ones with a reason',async()=>{
+    const res=await POST(post({action:'heal_dead_group_accounts'}));
+    const data=await body(res);
+
+    expect(res.status).toBe(200);
+    const ids=data.items.map((i:{id:string})=>i.id);
+    expect(ids).not.toContain(G_SMM);
+    expect(new Set(ids)).toEqual(new Set([G_WB,G_OZON]));
+    const smm=group(G_SMM);
+    expect(smm.joinState).toBe('');
+    expect(smm.joinRelevance.band).toBe('skip');
+    expect(smm.joinRelevance.reasons.length).toBeGreaterThan(0);
+    // Joined groups are untouched by the gate.
+    expect(group(G_JOINED_SMM).joinRelevance).toBeUndefined();
+    expect(group(G_JOINED_SMM).membership).toBe('joined');
+  });
+
+  it('rescan_groups returns the join queue ordered by relevance score',async()=>{
+    const res=await POST(post({action:'rescan_groups'}));
+    const data=await body(res);
+
+    const scores=data.rejoinItems.map((i:{id:string})=>group(i.id).joinRelevance.score);
+    expect(scores.length).toBe(2);
+    expect([...scores].sort((a:number,b:number)=>b-a)).toEqual(scores);
+    expect(data.joinStats).toMatchObject({auto:2,skip:1});
+  });
+
+  it('join_group refuses a parked group without calling the worker',async()=>{
+    const calls=stubWorker({ok:true,join:'joined'});
+    await POST(post({action:'heal_dead_group_accounts'}));
+
+    const res=await POST(post({action:'join_group',id:G_SMM}));
+    const data=await body(res);
+
+    expect(res.status).toBe(409);
+    expect(data.parked).toBe(true);
+    expect(data.error).toMatch(/Не вступать/);
+    expect(calls.filter(u=>u.endsWith('/join-group'))).toHaveLength(0);
+  });
+
+  it('enqueue_joins is the owner\'s intent: it approves a parked group (heal never re-enqueues automatically)',async()=>{
+    await POST(post({action:'heal_dead_group_accounts'}));
+    expect(group(G_SMM).joinState).toBe('');
+
+    const res=await body(await POST(post({action:'enqueue_joins',groupIds:[G_SMM]})));
+    expect(res.items.map((i:{id:string})=>i.id)).toEqual([G_SMM]);
+    expect(group(G_SMM)).toMatchObject({joinDecision:'approved',joinWanted:true,joinState:'queued'});
+  });
+
+  it('owner can approve, skip and reset a group; skip leaves the queue',async()=>{
+    await POST(post({action:'heal_dead_group_accounts'}));
+
+    const skip=await body(await POST(post({action:'set_group_join_decision',groupIds:[G_WB],decision:'skipped'})));
+    expect(skip.ok).toBe(true);
+    expect(group(G_WB)).toMatchObject({joinDecision:'skipped',joinState:''});
+    const healed=await body(await POST(post({action:'heal_dead_group_accounts'})));
+    expect(healed.items.map((i:{id:string})=>i.id)).not.toContain(G_WB);
+
+    const approve=await body(await POST(post({action:'set_group_join_decision',groupIds:[G_SMM],decision:'approved'})));
+    expect(approve.items.map((i:{id:string})=>i.id)).toEqual([G_SMM]);
+    expect(group(G_SMM).joinDecision).toBe('approved');
+
+    await POST(post({action:'set_group_join_decision',groupIds:[G_WB],decision:''}));
+    expect(group(G_WB).joinDecision).toBe('');
+  });
+
+  it('rescore_join_queue reports band counts and clears the queue of parked groups',async()=>{
+    const res=await POST(post({action:'rescore_join_queue'}));
+    const data=await body(res);
+
+    expect(res.status).toBe(200);
+    expect(data.counts).toMatchObject({auto:2,skip:1,joined:1});
+    expect(data.cleared).toBe(1);
+    expect(group(G_SMM).joinState).toBe('');
+    expect(group(G_WB).joinState).toBe('queued');
+  });
+
+  it('a form save keeps the relevance and the owner decision',async()=>{
+    await POST(post({action:'set_group_join_decision',groupIds:[G_SMM],decision:'skipped'}));
+    const g=group(G_SMM);
+    const res=await POST(post({action:'save',kind:'group',id:G_SMM,data:{name:'DNative',url:g.url,accountId:ACCOUNT_ID}}));
+    expect(res.status).toBe(200);
+    expect(group(G_SMM).joinDecision).toBe('skipped');
+  });
+});
+
+describe('workspace API: join pacing',()=>{
+  beforeEach(async()=>{
+    await seedWorkspace();
+    setCreated(ACCOUNT_ID,'2026-01-01T00:00:00Z');
+    addRecord(G_WB,'group',unjoined('WB Official Chat','https://t.me/wb_official_chat_test'));
+    await POST(post({action:'heal_dead_group_accounts'}));
+  });
+  afterEach(()=>{
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it('FloodWait pauses the account for exactly the demanded time plus margin',async()=>{
+    stubWorker({ok:false,join:'flood',error:'FloodWait 1000с',waitSec:1000});
+    const before=Date.now();
+
+    const res=await POST(post({action:'join_group',id:G_WB}));
+
+    expect(res.status).toBe(429);
+    const acc=account(ACCOUNT_ID);
+    const pause=(Date.parse(acc.floodUntil)-before)/1000;
+    expect(pause).toBeGreaterThanOrEqual(1150-2);
+    expect(pause).toBeLessThanOrEqual(1150+2);
+    expect(acc.status).toBe('active');
+    expect(group(G_WB).joinAttempts||0).toBe(0);
+    // Stand: FloodWait also puts the account on the shared flood cooldown (applyFloodCooldown).
+    expect(acc.cooldownReason).toBe('flood');
+    const cooldown=(Date.parse(acc.cooldownUntil)-before)/1000;
+    expect(cooldown).toBeGreaterThanOrEqual(1000-2);
+    expect(cooldown).toBeLessThanOrEqual(1000+2);
+  });
+
+  it('a successful join sets a randomized next slot minutes ahead and clears the reservation',async()=>{
+    stubWorker({ok:true,join:'joined',title:'WB Official Chat'});
+
+    const res=await POST(post({action:'join_group',id:G_WB}));
+
+    expect(res.status).toBe(200);
+    const acc=account(ACCOUNT_ID);
+    const gap=(Date.parse(acc.joinNextAt)-Date.now())/1000;
+    expect(gap).toBeGreaterThanOrEqual(350);
+    expect(gap).toBeLessThanOrEqual(900);
+    expect(acc.joinReservedUntil||'').toBe('');
+    expect(acc.joinsToday).toBe(1);
+    expect(group(G_WB).membership).toBe('joined');
+  });
+
+  it('PEER_FLOOD puts the account into spamblock instead of burning more joins',async()=>{
+    stubWorker({ok:false,join:'peer_flood',status:'spamblock',error:'PEER_FLOOD: Telegram ограничил аккаунт'});
+
+    await POST(post({action:'join_group',id:G_WB}));
+
+    expect(account(ACCOUNT_ID).status).toBe('spamblock');
+  });
+
+  it('a busy account hands the join to another ready farm account (parallel across accounts)',async()=>{
+    const sealed=await sealedSession('s2');
+    addRecord(ACC2,'account',{name:'Farm 2',phone:'+79990001123',status:'active',proxyId:''},sealed);
+    setCreated(ACC2,'2026-01-01T00:00:00Z');
+    const busy={...account(ACCOUNT_ID),joinReservedUntil:new Date(Date.now()+120_000).toISOString()};
+    setData(ACCOUNT_ID,busy);
+    stubWorker({ok:true,join:'joined'});
+
+    const res=await POST(post({action:'join_group',id:G_WB}));
+
+    expect(res.status).toBe(200);
+    expect(group(G_WB).accountId).toBe(ACC2);
+    expect(account(ACC2).joinsToday).toBe(1);
+  });
+
+  it('«Слот не видит @» from 3 distinct accounts marks the link dead',async()=>{
+    const ids=[ACC2,'11111111-1111-4111-8111-111111111113'];
+    for(const [i,id] of ids.entries()){
+      addRecord(id,'account',{name:`F${i}`,phone:`+7999000113${i}`,status:'active',proxyId:''},await sealedSession(`x${i}`));
+      setCreated(id,'2026-01-01T00:00:00Z');
+    }
+    stubWorker({ok:false,join:'missing',usernameMissing:true,error:'Слот не видит @wb_official_chat_test'});
+
+    for(let i=0;i<3;i++)await POST(post({action:'join_group',id:G_WB}));
+
+    const g=group(G_WB);
+    expect(new Set(g.joinMissingAccounts).size).toBe(3);
+    expect(g.joinDead).toBe(true);
+    const again=await POST(post({action:'join_group',id:G_WB}));
+    expect(again.status).toBe(409);
+  });
+
+  it('scan: «Слот не видит @» rotates only to untried accounts and stops at the cap',async()=>{
+    const ids=[ACC2,'11111111-1111-4111-8111-111111111113','11111111-1111-4111-8111-111111111114'];
+    for(const [i,id] of ids.entries()){
+      addRecord(id,'account',{name:`S${i}`,phone:`+7999000114${i}`,status:'active',proxyId:''},await sealedSession(`s${i}`));
+    }
+    const joined={...group(G_WB),membership:'joined',joinedAt:'2026-09-01T00:00:00Z',status:'active',joinState:''};
+    setData(G_WB,joined);
+    mockWorker(()=>({ok:false,usernameMissing:true,join:'missing',error:'Слот не видит @wb_official_chat_test'}));
+
+    const tried=new Set<string>();
+    for(let i=0;i<5;i++){
+      tried.add(group(G_WB).accountId);
+      await POST(post({action:'scan_group',id:G_WB,force:true}));
+    }
+
+    const g=group(G_WB);
+    expect(g.joinDead).toBe(true);
+    expect(new Set(g.joinMissingAccounts).size).toBe(3);
+    expect(tried.size).toBe(3);
+  });
+
+  it('a farm where every usable account already failed to see @ marks the link dead, not «farm exhausted»',async()=>{
+    const g={...group(G_WB),joinMissingAccounts:[ACCOUNT_ID],usernameMissing:true};
+    setData(G_WB,g);
+    const calls=stubWorker({ok:true,join:'joined'});
+
+    const res=await POST(post({action:'join_group',id:G_WB}));
+    const data=await body(res);
+
+    expect(res.status).toBe(409);
+    expect(data.farmExhausted).toBeUndefined();
+    expect(data.deadLink).toBe(true);
+    expect(group(G_WB).joinDead).toBe(true);
+    expect(calls.filter(u=>u.endsWith('/join-group'))).toHaveLength(0);
+  });
+
+  it('a joined group moved off a dead account is re-joined without the relevance gate',async()=>{
+    const G_BLOG='a0000000-0000-4000-8000-000000000009';
+    addRecord(G_BLOG,'group',{...unjoined('Главред','https://t.me/glvrd_test',{source:'tgstat-blogs'}),membership:'joined',joinedAt:'2026-09-01T00:00:00Z',status:'active',joinState:'',accountId:'dead-account'});
+    await POST(post({action:'heal_dead_group_accounts'}));
+    const moved=group(G_BLOG);
+    expect(moved.membership).toBe('none');
+    expect(moved.joinRejoin).toBe(true);
+    const calls=stubWorker({ok:true,join:'joined'});
+
+    const res=await POST(post({action:'join_group',id:G_BLOG}));
+
+    expect(res.status).toBe(200);
+    expect(calls.filter(u=>u.endsWith('/join-group'))).toHaveLength(1);
+    expect(group(G_BLOG)).toMatchObject({membership:'joined',joinRejoin:false});
+  });
+
+  it('peer refresh of a joined group waits out the account FloodWait without calling Telegram',async()=>{
+    const joined={...group(G_WB),membership:'joined',joinedAt:'2026-09-01T00:00:00Z',status:'active',joinState:'',channelId:'',accessHash:''};
+    setData(G_WB,joined);
+    const acc={...account(ACCOUNT_ID),floodUntil:new Date(Date.now()+600_000).toISOString()};
+    setData(ACCOUNT_ID,acc);
+    const calls=stubWorker({ok:true,join:'already'});
+
+    const res=await POST(post({action:'join_group',id:G_WB}));
+
+    expect(res.status).toBe(429);
+    expect((await body(res)).waitSec).toBeGreaterThan(500);
+    expect(calls.filter(u=>u.endsWith('/join-group'))).toHaveLength(0);
+  });
+
+  it('two parallel joins never share one account (CAS reservation)',async()=>{
+    const G2='a0000000-0000-4000-8000-000000000010';
+    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
+    await POST(post({action:'heal_dead_group_accounts'}));
+    const joins:string[]=[];
+    mockWorker(async(path)=>{
+      if(path!=='/join-group')throw new Error('offline');
+      joins.push(path);
+      await new Promise(r=>setTimeout(r,20));
+      return {ok:true,join:'joined'};
+    });
+
+    const [a,b]=await Promise.all([POST(post({action:'join_group',id:G_WB})),POST(post({action:'join_group',id:G2}))]);
+
+    expect(joins).toHaveLength(1);
+    expect([a.status,b.status].sort()).toEqual([200,429]);
+  });
+
+  it('one join at a time per proxy even with two free accounts on it',async()=>{
+    const G2='a0000000-0000-4000-8000-000000000011';
+    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
+    const SHARED='33333333-3333-4333-8333-333333333399';
+    addRecord(SHARED,'proxy',{name:'shared',host:'proxy.example.com',port:1081,protocol:'socks5',status:'active'});
+    addRecord(ACC2,'account',{name:'Farm 2',phone:'+79990001123',status:'active',proxyId:SHARED},await sealedSession('s2'));
+    setCreated(ACC2,'2026-01-01T00:00:00Z');
+    setData(ACCOUNT_ID,{...account(ACCOUNT_ID),proxyId:SHARED});
+    await POST(post({action:'heal_dead_group_accounts'}));
+    const joins:string[]=[];
+    mockWorker(async(path)=>{
+      if(path!=='/join-group')throw new Error('offline');
+      joins.push(path);
+      await new Promise(r=>setTimeout(r,20));
+      return {ok:true,join:'joined'};
+    });
+
+    await Promise.all([POST(post({action:'join_group',id:G_WB})),POST(post({action:'join_group',id:G2}))]);
+
+    expect(joins).toHaveLength(1);
+  });
+
+  it('every failure branch releases the reservation; account-side errors build the streak',async()=>{
+    stubWorker({ok:false,join:'private',error:'Группа приватная — нужен инвайт-ссылка'});
+    await POST(post({action:'join_group',id:G_WB}));
+    expect(account(ACCOUNT_ID).joinReservedUntil).toBe('');
+    expect(account(ACCOUNT_ID).joinErrStreak||0).toBe(0);
+
+    const g={...group(G_WB),joinNextAt:'',joinGaveUp:false};
+    setData(G_WB,g);
+    // The failed attempt above spent a half gap on the account; skip past it for the second attempt.
+    setData(ACCOUNT_ID,{...account(ACCOUNT_ID),joinNextAt:'',lastJoinAt:''});
+    stubWorker({ok:false,join:'failed',error:'Telegram не подтвердил вступление'});
+    await POST(post({action:'join_group',id:G_WB}));
+    expect(account(ACCOUNT_ID).joinReservedUntil).toBe('');
+    expect(account(ACCOUNT_ID).joinErrStreak).toBe(1);
+  });
+
+  it('a failed attempt still spends a (half) gap on the account — no back-to-back Telegram calls',async()=>{
+    const G2='a0000000-0000-4000-8000-000000000013';
+    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
+    const calls=stubWorker({ok:false,join:'private',error:'Группа приватная — нужен инвайт-ссылка'});
+
+    await POST(post({action:'join_group',id:G_WB}));
+    const second=await POST(post({action:'join_group',id:G2}));
+
+    expect(calls.filter(u=>u.endsWith('/join-group'))).toHaveLength(1);
+    expect(second.status).toBe(429);
+    const gap=(Date.parse(account(ACCOUNT_ID).joinNextAt)-Date.now())/1000;
+    expect(gap).toBeGreaterThanOrEqual(170);
+    expect(gap).toBeLessThanOrEqual(450);
+  });
+
+  it('only untried accounts paced → the pause is the group\'s, the farm keeps going (retryOther)',async()=>{
+    addRecord(ACC2,'account',{name:'Farm 2',phone:'+79990001123',status:'active',proxyId:'',joinNextAt:new Date(Date.now()+300_000).toISOString()},await sealedSession('s2'));
+    setCreated(ACC2,'2026-01-01T00:00:00Z');
+    setData(G_WB,{...group(G_WB),joinMissingAccounts:[ACCOUNT_ID],usernameMissing:true});
+    const calls=stubWorker({ok:true,join:'joined'});
+
+    const res=await POST(post({action:'join_group',id:G_WB}));
+    const data=await body(res);
+
+    expect(res.status).toBe(429);
+    expect(data.retryOther).toBe(true);
+    expect(data.farmExhausted).toBeUndefined();
+    expect(calls.filter(u=>u.endsWith('/join-group'))).toHaveLength(0);
+  });
+
+  it('heal migrates legacy swapped groups (joinedAccountId, no membership) as rejoins, not new decisions',async()=>{
+    const G_OLD='a0000000-0000-4000-8000-000000000014';
+    addRecord(G_OLD,'group',unjoined('МойСклад | Блог','https://t.me/moysklad_blog_test',{joinedAccountId:ACCOUNT_ID,joinState:''}));
+    const G_SKIP='a0000000-0000-4000-8000-000000000015';
+    addRecord(G_SKIP,'group',unjoined('Главред','https://t.me/glvrd_old_test',{joinedAccountId:ACCOUNT_ID,joinDecision:'skipped',source:'tgstat-blogs',joinState:''}));
+
+    const healed=await body(await POST(post({action:'heal_dead_group_accounts'})));
+
+    expect(group(G_OLD).joinRejoin).toBe(true);
+    expect(healed.items.map((i:{id:string})=>i.id)).toContain(G_OLD);
+    expect(healed.items.map((i:{id:string})=>i.id)).not.toContain(G_SKIP);
+  });
+});

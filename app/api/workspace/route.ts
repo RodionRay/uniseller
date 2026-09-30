@@ -3656,24 +3656,6 @@ export async function POST(req:Request){const session=await getSessionUser();con
    return isAccountUsable(a)&&hasMemberInviteQuota(a)&&!isAccountResolveBlind(a);
   });
   if(!liveIds.length){
-   // Все рабочие слоты слепы на ResolveUsername — не логиним их по кругу, ждём конца отлёжки
-   const blind=earliestResolveBlindEnd(accountIds.map(aid=>accMap.get(aid)).filter(a=>isAccountUsable(a)));
-   if(blind){
-    const resumeIso=blind.resumeAt;
-    const next={
-     ...data,
-     status:'scheduled',
-     error:'',
-     nextAt:resumeIso,
-     tickLockUntil:'',
-     log:pushTaskLogs(data.log,[
-      {level:'warn',text:`Все аккаунты (${blind.count}) не резолвят @username — ограничены Telegram`},
-      {level:'info',text:`Задача остановлена и запустится автоматически ${formatRuWhen(resumeIso)}`},
-     ]),
-    };
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'invite_task').run();
-    return reply({ok:true,stopped:true,scheduled:true,accountBlind:true,task:next});
-   }
    const quotaHit=accountIds.filter(aid=>{
     const a=accMap.get(aid);
     return isAccountUsable(a)&&!hasMemberInviteQuota(a);
@@ -3688,7 +3670,16 @@ export async function POST(req:Request){const session=await getSessionUser();con
     })
     .filter(t=>t>0)
     .sort((a,b)=>a-b);
-   const resumeIso=quotaHit?moscowNextMidnightIso():new Date(ends[0]||Date.now()+60*60*1000).toISOString();
+   // Слепые на ResolveUsername не логиним по кругу, но просыпаемся по самому раннему из: конец отлёжки, кулдаун, сброс квоты
+   const usable=accountIds.map(aid=>accMap.get(aid)).filter(a=>isAccountUsable(a));
+   const blind=earliestResolveBlindEnd(usable);
+   const wakeAt=[blind?Date.parse(blind.resumeAt):0,ends[0]||0,quotaHit?Date.parse(moscowNextMidnightIso()):0].filter(t=>t>0);
+   const resumeIso=new Date(wakeAt.length?Math.min(...wakeAt):Date.now()+60*60*1000).toISOString();
+   const reason=blind&&blind.count===usable.length
+    ?`Все аккаунты (${blind.count}) не резолвят @username — ограничены Telegram`
+    :quotaHit?`Ферма: дневной лимит инвайтов на всех аккаунтах (${quotaHit})`
+    :blind?`Нет активных аккаунтов · ${blind.count} не резолвят @username`
+    :'Нет активных аккаунтов';
    const next={
     ...data,
     status:'scheduled',
@@ -3696,12 +3687,12 @@ export async function POST(req:Request){const session=await getSessionUser();con
     nextAt:resumeIso,
     tickLockUntil:'',
     log:pushTaskLogs(data.log,[
-     {level:'info',text:quotaHit?`Ферма: дневной лимит инвайтов на всех аккаунтах (${quotaHit})`:'Нет активных аккаунтов'},
+     {level:blind?'warn':'info',text:reason},
      {level:'info',text:`Задача остановлена и запустится автоматически ${formatRuWhen(resumeIso)}`},
     ]),
    };
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'invite_task').run();
-   return reply({ok:true,stopped:true,scheduled:true,task:next});
+   return reply({ok:true,stopped:true,scheduled:true,accountBlind:!!blind,task:next});
   }
   let accountIndex=Number(data.accountIndex)||0;
   if(accountIndex>=liveIds.length)accountIndex=0;

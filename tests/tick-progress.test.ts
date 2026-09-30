@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { moscowDayKey } from "@/lib/telegram-accounts";
 import { insertRecord, readData } from "./helpers/d1-fake";
 import {
   ACCOUNT_ID,
@@ -166,5 +167,83 @@ describe("tick_invite keeps progress when paused mid-tick", () => {
     await POST(post({ action: "tick_invite", id: TASK_ID }));
 
     expect(readData(harness.sqlite!, TASK_ID)).toMatchObject({ status: "paused", done: 1, invitedToday: 1 });
+  });
+});
+
+describe("tick_invite with resolve-blind accounts", () => {
+  const OTHER_ID = "66666666-6666-4666-8666-666666666666";
+  const inHours = (h: number) => new Date(Date.now() + h * 3_600_000).toISOString();
+
+  function seedInvite(accountIds: string[]): void {
+    seedAudience();
+    insertRecord(harness.sqlite!, {
+      id: TASK_ID,
+      owner: OWNER,
+      kind: "invite_task",
+      data: {
+        audienceTaskId: AUDIENCE_ID,
+        targetUrl: "https://t.me/target",
+        accountIds,
+        status: "running",
+        batchSize: 1,
+        pauseFromSec: 1,
+        pauseToSec: 1,
+      },
+    });
+  }
+
+  function blindAccount(until = inHours(6)): void {
+    harness
+      .sqlite!.prepare("UPDATE records SET data=json_set(data,'$.resolveBlindUntil',?) WHERE id=?")
+      .run(until, ACCOUNT_ID);
+  }
+
+  it("schedules an all-blind farm until the earliest blindness ends without calling the worker", async () => {
+    const calls = mockWorker(() => ({ ok: true }));
+    const until = inHours(6);
+    blindAccount(until);
+    seedInvite([ACCOUNT_ID]);
+
+    await POST(post({ action: "tick_invite", id: TASK_ID }));
+
+    expect(readData(harness.sqlite!, TASK_ID)).toMatchObject({ status: "scheduled", nextAt: until });
+    expect(calls).toEqual([]);
+  });
+
+  it("wakes at a flood cooldown that ends before the blindness", async () => {
+    mockWorker(() => ({ ok: true }));
+    blindAccount();
+    const floodEnd = inHours(0.2);
+    await seedAccount(harness.sqlite!, OTHER_ID, { cooldownUntil: floodEnd, cooldownReason: "flood" });
+    seedInvite([ACCOUNT_ID, OTHER_ID]);
+
+    await POST(post({ action: "tick_invite", id: TASK_ID }));
+
+    expect(readData(harness.sqlite!, TASK_ID)).toMatchObject({ status: "scheduled", nextAt: floodEnd });
+  });
+
+  it("wakes at the quota reset when it comes before the blindness", async () => {
+    mockWorker(() => ({ ok: true }));
+    blindAccount(inHours(30));
+    await seedAccount(harness.sqlite!, OTHER_ID, { memberInvitesToday: 40, memberInviteDay: moscowDayKey() });
+    seedInvite([ACCOUNT_ID, OTHER_ID]);
+
+    await POST(post({ action: "tick_invite", id: TASK_ID }));
+
+    const task = readData(harness.sqlite!, TASK_ID)!;
+    expect(task.status).toBe("scheduled");
+    expect(Date.parse(String(task.nextAt))).toBeLessThanOrEqual(Date.now() + 24 * 3_600_000);
+  });
+
+  it("marks the account blind when the worker reports it cannot resolve the target", async () => {
+    mockWorker((path) =>
+      path === "/join-group" ? { ok: false, accountBlind: true, error: "ResolveUsername" } : { ok: true },
+    );
+    seedInvite([ACCOUNT_ID]);
+
+    await POST(post({ action: "tick_invite", id: TASK_ID }));
+
+    const until = Date.parse(String(readData(harness.sqlite!, ACCOUNT_ID)!.resolveBlindUntil));
+    expect(until).toBeGreaterThan(Date.now());
   });
 });

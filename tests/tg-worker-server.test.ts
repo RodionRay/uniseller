@@ -28,8 +28,13 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(() => r(null)))));
 });
 
-async function listen(opts: {maxConcurrency?: number; runPython?: (p: unknown, t: number) => Promise<unknown>} = {}) {
-  const config = resolveConfig({TG_WORKER_TOKEN: TOKEN, TG_WORKER_PORT: '0', TG_WORKER_MAX_CONCURRENCY: String(opts.maxConcurrency ?? 4)});
+async function listen(opts: {maxConcurrency?: number; maxQueue?: number; runPython?: (p: unknown, t: number) => Promise<unknown>} = {}) {
+  const config = resolveConfig({
+    TG_WORKER_TOKEN: TOKEN,
+    TG_WORKER_PORT: '0',
+    TG_WORKER_MAX_CONCURRENCY: String(opts.maxConcurrency ?? 4),
+    TG_WORKER_MAX_QUEUE: opts.maxQueue === undefined ? undefined : String(opts.maxQueue),
+  });
   const server = createWorkerServer(config, {
     runPython: opts.runPython ?? (async () => ({ok: true})),
     tickAutoRescan: async () => ({skipped: true}),
@@ -187,18 +192,39 @@ describe('tg-worker HTTP guard', () => {
     expect(status).toBe(413);
   });
 
-  it('returns 429 when all worker slots are busy', async () => {
+  it('queues requests beyond the slots and returns 429 only when the queue is full', async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));
-    const {base} = await listen({maxConcurrency: 1, runPython: async () => {await gate; return {ok: true};}});
+    const {base} = await listen({maxConcurrency: 1, maxQueue: 1, runPython: async () => {await gate; return {ok: true};}});
     const first = post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
     await new Promise((r) => setTimeout(r, 100));
-    const second = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
-    expect(second.status).toBe(429);
+    const queued = post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    await new Promise((r) => setTimeout(r, 100));
+    const rejected = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    expect(rejected.status).toBe(429);
     release();
     expect((await first).status).toBe(200);
-    const third = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
-    expect(third.status).toBe(200);
+    expect((await queued).status).toBe(200);
+  });
+
+  it('serves 8 concurrent proxy checks with 4 slots (UI bulk check) without 429', async () => {
+    let running = 0;
+    let peak = 0;
+    const {base} = await listen({
+      maxConcurrency: 4,
+      runPython: async () => {
+        running += 1;
+        peak = Math.max(peak, running);
+        await new Promise((r) => setTimeout(r, 50));
+        running -= 1;
+        return {ok: true};
+      },
+    });
+    const results = await Promise.all(
+      Array.from({length: 8}, () => post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'})),
+    );
+    expect(results.map((r) => r.status)).toEqual(Array(8).fill(200));
+    expect(peak).toBe(4);
   });
 });
 

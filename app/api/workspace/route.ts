@@ -39,6 +39,7 @@ import {
  type MailingLeadFilter,
  type MailingSourceKind,
 } from '@/lib/mailing';
+import {checkProxyTarget} from '@/lib/security/net-guard';
 import {env} from 'cloudflare:workers';
 import {z} from 'zod';
 export const dynamic='force-dynamic';
@@ -163,7 +164,7 @@ const schemas={
  }),
  proxy:z.object({
   name:short,
-  host:z.string().trim().regex(/^[a-zA-Z0-9.-]+$/).max(253),
+  host:z.string().trim().regex(/^[a-zA-Z0-9.-]+$/).max(253).refine(h=>checkProxyTarget(h,1).ok,{message:'forbidden_host'}),
   port:z.coerce.number().int().min(1).max(65535),
   protocol:z.enum(['socks5','http']),
   username:z.string().max(200).default(''),
@@ -391,6 +392,12 @@ async function runProxyCheck(owner:string,id:string){
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'proxy').first();
  if(!row)return {id,ok:false as const,error:'Прокси не найден',latencyMs:0,status:'inactive' as const};
  const data=JSON.parse(row.data);
+ const target=checkProxyTarget(String(data.host||''),Number(data.port));
+ if(!target.ok){
+  const failed={...data,status:'inactive',lastChecked:new Date().toISOString(),checkError:target.reason,exitIp:'',telegramOk:false,checkingAt:''};
+  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(failed),owner,id,'proxy').run();
+  return {id,ok:false as const,error:target.reason,latencyMs:0,status:'inactive' as const};
+ }
  const checkingAt=new Date().toISOString();
  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...data,status:'checking',checkError:'',checkingAt}),owner,id,'proxy').run();
  if(!row.secret){
@@ -496,6 +503,8 @@ async function loadAccountSessionPayload(owner:string,accountId:string){
   const prow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,data.proxyId,'proxy').first();
   if(prow){
    const pdata=JSON.parse(prow.data);
+   const target=checkProxyTarget(String(pdata.host||''),Number(pdata.port));
+   if(!target.ok)throw new UserFacingError(target.reason);
    let password='';
    if(prow.secret){try{password=await unseal(prow.secret,owner)}catch{/* */}}
    proxyPayload={host:pdata.host,port:Number(pdata.port),protocol:pdata.protocol||'socks5',username:pdata.username||'',password};

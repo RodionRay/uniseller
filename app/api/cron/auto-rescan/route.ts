@@ -6,6 +6,14 @@ import {
   sessionCookieName,
 } from "@/lib/auth";
 import { listUserIdsForCron } from "@/lib/users";
+import { database } from "@/lib/server-store";
+import { acquireLock, releaseLock } from "@/lib/locks";
+import { advanceCursor, rotateFrom } from "@/lib/processes/round-robin";
+import {
+  SYSTEM_OWNER,
+  readCronCursor,
+  writeCronCursor,
+} from "@/lib/processes/cron-state";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -18,6 +26,20 @@ const BOOT_TIMEOUT_MS = 20_000;
 const MAX_JOINS = 3;
 const MAX_SCANS_AUTO = 6;
 const MAX_SCANS_FORCE = 10;
+/** Owners per tick; the persisted cursor makes every owner's turn come round. */
+const MAX_OWNERS_PER_TICK = 3;
+/** Next owner starts only with this much budget left (boot + rescan + one scan). */
+const OWNER_MIN_LEFT_MS = 80_000;
+/** poll_dm_replies gets what is left, capped; the server bounds itself by budgetMs. */
+const POLL_DM_MAX_BUDGET_MS = 60_000;
+const POLL_DM_MIN_BUDGET_MS = 10_000;
+const POLL_DM_RESERVE_MS = 25_000;
+const POLL_DM_FETCH_MARGIN_MS = 8_000;
+const MARK_TIMEOUT_MS = 12_000;
+/** Server-side tick lock outlives the worker's fetch abort (270 s). */
+const CRON_LOCK_TTL_MS = 300_000;
+const CRON_LOCK_KEY = "cron:auto-rescan";
+const CRON_CURSOR_JOB = "auto-rescan-owners";
 
 function reply(data: unknown, status = 200) {
   return Response.json(data, {
@@ -26,20 +48,58 @@ function reply(data: unknown, status = 200) {
   });
 }
 
+/**
+ * Production accepts only CRON_SECRET. Outside production the worker's own fallback
+ * chain is accepted so `npm run dev` works without extra env.
+ */
 function cronSecret(): string {
-  return (
-    readEnv("CRON_SECRET") ||
-    readEnv("TG_WORKER_TOKEN") ||
-    readEnv("SESSION_SECRET") ||
-    ""
-  );
+  const dedicated = readEnv("CRON_SECRET") || "";
+  if (readEnv("NODE_ENV") === "production") return dedicated;
+  return dedicated || readEnv("TG_WORKER_TOKEN") || readEnv("SESSION_SECRET") || "";
 }
 
-function authOk(req: Request): boolean {
+function errorStack(e: unknown): string {
+  return e instanceof Error ? e.stack || e.message : String(e);
+}
+
+type CronOwner = { userId: string; email: string; name: string };
+
+/** Stable order (admin first, then by id) so the cursor means the same owner across ticks. */
+async function listCronOwners(): Promise<CronOwner[]> {
+  const owners: CronOwner[] = [];
+  const adminEmail = getAdminEmail();
+  if (adminEmail) {
+    owners.push({ userId: ADMIN_USER_ID, email: adminEmail, name: "Администратор" });
+  }
+  try {
+    const users = await listUserIdsForCron();
+    users.sort((a, b) => a.userId.localeCompare(b.userId));
+    owners.push(...users);
+  } catch (e) {
+    console.error("[cron:auto-rescan] owners lookup failed", { err: errorStack(e) });
+  }
+  const seen = new Set<string>();
+  return owners.filter((o) => !seen.has(o.userId) && !!seen.add(o.userId));
+}
+
+/**
+ * Compares SHA-256 digests with a fixed-length XOR loop: `===` on the raw header
+ * returns at the first differing byte and leaks the secret through timing.
+ * Kept local (not lib/auth) so route tests can mock lib/auth wholesale.
+ */
+async function bearerMatches(header: string, secret: string): Promise<boolean> {
+  const digest = async (value: string) =>
+    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+  const [a, b] = await Promise.all([digest(header), digest(`Bearer ${secret}`)]);
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
+}
+
+async function authOk(req: Request): Promise<boolean> {
   const secret = cronSecret();
   if (!secret) return false;
-  const auth = req.headers.get("authorization") || "";
-  return auth === `Bearer ${secret}`;
+  return bearerMatches(req.headers.get("authorization") || "", secret);
 }
 
 function isAbort(e: unknown) {
@@ -110,7 +170,7 @@ async function tryJoin(
  * Порциями: 1 join + 1–2 скана за тик, с бюджетом времени. Остаток — следующим тиком.
  */
 export async function POST(req: Request) {
-  if (!authOk(req)) return reply({ error: "Unauthorized" }, 401);
+  if (!(await authOk(req))) return reply({ error: "Unauthorized" }, 401);
 
   const origin = new URL(req.url).origin;
   const force =
@@ -124,34 +184,40 @@ export async function POST(req: Request) {
   const started = Date.now();
   const left = () => TICK_BUDGET_MS - (Date.now() - started);
 
-  const owners: { userId: string; email: string; name: string }[] = [];
-  const adminEmail = getAdminEmail();
-  if (adminEmail) {
-    owners.push({
-      userId: ADMIN_USER_ID,
-      email: adminEmail,
-      name: "Администратор",
-    });
-  }
-  try {
-    owners.push(...(await listUserIdsForCron()));
-  } catch {
-    /* таблицы пользователей ещё не созданы */
-  }
+  const owners = await listCronOwners();
   if (!owners.length) {
     return reply({ error: "Нет пользователей для обхода" }, 503);
   }
 
+  // Worker retries / overlapping schedules: one tick at a time across processes.
+  const db = database();
+  const lock = await acquireLock(db, {
+    owner: SYSTEM_OWNER,
+    key: CRON_LOCK_KEY,
+    ttlMs: CRON_LOCK_TTL_MS,
+  });
+  if (!lock) return reply({ ok: true, skipped: true, reason: "busy" });
+
   const ticks: Record<string, unknown>[] = [];
-  for (const owner of owners.slice(0, 3)) {
-    if (left() < 80_000) break;
-    const cookie = await createSessionToken({
-      userId: owner.userId,
-      email: owner.email,
-      displayName: owner.name,
-    });
-    const one = await tickOwner(origin, cookie, force, left);
-    ticks.push({ owner: owner.userId, ...one });
+  try {
+    const cursor = await readCronCursor(db, CRON_CURSOR_JOB);
+    let processed = 0;
+    for (const owner of rotateFrom(owners, cursor).slice(0, MAX_OWNERS_PER_TICK)) {
+      if (left() < OWNER_MIN_LEFT_MS) break;
+      const cookie = await createSessionToken({
+        userId: owner.userId,
+        email: owner.email,
+        displayName: owner.name,
+      });
+      const one = await tickOwner(origin, cookie, force, left);
+      ticks.push({ owner: owner.userId, ...one });
+      processed++;
+    }
+    await writeCronCursor(db, CRON_CURSOR_JOB, advanceCursor(cursor, processed, owners.length));
+  } finally {
+    await releaseLock(db, lock).catch((e) =>
+      console.error("[cron:auto-rescan] lock release failed", { err: errorStack(e) }),
+    );
   }
 
   const sum = (key: string) =>
@@ -336,16 +402,30 @@ async function tickOwner(
       }
     }
 
-    try {
-      await workspace(origin, cookie, { action: "poll_dm_replies" }, 90_000);
-    } catch {
-      /* ответы в ЛС — следующим тиком */
+    const pollBudget = Math.min(POLL_DM_MAX_BUDGET_MS, left() - POLL_DM_RESERVE_MS);
+    if (pollBudget >= POLL_DM_MIN_BUDGET_MS) {
+      try {
+        await workspace(
+          origin,
+          cookie,
+          { action: "poll_dm_replies", budgetMs: pollBudget },
+          pollBudget + POLL_DM_FETCH_MARGIN_MS,
+        );
+      } catch (e) {
+        // Ответы в ЛС — следующим тиком; сбой виден в логах.
+        console.error("[cron:auto-rescan] poll_dm_replies failed", { err: errorStack(e) });
+      }
     }
 
     try {
-      await workspace(origin, cookie, { action: "mark_auto_rescan" }, 12_000);
-    } catch {
-      /* */
+      await workspace(
+        origin,
+        cookie,
+        { action: "mark_auto_rescan" },
+        Math.min(MARK_TIMEOUT_MS, Math.max(3_000, left())),
+      );
+    } catch (e) {
+      console.error("[cron:auto-rescan] mark_auto_rescan failed", { err: errorStack(e) });
     }
 
     const due = Number(pack.total) || ids.length;
@@ -369,6 +449,7 @@ async function tickOwner(
       errors: errors.slice(0, 5),
     };
   } catch (e) {
+    console.error("[cron:auto-rescan] owner tick failed", { err: errorStack(e) });
     return {
       ok: false,
       error: String((e as Error).message || e).slice(0, 400),

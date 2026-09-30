@@ -1,33 +1,22 @@
 #!/usr/bin/env node
 /**
- * Локальная починка битых joinStateError в SQLite (.data или D1 persist).
- * Usage: node scripts/heal-joinstate-error.mjs
+ * Разовая починка битых joinStateError (объект / >500 символов) в локальной D1.
+ * Usage: npm run heal:joinstate   (D1_PERSIST_DIR, по умолчанию .wrangler/state;
+ * Docker: docker compose exec web npm run heal:joinstate)
  */
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { locateD1File } from "./wrangler-local.mjs";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
 
-const candidates = [
-  join(process.cwd(), ".data", "uniseller.sqlite"),
-  ...[
-    join(
-      process.cwd(),
-      ".wrangler/state/v3/d1/miniflare-D1DatabaseObject",
-    ),
-  ].flatMap((dir) => {
-    try {
-      const { readdirSync } = require("node:fs");
-      return readdirSync(dir)
-        .filter((f) => f.endsWith(".sqlite") && f !== "metadata.sqlite")
-        .map((f) => join(dir, f));
-    } catch {
-      return [];
-    }
-  }),
-];
+let candidates;
+try {
+  candidates = [locateD1File()];
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
 
 function sanitize(v) {
   if (v == null) return "";
@@ -37,7 +26,6 @@ function sanitize(v) {
 
 let total = 0;
 for (const path of candidates) {
-  if (!existsSync(path)) continue;
   const db = new Database(path);
   const has = db
     .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='records'")

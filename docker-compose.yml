@@ -1,15 +1,71 @@
+# Production on one VPS: `docker compose up -d --build` (docs/DEPLOY.md).
+# web reads ./.env (see .env.example); the worker gets an explicit allowlist from it.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
-  uniseller:
-    build: .
-    ports:
-      - "127.0.0.1:5173:5173"
-    env_file:
-      - .env
+  web:
+    build:
+      context: .
+      target: web
+    image: uniseller-web:latest
+    env_file: .env
     environment:
-      DATA_DIR: /data
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "5173"
+      D1_PERSIST_DIR: /data/wrangler
+      BACKUP_DIR: /data/backups
+      TELEGRAM_WORKER_URL: http://worker:8790
+    ports:
+      # Only Caddy on the host reaches the app; never publish on 0.0.0.0.
+      - "127.0.0.1:5173:5173"
     volumes:
       - uniseller-data:/data
+    networks:
+      - uniseller
     restart: unless-stopped
+    logging: *logging
+
+  worker:
+    build:
+      context: .
+      target: worker
+    image: uniseller-worker:latest
+    # TgCrypto / PyQt5-Qt5 wheels exist for x86_64 only.
+    platform: linux/amd64
+    # No env_file: the worker parses untrusted tdata, so it gets only what it reads
+    # (values are interpolated from ./.env by compose). Session/encryption keys,
+    # OAuth and admin secrets never reach this container.
+    environment:
+      NODE_ENV: production
+      TG_WORKER_HOST: 0.0.0.0
+      TG_WORKER_PORT: "8790"
+      TG_WORKER_TOKEN: ${TG_WORKER_TOKEN:?set TG_WORKER_TOKEN in .env}
+      CRON_SECRET: ${CRON_SECRET:?set CRON_SECRET in .env}
+      # worker -> web (auto-rescan cron) over the compose network, not the public URL;
+      # Caddy blocks /api/cron/* from outside.
+      APP_URL: http://web:5173
+      TG_WORKER_CONCURRENCY: ${TG_WORKER_CONCURRENCY:-4}
+      AUTO_RESCAN_EVERY_MS: ${AUTO_RESCAN_EVERY_MS:-300000}
+      TG_WORKER_KILL_GRACE_MS: ${TG_WORKER_KILL_GRACE_MS:-}
+      TG_WORKER_MAX_OUTPUT_BYTES: ${TG_WORKER_MAX_OUTPUT_BYTES:-}
+      TG_WORKER_TIMEOUT_MS: ${TG_WORKER_TIMEOUT_MS:-}
+    expose:
+      - "8790"
+    networks:
+      - uniseller
+    depends_on:
+      - web
+    restart: unless-stopped
+    logging: *logging
+
+networks:
+  uniseller:
 
 volumes:
   uniseller-data:

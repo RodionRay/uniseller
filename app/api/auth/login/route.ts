@@ -11,6 +11,9 @@ import {
   verifyPasswordHash,
 } from "@/lib/auth";
 import { findUserByEmail } from "@/lib/users";
+import { getDatabase } from "@/lib/db";
+import { isSameOriginRequest } from "@/lib/env";
+import { LOGIN_EMAIL_RULE, LOGIN_FAILURE_RULE, clientIp, createRateLimiter } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -22,8 +25,7 @@ function reply(data: unknown, status = 200) {
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin) {
+  if (!isSameOriginRequest(req)) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
   }
 
@@ -41,11 +43,37 @@ export async function POST(req: Request) {
       return reply({ error: "Неверный email или пароль" }, 401);
     }
 
+    // Count the attempt atomically BEFORE the slow PBKDF2: a check-then-hit let parallel
+    // requests all pass the check while the first verification was still running.
+    const limiter = createRateLimiter(getDatabase());
+    const throttleKey = `login:${clientIp(req)}:${email}`;
+    const emailKey = `login-email:${email}`;
+    const attempts = await limiter.hit(throttleKey, LOGIN_FAILURE_RULE);
+    const emailAttempts = await limiter.hit(emailKey, LOGIN_EMAIL_RULE);
+    const blocked =
+      attempts > LOGIN_FAILURE_RULE.max
+        ? { key: throttleKey, rule: LOGIN_FAILURE_RULE }
+        : emailAttempts > LOGIN_EMAIL_RULE.max
+          ? { key: emailKey, rule: LOGIN_EMAIL_RULE }
+          : null;
+    if (blocked) {
+      const retryAfter = await limiter.retryAfterSec(blocked.key, blocked.rule);
+      return NextResponse.json(
+        { error: "Слишком много попыток входа. Попробуйте позже." },
+        {
+          status: 429,
+          headers: { "Cache-Control": "no-store", "Retry-After": String(Math.max(1, retryAfter)) },
+        },
+      );
+    }
+    const rejectCredentials = () => reply({ error: "Неверный email или пароль" }, 401);
+
     const dbUser = await findUserByEmail(email);
     if (dbUser?.passwordHash) {
       if (!(await verifyPasswordHash(password, dbUser.passwordHash))) {
-        return reply({ error: "Неверный email или пароль" }, 401);
+        return rejectCredentials();
       }
+      await limiter.reset(throttleKey);
       const token = await createSessionToken({
         userId: dbUser.id,
         email: dbUser.email || email,
@@ -68,12 +96,13 @@ export async function POST(req: Request) {
         email: expected,
         displayName: "Администратор",
       });
+      await limiter.reset(throttleKey);
       const response = reply({ ok: true });
       response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
       return response;
     }
 
-    return reply({ error: "Неверный email или пароль" }, 401);
+    return rejectCredentials();
   } catch {
     return reply({ error: "Не удалось выполнить вход" }, 503);
   }

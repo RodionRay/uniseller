@@ -1,5 +1,8 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { readEnv, type EnvReader } from "@/lib/env";
+
+export { readEnv };
 
 export type SessionUser = {
   userId: string;
@@ -20,20 +23,6 @@ const LOGIN_PATH = "/login";
 const LOGOUT_PATH = "/logout";
 const SESSION_TTL_SEC = 60 * 60 * 24 * 14;
 const PBKDF2_ITERATIONS = 210_000;
-
-export function readEnv(name: string): string | undefined {
-  const fromProcess = process.env[name]?.trim();
-  if (fromProcess) return fromProcess;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { env } = require("cloudflare:workers") as {
-      env: Record<string, string | undefined>;
-    };
-    return env[name]?.trim();
-  } catch {
-    return undefined;
-  }
-}
 
 export function getAdminEmail(): string | undefined {
   return readEnv("ADMIN_EMAIL")?.toLowerCase();
@@ -81,11 +70,17 @@ export function sessionCookieName(): string {
   return COOKIE_NAME;
 }
 
+/** HTTPS deployments (APP_URL https://…) or production builds get `Secure` cookies. */
+export function cookieSecure(read: EnvReader = readEnv): boolean {
+  if (read("APP_URL")?.toLowerCase().startsWith("https://")) return true;
+  return process.env.NODE_ENV === "production";
+}
+
 export function sessionCookieOptions(maxAge = SESSION_TTL_SEC) {
   return {
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: process.env.NODE_ENV === "production",
+    secure: cookieSecure(),
     path: "/",
     maxAge,
   };
@@ -184,25 +179,25 @@ export async function verifyPasswordHash(
   return timingSafeEqualBytes(expected, actual);
 }
 
+const AUTH_PAGE_PATHS = new Set([LOGIN_PATH, "/register", LOGOUT_PATH, "/callback"]);
+
+/**
+ * Validates the *normalised* path too: "/.//evil.com" passes a raw prefix check but
+ * resolves to "//evil.com", which browsers read as another origin.
+ */
 export function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
+  if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/";
+  let url: URL;
   try {
-    const url = new URL(value, "https://app.local");
-    if (url.origin !== "https://app.local") return "/";
-    if (
-      url.pathname === LOGIN_PATH ||
-      url.pathname === "/register" ||
-      url.pathname === LOGOUT_PATH ||
-      url.pathname === "/signin-with-chatgpt" ||
-      url.pathname === "/signout-with-chatgpt" ||
-      url.pathname === "/callback"
-    ) {
-      return "/app";
-    }
-    return `${url.pathname}${url.search}${url.hash}`;
+    url = new URL(value, "https://app.local");
   } catch {
     return "/";
   }
+  if (url.origin !== "https://app.local") return "/";
+  const path = url.pathname;
+  if (!path.startsWith("/") || path.startsWith("//") || path.includes("\\")) return "/";
+  if (AUTH_PAGE_PATHS.has(path)) return "/app";
+  return `${path}${url.search}${url.hash}`;
 }
 
 async function sign(payload: string): Promise<string> {
@@ -231,7 +226,7 @@ async function sessionKey(): Promise<CryptoKey> {
 
 async function deriveKey(
   password: string,
-  salt: Buffer | Uint8Array,
+  salt: Uint8Array,
   iterations: number,
 ): Promise<ArrayBuffer> {
   const baseKey = await crypto.subtle.importKey(
@@ -244,7 +239,9 @@ async function deriveKey(
   return crypto.subtle.deriveBits(
     {
       name: "PBKDF2",
-      salt,
+      // Copy into a fresh ArrayBuffer-backed view: WebCrypto's BufferSource type
+      // rejects Buffer/SharedArrayBuffer-backed views.
+      salt: new Uint8Array(salt),
       iterations,
       hash: "SHA-256",
     },

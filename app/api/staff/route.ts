@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isSameOriginRequest } from "@/lib/env";
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth";
 import { findUserById } from "@/lib/users";
@@ -38,7 +39,48 @@ const accessSchema = z
   .partial()
   .optional();
 
+/** Every failure answers JSON and is logged once with the action and user. */
+async function guarded(
+  action: () => string,
+  userId: () => string,
+  run: () => Promise<Response>,
+): Promise<Response> {
+  try {
+    return await run();
+  } catch (e) {
+    if (e instanceof z.ZodError) return reply({ error: "Проверьте поля запроса" }, 400);
+    console.error("[staff]", {
+      action: action(),
+      userId: userId(),
+      err: e instanceof Error ? e.stack || e.message : String(e),
+    });
+    return reply({ error: "Не удалось выполнить действие. Повторите попытку." }, 503);
+  }
+}
+
 export async function GET(req: Request) {
+  return guarded(
+    () => "GET",
+    () => "",
+    () => handleGet(req),
+  );
+}
+
+export async function POST(req: Request) {
+  let action = "";
+  let userId = "";
+  return guarded(
+    () => action || "POST",
+    () => userId,
+    () =>
+      handlePost(req, (a, u) => {
+        action = a;
+        userId = u;
+      }),
+  );
+}
+
+async function handleGet(req: Request) {
   const url = new URL(req.url);
   const token = url.searchParams.get("token");
 
@@ -94,11 +136,13 @@ export async function GET(req: Request) {
   return reply({ workspace: ctx, members, invites });
 }
 
-export async function POST(req: Request) {
+async function handlePost(
+  req: Request,
+  track: (action: string, userId: string) => void,
+) {
   const user = await getSessionUser();
   if (!user) return reply({ error: "Войдите в кабинет" }, 401);
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin)
+  if (!isSameOriginRequest(req))
     return reply({ error: "Недопустимый источник запроса" }, 403);
 
   let body: any;
@@ -109,6 +153,7 @@ export async function POST(req: Request) {
   }
 
   const action = String(body.action || "");
+  track(action, user.userId);
 
   if (action === "accept_invite") {
     const token = z.string().min(16).max(80).parse(body.token);

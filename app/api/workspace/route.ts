@@ -722,8 +722,11 @@ const SCAN_LOCK_TTL_MS=10*60_000;
 const AUDIENCE_TICK_LOCK_MS=8*60_000;
 const INVITE_TICK_LOCK_MS=10*60_000;
 const MAILING_TICK_LOCK_MS=15*60_000;
-/** Mailing stops taking new recipients after this, so the lock TTL is never reached. */
-const MAILING_TICK_BUDGET_MS=10*60_000;
+/**
+ * Long actions start no new worker call after this, persist and answer more:true, so the browser
+ * (LONG_TIMEOUT_MS) keeps the request. A call already in flight may overrun it; progress is saved per step.
+ */
+const TICK_WORK_BUDGET_MS=100_000;
 /** Invite tick fields that survive a pause landing mid-tick (the rest is the user's call). */
 const INVITE_PROGRESS_FIELDS=new Set(['done','invitedToday','inviteDay','lastTickAt']);
 const TICK_BUSY_WAIT_SEC=15;
@@ -1712,20 +1715,26 @@ export async function POST(req:Request){const session=await getSessionUser();con
   await healStuckAccountChecks(owner,0);
   const mode=z.enum(['all','problem']).default('all').parse(b.mode??'all');
   const concurrency=Math.min(5,Math.max(1,z.coerce.number().int().default(ACCOUNT_CHECK_CONCURRENCY).parse(b.concurrency??ACCOUNT_CHECK_CONCURRENCY)));
-  const rows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='account' ORDER BY created DESC").bind(owner).all();
-  const ids=rows.results
-   .map((r:any)=>({id:r.id as string,data:JSON.parse(r.data as string)}))
-   .filter((r:{id:string;data:any})=>mode==='all'||r.data.status!=='active')
-   .map(r=>r.id)
-   .slice(0,40);
+  const cursor=z.coerce.number().int().min(0).default(0).parse(b.cursor??0);
+  const startedAt=Date.now();
+  // Stable order over all accounts: the cursor must not shift when checked ones leave the 'problem' filter.
+  const rows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='account' ORDER BY created DESC,id").bind(owner).all();
+  const all=rows.results.map((r:any)=>{
+   try{return {id:String(r.id),data:JSON.parse(String(r.data))}}
+   catch(e){logActionError('check_accounts_corrupt_row',owner,e);return {id:String(r.id),data:{}}}
+  });
   const results:Awaited<ReturnType<typeof runAccountCheck>>[]=[];
-  for(let i=0;i<ids.length;i+=concurrency){
-   const batch=ids.slice(i,i+concurrency);
-   const part=await Promise.all(batch.map(id=>runAccountCheck(owner,id,{checkRestrictions:false,ensureUsername:b.ensureUsername!==false,forceUsername:b.forceUsername===true,rotateProxy:true})));
+  let next=cursor;
+  while(next<all.length&&(next===cursor||Date.now()-startedAt<=TICK_WORK_BUDGET_MS)){
+   const slice=all.slice(next,next+concurrency);
+   next+=slice.length;
+   const ids=slice.filter(r=>mode==='all'||r.data.status!=='active').map(r=>r.id);
+   const part=await Promise.all(ids.map(id=>runAccountCheck(owner,id,{checkRestrictions:false,ensureUsername:b.ensureUsername!==false,forceUsername:b.forceUsername===true,rotateProxy:true})));
    results.push(...part);
   }
   const active=results.filter(r=>r.status==='active').length;
-  return reply({ok:true,checked:results.length,active,results});
+  const more=next<all.length;
+  return reply({ok:true,checked:results.length,active,results,more,cursor:more?next:undefined});
  }
  if(b.action==='reset_checking_accounts'){
   const fixedAcc=await healStuckAccountChecks(owner,0);
@@ -3355,6 +3364,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   try{
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'invite_task').first();
   if(!row)return reply({error:'Задача инвайта не найдена'},404);
+  const tickStartedAt=Date.now();
   let data=JSON.parse(row.data);
   if(data.status==='scheduled'&&data.autoStart!==false){
    // Автодозапуск после отлёжки аккаунтов
@@ -3507,8 +3517,16 @@ export async function POST(req:Request){const session=await getSessionUser();con
     },logEntries);
     return reply({ok:true,needJoin:true,task:next});
    }
-   if(sourceUrl){
+   if(sourceUrl&&Date.now()-tickStartedAt<=TICK_WORK_BUDGET_MS){
     try{await accountWorkerPost(owner,accountId,'/join-group',{...payload,url:sourceUrl})}catch(e){if(!isAccountBusy(e))logActionError('tick_invite_source_join',owner,e)}
+   }
+   if(Date.now()-tickStartedAt>TICK_WORK_BUDGET_MS){
+    // Joins are idempotent ('already' next time): hand the invite call to the next poll.
+    const next=await persistInviteTask({nextAt:'',status:'running'},[
+     ...logEntries,
+     {level:'info',text:'Время тика вышло — приглашения следующим тиком'},
+    ]);
+    return reply({ok:true,more:true,task:next});
    }
    const result=await accountWorkerPost(owner,accountId,'/invite-users',{
     ...payload,
@@ -4198,6 +4216,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    let payload=await loadPayload(activeAccountId);
    let accountWentCooldown=false;
    let cooldownUntil='';
+   let budgetCut=false;
    let nextAccountIndex=accountIndex;
    /** Per-send quota bump: counters survive a crash later in the batch. */
    const bumpSendCounters=async(aid:string)=>{
@@ -4211,7 +4230,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
    };
 
    for(const cand of batch){
-    if(Date.now()-tickStartedAt>MAILING_TICK_BUDGET_MS){
+    if(Date.now()-tickStartedAt>TICK_WORK_BUDGET_MS){
+     budgetCut=true;
      logEntries.push({level:'info',text:'Время тика вышло — остальные получатели следующим тиком'});
      break;
     }
@@ -4552,8 +4572,9 @@ export async function POST(req:Request){const session=await getSessionUser();con
      else pause=Math.max(pause,left);
     }
    }
-   logEntries.push({level:'info',text:`Ожидание ${pause} секунд`});
-
+   // Budget cut mid-batch: the rest of the batch goes out on the next poll, like within one tick.
+   const continueNow=budgetCut&&stillLive.length>0;
+   if(!continueNow)logEntries.push({level:'info',text:`Ожидание ${pause} секунд`});
 
    if(!stillLive.length){
     const resumeIso=accountWentCooldown?(cooldownUntil||cooldownHoursFromNow(24)):moscowNextMidnightIso();
@@ -4576,11 +4597,11 @@ export async function POST(req:Request){const session=await getSessionUser();con
     accountIndex:nextIndex,
     lastAccountId:accountId,
     lastTickAt:new Date().toISOString(),
-    nextAt:new Date(Date.now()+pause*1000).toISOString(),
+    nextAt:continueNow?'':new Date(Date.now()+pause*1000).toISOString(),
     status:'running',
     error:'',
    },logEntries);
-   return reply({ok:true,sent:okN,failed:failN,task:next,accountId});
+   return reply({ok:true,sent:okN,failed:failN,task:next,accountId,more:continueNow||undefined});
   }catch(e){
    logActionError('tick_mailing',owner,e);
    const next=await persistMailingTask({

@@ -11,6 +11,7 @@ import {
   waitLabel,
 } from "@/app/app/api-client";
 import { createPollGate } from "@/app/app/poll-gate";
+import { appTimeoutForWorker } from "@/lib/processes/worker-timeouts";
 
 function respond(body: string, status = 200, contentType = "application/json"): typeof fetch {
   return (async () => new Response(body, { status, headers: { "Content-Type": contentType } })) as typeof fetch;
@@ -121,6 +122,16 @@ describe("timeoutForAction", () => {
   it("gives poll_dm_replies ~100 s to cover the server budget", () => {
     expect(timeoutForAction("poll_dm_replies")).toBe(POLL_DM_TIMEOUT_MS);
     expect(POLL_DM_TIMEOUT_MS).toBeGreaterThanOrEqual(95_000);
+  });
+
+  it("outlasts the slowest single worker call (180 s + margin) for invite, collect and photos", () => {
+    for (const action of ["tick_invite", "tick_audience", "upload_account_photos"]) {
+      expect(timeoutForAction(action)).toBeGreaterThanOrEqual(appTimeoutForWorker("/invite-users") + 5_000);
+    }
+  });
+
+  it("outlasts one default worker call for the other long actions", () => {
+    expect(LONG_TIMEOUT_MS).toBeGreaterThan(appTimeoutForWorker("/send-message"));
   });
 
   it("gives CRUD and GET the default timeout", () => {

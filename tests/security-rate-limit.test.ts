@@ -63,12 +63,15 @@ describe("trustedClientIp", () => {
     expect(trustedClientIp(req({ "cf-connecting-ip": "198.51.100.4" }))).toBeNull();
   });
 
-  it.each(["", "none", "NONE"])("trusts no header when TRUSTED_IP_HEADER=%j", (value) => {
+  // Unset = no overwriting proxy is known, so every header is client-controlled.
+  it.each([undefined, "", "none", "NONE"])("trusts no header when TRUSTED_IP_HEADER=%j", (value) => {
     vi.stubEnv("TRUSTED_IP_HEADER", value);
     expect(trustedClientIp(req({ "cf-connecting-ip": "203.0.113.5" }))).toBeNull();
+    expect(trustedClientIp(req({ "x-real-ip": "203.0.113.5" }))).toBeNull();
   });
 
-  it("uses cf-connecting-ip only by default", () => {
+  it("with cf-connecting-ip configured ignores x-forwarded-for and malformed values", () => {
+    vi.stubEnv("TRUSTED_IP_HEADER", "cf-connecting-ip");
     expect(trustedClientIp(req({ "cf-connecting-ip": "203.0.113.5" }))).toBe("203.0.113.5");
     expect(trustedClientIp(req({ "x-forwarded-for": "203.0.113.5" }))).toBeNull();
     expect(trustedClientIp(req({ "cf-connecting-ip": "evil<script>" }))).toBeNull();

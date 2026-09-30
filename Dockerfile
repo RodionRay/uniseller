@@ -22,8 +22,8 @@ ENV NODE_ENV=production \
     D1_PERSIST_DIR=/data/wrangler \
     BACKUP_DIR=/data/backups \
     WRANGLER_SEND_METRICS=false
-# wrangler dev --local passes a client-supplied CF-Connecting-IP through, so no header is
-# trusted by default; see README "Client IP and rate limits".
+# wrangler dev --local passes client-supplied IP headers through, so none is trusted (also the
+# app default when unset; explicit here); see README "Client IP and rate limits".
 ENV TRUSTED_IP_HEADER=none
 # Wrangler 4.92 enables miniflare's Local Explorer (/cdn-cgi/explorer: raw SQL on D1) by default.
 ENV X_LOCAL_EXPLORER=false

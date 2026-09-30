@@ -1,16 +1,13 @@
 const IP_PATTERN = /^[0-9a-fA-F:.]{2,45}$/;
-const DEFAULT_TRUSTED_HEADER = "cf-connecting-ip";
 
 /**
- * Header that the edge in front of the app sets and overwrites with the real
- * client IP. `TRUSTED_IP_HEADER` names it (default `cf-connecting-ip`);
- * empty or `none` means no such edge exists, so no header is trusted.
- * Without an overwriting proxy the header is client-controlled.
+ * Header that the proxy in front of the app sets and overwrites with the real
+ * client IP, named by `TRUSTED_IP_HEADER` (e.g. `x-real-ip` behind Caddy).
+ * Unset, empty or `none` means no such proxy is known, so no header is
+ * trusted: without an overwriting proxy every header is client-controlled.
  */
 function trustedIpHeader(): string | null {
-  const configured = process.env.TRUSTED_IP_HEADER;
-  if (configured === undefined) return DEFAULT_TRUSTED_HEADER;
-  const name = configured.trim().toLowerCase();
+  const name = process.env.TRUSTED_IP_HEADER?.trim().toLowerCase() ?? "";
   return name === "" || name === "none" ? null : name;
 }
 

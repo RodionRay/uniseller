@@ -57,7 +57,8 @@
 ### IP клиента и лимиты
 - Лимиты по IP (`login-ip`, `register-ip`, `contact-ip`, `assistant-anon-ip` в
   `lib/security/rate-limit.ts::RATE_LIMITS`) берут IP из заголовка `TRUSTED_IP_HEADER`
-  (`lib/security/client-ip.ts::trustedClientIp`), по умолчанию `cf-connecting-ip`; `X-Forwarded-For` не читается.
+  (`lib/security/client-ip.ts::trustedClientIp`); без переменной (или `none`) заголовку не доверяют;
+  `X-Forwarded-For` не читается.
 - Прокси перед приложением **обязан перезаписывать** этот заголовок. Без такого прокси (локально, Docker/VPS через
   `wrangler dev --local`, который пропускает присланный клиентом `CF-Connecting-IP`) — `TRUSTED_IP_HEADER=none`.
   Docker так и поставляется; с Caddy из `deploy/Caddyfile` (перезаписывает `X-Real-IP`) — `TRUSTED_IP_HEADER=x-real-ip`.

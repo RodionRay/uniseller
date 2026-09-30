@@ -2,6 +2,12 @@ import { NextResponse } from "next/server";
 import { database } from "@/lib/server-store";
 import { readEnv } from "@/lib/auth";
 import { contactTasks } from "@/components/marketing/content";
+import { trustedClientIp } from "@/lib/security/client-ip";
+import {
+  RATE_LIMITS,
+  consumeRateLimit,
+  tooManyRequests,
+} from "@/lib/security/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -37,6 +43,11 @@ export async function POST(req: Request) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
   }
   try {
+    const limit = await consumeRateLimit(
+      RATE_LIMITS.contactPerIp,
+      trustedClientIp(req) ?? "unknown",
+    );
+    if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
     const body = (await req.json()) as Record<string, string>;
     const name = String(body.name ?? "").trim().slice(0, 80);
     const email = String(body.email ?? "").trim().toLowerCase().slice(0, 120);

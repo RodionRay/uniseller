@@ -6,6 +6,12 @@ import {
   canAskAssistant,
   generateAssistantReply,
 } from "@/lib/assistant-chat";
+import { trustedClientIp } from "@/lib/security/client-ip";
+import {
+  RATE_LIMITS,
+  consumeRateLimits,
+  tooManyRequests,
+} from "@/lib/security/rate-limit";
 import { z } from "zod";
 
 export const dynamic = "force-dynamic";
@@ -19,13 +25,10 @@ function reply(data: unknown, status = 200) {
 
 function clientKey(req: Request, owner?: string | null) {
   if (owner) return "assistant-guard:user:" + owner;
-  const fwd =
-    req.headers.get("cf-connecting-ip") ||
-    req.headers.get("x-forwarded-for") ||
-    "";
-  const ip = fwd.split(",")[0]?.trim() || "anon";
-  return "assistant-guard:ip:" + ip.slice(0, 80);
+  return "assistant-guard:ip:" + (trustedClientIp(req) ?? "anon");
 }
+
+type RecordRow = { created?: string; data?: string; secret?: string | null };
 
 async function loadOwnerProduct(
   owner: string,
@@ -33,12 +36,12 @@ async function loadOwnerProduct(
   const fromEnv = envAiApiKey() || undefined;
   try {
     const db = database();
-    const config: any = await db
+    const config = await db
       .prepare("SELECT * FROM records WHERE owner=? AND kind=? LIMIT 1")
       .bind(owner, "settings")
-      .first();
+      .first<RecordRow>();
     if (!config) return { apiKey: fromEnv };
-    const data = JSON.parse(config.data);
+    const data = JSON.parse(config.data || "{}") as { product?: string };
     const sealedKey = config.secret
       ? await unseal(config.secret, owner).catch(() => undefined)
       : undefined;
@@ -72,15 +75,23 @@ export async function POST(req: Request) {
     }
 
     if (db) {
-      const guardRow: any = await db
+      const guardRow = await db
         .prepare("SELECT created FROM records WHERE id=?")
         .bind(guardId)
-        .first();
+        .first<RecordRow>();
       if (!canAskAssistant(guardRow?.created, now)) {
         return reply(
           { error: "Подождите несколько секунд перед следующим вопросом." },
           429,
         );
+      }
+      // The site widget is public: anonymous use has a per-IP and a global daily cap.
+      if (!owner) {
+        const quota = await consumeRateLimits([
+          [RATE_LIMITS.assistantAnonGlobal, "all"],
+          [RATE_LIMITS.assistantAnonPerIp, trustedClientIp(req) ?? "unknown"],
+        ]);
+        if (!quota.allowed) return tooManyRequests(quota.retryAfterSec);
       }
       await db
         .prepare(

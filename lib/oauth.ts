@@ -3,10 +3,23 @@ import {
   safeRelativeReturnPath,
   sessionCookieOptions,
 } from "@/lib/auth";
+import { constantTimeEqual } from "@/lib/security/secret-compare";
+import {
+  createSignedNonce,
+  readCookie,
+  verifySignedNonce,
+} from "@/lib/security/signed-nonce";
 
 export type OAuthProvider = "google" | "yandex" | "vk";
 
 const STATE_COOKIE = "unilab_oauth";
+const TELEGRAM_STATE_COOKIE = "unilab_tg_state";
+const TELEGRAM_STATE_TTL_SEC = 600;
+/** Telegram Login payloads older than this are rejected as replays. */
+export const TELEGRAM_AUTH_MAX_AGE_SEC = 300;
+const TELEGRAM_CLOCK_SKEW_SEC = 60;
+/** Our own query params on data-auth-url; Telegram does not sign them. */
+const TELEGRAM_UNSIGNED_KEYS = new Set(["hash", "state", "return_to"]);
 
 export function oauthEnabled(provider: OAuthProvider): boolean {
   const prefix =
@@ -83,12 +96,16 @@ export function oauthAuthorizeUrl(
   return u.toString();
 }
 
-export function oauthStateCookie(value: string, maxAge = 600) {
+export function oauthStateCookie(
+  value: string,
+  requestUrl: string,
+  maxAge = 600,
+) {
   return {
     name: STATE_COOKIE,
     value,
     options: {
-      ...sessionCookieOptions(maxAge),
+      ...sessionCookieOptions(maxAge, requestUrl),
       sameSite: "lax" as const,
     },
   };
@@ -130,6 +147,8 @@ export function makeOAuthState(provider: string, returnTo: string) {
 export type OAuthProfile = {
   providerUserId: string;
   email: string | null;
+  /** True only when the provider asserts the email is verified (Google). */
+  emailVerified: boolean;
   name: string;
 };
 
@@ -160,12 +179,14 @@ export async function exchangeOAuthCode(
     const me = (await meRes.json()) as {
       sub?: string;
       email?: string;
+      email_verified?: boolean;
       name?: string;
     };
     if (!me.sub) throw new Error("Google не вернул профиль");
     return {
       providerUserId: me.sub,
       email: me.email || null,
+      emailVerified: me.email_verified === true,
       name: me.name || me.email || "Google",
     };
   }
@@ -195,6 +216,7 @@ export async function exchangeOAuthCode(
     return {
       providerUserId: String(me.id),
       email: me.default_email || null,
+      emailVerified: false,
       name: me.real_name || me.display_name || me.default_email || "Яндекс",
     };
   }
@@ -224,7 +246,55 @@ export async function exchangeOAuthCode(
   return {
     providerUserId: String(token.user_id),
     email: token.email || null,
+    emailVerified: false,
     name: name || `VK ${token.user_id}`,
+  };
+}
+
+function stateSecret(): string {
+  const secret = readEnv("SESSION_SECRET");
+  if (!secret || secret.length < 32) {
+    throw new Error("SESSION_SECRET не настроен (минимум 32 символа)");
+  }
+  return secret;
+}
+
+/**
+ * Issued when the login page loads the Telegram widget: the nonce is put into
+ * data-auth-url, the signed token into an httpOnly cookie. The callback only
+ * accepts a payload that comes back with the matching pair (login CSRF guard).
+ */
+export async function makeTelegramState(requestUrl: string) {
+  const { nonce, token } = await createSignedNonce(
+    stateSecret(),
+    TELEGRAM_STATE_TTL_SEC,
+  );
+  return {
+    nonce,
+    cookie: {
+      name: TELEGRAM_STATE_COOKIE,
+      value: token,
+      options: sessionCookieOptions(TELEGRAM_STATE_TTL_SEC, requestUrl),
+    },
+  };
+}
+
+export async function telegramStateValid(
+  req: Request,
+  state: string | null | undefined,
+): Promise<boolean> {
+  return verifySignedNonce(
+    readCookie(req, TELEGRAM_STATE_COOKIE),
+    state,
+    stateSecret(),
+  );
+}
+
+export function telegramStateCookieCleared(requestUrl: string) {
+  return {
+    name: TELEGRAM_STATE_COOKIE,
+    value: "",
+    options: { ...sessionCookieOptions(0, requestUrl), maxAge: 0 },
   };
 }
 
@@ -234,9 +304,9 @@ export async function verifyTelegramAuth(
   const token = readEnv("TELEGRAM_BOT_TOKEN");
   if (!token) throw new Error("Telegram Login не настроен");
   const hash = data.hash;
-  if (!hash) throw new Error("Нет подписи Telegram");
+  if (!hash || !data.id) throw new Error("Нет подписи Telegram");
   const check = Object.keys(data)
-    .filter((k) => k !== "hash")
+    .filter((k) => !TELEGRAM_UNSIGNED_KEYS.has(k))
     .sort()
     .map((k) => `${k}=${data[k]}`)
     .join("\n");
@@ -257,9 +327,12 @@ export async function verifyTelegramAuth(
     new TextEncoder().encode(check),
   );
   const hex = Buffer.from(mac).toString("hex");
-  if (hex !== hash) throw new Error("Неверная подпись Telegram");
+  if (!(await constantTimeEqual(hex, hash.toLowerCase()))) {
+    throw new Error("Неверная подпись Telegram");
+  }
   const authDate = Number(data.auth_date || 0);
-  if (!authDate || Date.now() / 1000 - authDate > 86400) {
+  const ageSec = Date.now() / 1000 - authDate;
+  if (!authDate || ageSec > TELEGRAM_AUTH_MAX_AGE_SEC || ageSec < -TELEGRAM_CLOCK_SKEW_SEC) {
     throw new Error("Сессия Telegram устарела");
   }
   const name =

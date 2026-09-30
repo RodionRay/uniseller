@@ -1,5 +1,8 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { safeRelativeReturnPath } from "@/lib/security/return-path";
+
+export { safeRelativeReturnPath };
 
 export type SessionUser = {
   userId: string;
@@ -81,11 +84,21 @@ export function sessionCookieName(): string {
   return COOKIE_NAME;
 }
 
-export function sessionCookieOptions(maxAge = SESSION_TTL_SEC) {
+const INSECURE_COOKIE_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Secure unless the request is for a loopback host (plain-http local dev).
+ * Without a request URL the cookie is always Secure.
+ */
+export function sessionCookieOptions(
+  maxAge = SESSION_TTL_SEC,
+  requestUrl?: string,
+) {
+  const host = requestUrl ? new URL(requestUrl).hostname : "";
   return {
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: process.env.NODE_ENV === "production",
+    secure: !INSECURE_COOKIE_HOSTS.has(host),
     path: "/",
     maxAge,
   };
@@ -184,27 +197,6 @@ export async function verifyPasswordHash(
   return timingSafeEqualBytes(expected, actual);
 }
 
-export function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
-  try {
-    const url = new URL(value, "https://app.local");
-    if (url.origin !== "https://app.local") return "/";
-    if (
-      url.pathname === LOGIN_PATH ||
-      url.pathname === "/register" ||
-      url.pathname === LOGOUT_PATH ||
-      url.pathname === "/signin-with-chatgpt" ||
-      url.pathname === "/signout-with-chatgpt" ||
-      url.pathname === "/callback"
-    ) {
-      return "/app";
-    }
-    return `${url.pathname}${url.search}${url.hash}`;
-  } catch {
-    return "/";
-  }
-}
-
 async function sign(payload: string): Promise<string> {
   const key = await sessionKey();
   const mac = await crypto.subtle.sign(
@@ -231,7 +223,7 @@ async function sessionKey(): Promise<CryptoKey> {
 
 async function deriveKey(
   password: string,
-  salt: Buffer | Uint8Array,
+  salt: Uint8Array<ArrayBuffer>,
   iterations: number,
 ): Promise<ArrayBuffer> {
   const baseKey = await crypto.subtle.importKey(

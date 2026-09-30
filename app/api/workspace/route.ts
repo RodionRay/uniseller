@@ -3372,9 +3372,31 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   }
   const liveIds=accountIds.filter(aid=>{
    const a=accMap.get(aid);
-   return isAccountUsable(a)&&hasMemberInviteQuota(a);
+   return isAccountUsable(a)&&hasMemberInviteQuota(a)&&!isAccountResolveBlind(a);
   });
   if(!liveIds.length){
+   // Все рабочие слоты слепы на ResolveUsername — не логиним их по кругу, ждём конца отлёжки
+   const blindEnds=accountIds
+    .map(aid=>accMap.get(aid))
+    .filter(a=>isAccountUsable(a)&&isAccountResolveBlind(a))
+    .map(a=>Date.parse(String(a.resolveBlindUntil)))
+    .sort((a,b)=>a-b);
+   if(blindEnds.length){
+    const resumeIso=new Date(blindEnds[0]).toISOString();
+    const next={
+     ...data,
+     status:'scheduled',
+     error:'',
+     nextAt:resumeIso,
+     tickLockUntil:'',
+     log:pushTaskLogs(data.log,[
+      {level:'warn',text:`Все аккаунты (${blindEnds.length}) не резолвят @username — ограничены Telegram`},
+      {level:'info',text:`Задача остановлена и запустится автоматически ${formatRuWhen(resumeIso)}`},
+     ]),
+    };
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'invite_task').run();
+    return reply({ok:true,stopped:true,scheduled:true,accountBlind:true,task:next});
+   }
    const quotaHit=accountIds.filter(aid=>{
     const a=accMap.get(aid);
     return isAccountUsable(a)&&!hasMemberInviteQuota(a);
@@ -3476,6 +3498,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const joinRes=await workerPost('/join-group',{...payload,url:data.targetUrl});
    if(!joinRes.ok&&joinRes.join!=='already'&&!/уже|already/i.test(String(joinRes.error||''))){
     const pause=randomPauseSec(data.pauseFromSec,data.pauseToSec);
+    if(isAccountBlindResult(joinRes)){
+     // Слот слеп — убираем из ротации на отлёжку, иначе задача логинит его каждый круг
+     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...(accMap.get(accountId)||{}),...accountBlindPatch(),error:String(joinRes.error||'').slice(0,500)}),owner,accountId,'account').run();
+    }
     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} не смог вступить в группу: ${String(joinRes.error||'').slice(0,120)}`});
     logEntries.push({level:'info',text:`Ожидание ${pause} секунд`});
     const next=await persistInviteTask({

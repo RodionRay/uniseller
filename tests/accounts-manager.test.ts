@@ -103,7 +103,7 @@ describe("менеджер аккаунтов · helpers", () => {
       month: "2-digit",
       day: "2-digit",
     }).format(new Date());
-    const out = applyQuotaCooldownIfExhausted({
+    const out = applyQuotaCooldownIfExhausted<Record<string, unknown>>({
       status: "active",
       limits: { invite: 2, message: 40, chat: 40, memberInvite: 40 },
       joinsToday: 2,
@@ -133,7 +133,7 @@ describe("менеджер аккаунтов · helpers", () => {
       month: "2-digit",
       day: "2-digit",
     }).format(new Date());
-    const chat = applyQuotaCooldownIfExhausted({
+    const chat = applyQuotaCooldownIfExhausted<Record<string, unknown>>({
       status: "active",
       limits: { invite: 40, message: 40, chat: 2, memberInvite: 40 },
       chatsToday: 2,
@@ -142,7 +142,7 @@ describe("менеджер аккаунтов · helpers", () => {
     expect(chat.status).toBe("cooldown");
     expect(String(chat.cooldownReason)).toBe("day_chat");
 
-    const invites = applyQuotaCooldownIfExhausted({
+    const invites = applyQuotaCooldownIfExhausted<Record<string, unknown>>({
       status: "active",
       limits: { invite: 40, message: 40, chat: 40, memberInvite: 3 },
       memberInvitesToday: 3,

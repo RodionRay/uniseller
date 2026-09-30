@@ -83,7 +83,10 @@ export function interpretMailingSendResult(
       deliveryMode === "chat"
         ? bumpChatCounters(account, 1)
         : bumpMessageCounters(account, 1);
-    const bumped = applyQuotaCooldownIfExhausted({ ...account, ...counters });
+    const bumped = applyQuotaCooldownIfExhausted<Record<string, unknown>>({
+      ...account,
+      ...counters,
+    });
     return {
       kind: "ok",
       bumped,

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { WORKER_REPLY_MARGIN_MS, appTimeoutForWorker, workerTimeoutMs } from "@/lib/processes/worker-timeouts";
 import { acquireLock } from "@/lib/locks";
 import { ACCOUNT_ID, OWNER, harness, mockWorker, post, resetHarness, seedAccount } from "./helpers/workspace-harness";
@@ -54,7 +54,7 @@ describe("worker timeout contract", () => {
 });
 
 describe("route passes the contract timeout to fetch", () => {
-  let timeoutSpy: ReturnType<typeof vi.spyOn>;
+  let timeoutSpy: MockInstance<(ms: number) => AbortSignal>;
   let errSpy: ReturnType<typeof vi.spyOn>;
   beforeEach(async () => {
     resetHarness();

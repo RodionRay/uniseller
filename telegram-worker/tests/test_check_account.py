@@ -1,14 +1,17 @@
 """Unit tests for pure helpers of check_account.py (stdlib only: python3 -m unittest)."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import os
 import sys
 import tempfile
+import types
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -203,6 +206,92 @@ class WorkDirTest(unittest.TestCase):
             del os.environ["UNISELLER_WORK_DIR"]
         self.assertEqual(work.parent, Path(parent))
         self.assertTrue(work.name.startswith("uniseller-acc-"))
+
+
+class _OpenTeleException(BaseException):
+    """Mirror of opentele.exception.OpenTeleException: a BaseException, not an Exception."""
+
+
+class _TDesktopUnauthorized(_OpenTeleException):
+    pass
+
+
+class _AuthClient:
+    def __init__(self, authorized: bool) -> None:
+        self.authorized = authorized
+
+    async def connect(self) -> None:
+        return None
+
+    async def is_user_authorized(self) -> bool:
+        return self.authorized
+
+    async def disconnect(self) -> None:
+        return None
+
+
+def _fake_opentele(*, current_authorized: bool = False) -> dict[str, types.ModuleType]:
+    """opentele stand-in: CreateNewSession raises TDesktopUnauthorized, as opentele does for a dead tdata."""
+    use_current, create_new = object(), object()
+
+    class TDesktop:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        def isLoaded(self) -> bool:
+            return True
+
+        async def ToTelethon(self, **kwargs: object) -> _AuthClient:
+            if kwargs["flag"] is create_new:
+                raise _TDesktopUnauthorized("TDesktop client is unauthorized")
+            return _AuthClient(current_authorized)
+
+    root = types.ModuleType("opentele")
+    td = types.ModuleType("opentele.td")
+    td.TDesktop = TDesktop  # type: ignore[attr-defined]
+    api = types.ModuleType("opentele.api")
+    api.UseCurrentSession = use_current  # type: ignore[attr-defined]
+    api.CreateNewSession = create_new  # type: ignore[attr-defined]
+    api.API = types.SimpleNamespace(TelegramDesktop=object())  # type: ignore[attr-defined]
+    exc = types.ModuleType("opentele.exception")
+    exc.OpenTeleException = _OpenTeleException  # type: ignore[attr-defined]
+    exc.TDesktopUnauthorized = _TDesktopUnauthorized  # type: ignore[attr-defined]
+    return {"opentele": root, "opentele.td": td, "opentele.api": api, "opentele.exception": exc}
+
+
+class DeadTdataTest(unittest.TestCase):
+    """Logged-out tdata: opentele raises TDesktopUnauthorized (BaseException) from CreateNewSession."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ca-dead-"))
+        self.payload = {
+            "format": "tdata",
+            "zipBase64": _zip_b64({"acc/tdata/key_datas": b"K", "acc/acc.session": b"S"}),
+        }
+
+    def _open(self, session_authorized: bool):
+        async def fake_session_file(*_args: object) -> _AuthClient:
+            return _AuthClient(session_authorized)
+
+        with mock.patch.dict(sys.modules, _fake_opentele()), mock.patch.object(
+            ca, "load_client_from_session_file", fake_session_file
+        ):
+            return asyncio.run(ca.open_client(self.payload, self.tmp))
+
+    def test_dead_tdata_is_classified_unauthorized(self) -> None:
+        with mock.patch.dict(sys.modules, _fake_opentele()):
+            with self.assertRaises(Exception) as ctx:
+                asyncio.run(ca.load_client_from_tdata(self.tmp, None, ""))
+        self.assertEqual(ca.classify_error(ctx.exception), "unauthorized")
+
+    def test_dead_tdata_falls_back_to_live_session_file(self) -> None:
+        client = self._open(session_authorized=True)
+        self.assertTrue(client.authorized)
+
+    def test_dead_tdata_and_session_report_unauthorized_status(self) -> None:
+        with self.assertRaises(Exception) as ctx:
+            self._open(session_authorized=False)
+        self.assertEqual(ca.error_result(ctx.exception)["status"], "unauthorized")
 
 
 if __name__ == "__main__":

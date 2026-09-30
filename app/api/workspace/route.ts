@@ -758,7 +758,8 @@ function isSessionDeadError(status:string,error:string){
  const e=String(error||'').toLowerCase();
  return (
   status==='unauthorized'||
-  /сессия больше не действительн|session.*(revoked|invalid|expired)|authkey|authorization key|not authorized/i.test(e)
+  // «unauthorized» — ещё и TDesktopUnauthorized из воркера до фикса BaseException (opentele)
+  /сессия больше не действительн|session.*(revoked|invalid|expired)|authkey|authorization key|not authorized|unauthorized/i.test(e)
  );
 }
 
@@ -820,14 +821,16 @@ async function putAccountConnectFailed(save:AccountSave,id:string,data:any,opts:
  };
 }
 
+/** Ключ сессии не зарегистрирован в Telegram: прокси тут ни при чём, повтор не поможет. */
+const DEAD_SESSION_TIP='Сессия недействительна — tdata разлогинена, нужен свежий аккаунт';
+
 async function putAccountUnauthorized(save:AccountSave,id:string,data:any,opts:{
  lastError:string;
  proxyRotated?:string;
 }){
  const tip=
-  `Сессия недействительна (смена прокси не помогла). `+
-  `Перелогиньтесь в Telegram Desktop и заново загрузите tdata/session. `+
-  `${String(opts.lastError||'').slice(0,160)}`;
+  `${DEAD_SESSION_TIP}. `+
+  `Последняя ошибка: ${String(opts.lastError||'').slice(0,160)}`;
  const next={
   ...data,
   status:'unauthorized' as const,

@@ -29,9 +29,20 @@ REFRESHED_SESSION_NAME = "uniseller_refreshed.session"
 _FLOOD_CLASSES = frozenset({"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"})
 _FROZEN_CLASSES = frozenset({"FrozenMethodInvalidError", "UserDeactivatedBanError", "UserDeactivatedError"})
 _UNAUTHORIZED_CLASSES = frozenset(
-    {"AuthKeyUnregisteredError", "SessionRevokedError", "AuthKeyDuplicatedError", "SessionExpiredError"}
+    {
+        "AuthKeyUnregisteredError",
+        "SessionRevokedError",
+        "AuthKeyDuplicatedError",
+        "SessionExpiredError",
+        "SessionUnauthorizedError",
+    }
 )
 _FLOOD_TEXT = re.compile(r"flood_(?:premium_)?wait_(\d+)|a wait of (\d+) seconds", re.IGNORECASE)
+SESSION_DEAD_MESSAGE = "Сессия больше не действительна"
+
+
+class SessionUnauthorizedError(RuntimeError):
+    """Ключ сессии (tdata/.session) разлогинен в Telegram — смена прокси не поможет."""
 
 
 def _class_names(exc: BaseException) -> set[str]:
@@ -139,6 +150,18 @@ def humanize_connect_error(exc: BaseException, has_proxy: bool) -> str:
             f"({raw[:120]})"
         )
     return raw[:400]
+
+
+def opentele_error(exc: BaseException) -> Exception:
+    """opentele бросает BaseException-наследников; переводим в обычные исключения воркера.
+
+    TDesktopUnauthorized = tdata разлогинена (ключ не зарегистрирован) → SessionUnauthorizedError.
+    """
+    from opentele.exception import TDesktopUnauthorized
+
+    if isinstance(exc, TDesktopUnauthorized):
+        return SessionUnauthorizedError(SESSION_DEAD_MESSAGE)
+    return RuntimeError(f"tdata: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 def error_result(exc: BaseException, **extra: Any) -> dict[str, Any]:
@@ -553,8 +576,12 @@ async def load_client_from_tdata(
     """tdata → Telethon. Сначала текущая сессия, при отказе — CreateNewSession (авто-смена)."""
     from opentele.td import TDesktop
     from opentele.api import UseCurrentSession, CreateNewSession, API
+    from opentele.exception import OpenTeleException
 
-    td = TDesktop(str(tdata_dir))
+    try:
+        td = TDesktop(str(tdata_dir))
+    except OpenTeleException as e:
+        raise opentele_error(e) from None
     if not td.isLoaded():
         raise RuntimeError("Не удалось прочитать tdata")
 
@@ -594,9 +621,11 @@ async def load_client_from_tdata(
                 await client.disconnect()
             except Exception:
                 pass
-            last_err = RuntimeError("Сессия больше не действительна")
+            last_err = SessionUnauthorizedError(SESSION_DEAD_MESSAGE)
             continue
-        except Exception as e:
+        except (Exception, OpenTeleException) as raw:
+            # OpenTeleException — BaseException: без перевода обходит все except Exception выше
+            e = opentele_error(raw) if isinstance(raw, OpenTeleException) else raw
             last_err = e
             try:
                 if client:
@@ -605,7 +634,7 @@ async def load_client_from_tdata(
                 pass
             # FloodWait/заморозка не лечатся новой сессией — лишь плодят авторизации устройств
             if classify_error(e) in ("flood", "frozen"):
-                raise
+                raise e
             low = str(e).lower()
             if any(
                 x in low
@@ -621,10 +650,9 @@ async def load_client_from_tdata(
                 raise RuntimeError(humanize_connect_error(e, bool(proxy))) from e
             continue
 
-    if last_err:
-        raise RuntimeError(humanize_connect_error(last_err, bool(proxy))) from last_err
-    raise RuntimeError("Сессия больше не действительна")
-    _ = two_fa
+    if last_err is None or classify_error(last_err) == "unauthorized":
+        raise SessionUnauthorizedError(SESSION_DEAD_MESSAGE) from last_err
+    raise RuntimeError(humanize_connect_error(last_err, bool(proxy))) from last_err
 
 
 async def load_client_from_session_file(
@@ -772,7 +800,7 @@ async def open_client(payload: dict[str, Any], work: Path):
                         await client.disconnect()
                     except Exception:
                         pass
-                    raise RuntimeError("Сессия больше не действительна")
+                    raise SessionUnauthorizedError(SESSION_DEAD_MESSAGE)
             return client
         except Exception as e:
             last_exc = e
@@ -795,10 +823,9 @@ async def open_client(payload: dict[str, Any], work: Path):
             continue
 
     msg = str(last_exc or "Не удалось открыть сессию")
-    if "Сессия больше не действительна" in msg or "auth" in msg.lower():
-        raise RuntimeError(
-            "Сессия больше не действительна"
-            + (f" ({'; '.join(errors)})" if errors else "")
+    if SESSION_DEAD_MESSAGE in msg or "auth" in msg.lower():
+        raise SessionUnauthorizedError(
+            SESSION_DEAD_MESSAGE + (f" ({'; '.join(errors)})" if errors else "")
         )
     if "Не удалось подключиться" not in msg and (
         "connection to telegram failed" in msg.lower() or "failed" in msg.lower()

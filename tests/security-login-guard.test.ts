@@ -14,7 +14,7 @@ const ADMIN = "boss@example.com";
 const ADMIN_PW = `admin-${randomUUID()}`;
 const DB_PW = `db-${randomUUID()}`;
 const NEW_PW = `new-${randomUUID()}`;
-const ENV_KEYS = ["SESSION_SECRET", "ADMIN_EMAIL", "ADMIN_PASSWORD_HASH", "REGISTRATION_OPEN"];
+const ENV_KEYS = ["SESSION_SECRET", "ADMIN_EMAIL", "ADMIN_PASSWORD_HASH", "REGISTRATION_OPEN", "TRUSTED_IP_HEADER"];
 const saved: Record<string, string | undefined> = {};
 let ipSeq = 0;
 
@@ -42,6 +42,8 @@ function sessionSubject(res: Response): string | null {
 beforeAll(async () => {
   for (const k of ENV_KEYS) saved[k] = process.env[k];
   process.env.SESSION_SECRET = "s".repeat(48);
+  // Per-IP guards below need a trusted header; unset trusts none.
+  process.env.TRUSTED_IP_HEADER = "cf-connecting-ip";
   // The register guards below only run once self-registration is open.
   process.env.REGISTRATION_OPEN = "true";
   process.env.ADMIN_EMAIL = ADMIN;

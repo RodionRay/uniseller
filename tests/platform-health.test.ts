@@ -14,6 +14,14 @@ const VALID_ENV: Record<string, string> = {
   TELEGRAM_WORKER_URL: "http://worker:8790",
 };
 
+type HealthBody = {
+  ok: boolean;
+  db: string;
+  config: { ok: boolean; missing: string[]; invalid: string[] };
+  worker?: string;
+};
+const readBody = async (res: Response) => (await res.json()) as HealthBody;
+
 const request = (query = "") => new Request(`http://127.0.0.1:5173/api/health${query}`);
 
 beforeEach(() => {
@@ -45,7 +53,7 @@ describe("GET /api/health", () => {
     vi.stubEnv("CRON_SECRET", "");
     const res = await GET(request());
     expect(res.status).toBe(503);
-    const body = await res.json();
+    const body = await readBody(res);
     expect(body.config.missing).toEqual(["CRON_SECRET"]);
     expect(JSON.stringify(body)).not.toContain("worker-token");
   });
@@ -54,7 +62,7 @@ describe("GET /api/health", () => {
     vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new Error("ECONNREFUSED"))));
     const res = await GET(request());
     expect(res.status).toBe(503);
-    expect((await res.json()).worker).toBe("down");
+    expect((await readBody(res)).worker).toBe("down");
   });
 
   it("scope=self skips the worker probe", async () => {
@@ -70,6 +78,6 @@ describe("GET /api/health", () => {
     db.up = false;
     const res = await GET(request("?scope=self"));
     expect(res.status).toBe(503);
-    expect((await res.json()).db).toBe("down");
+    expect((await readBody(res)).db).toBe("down");
   });
 });

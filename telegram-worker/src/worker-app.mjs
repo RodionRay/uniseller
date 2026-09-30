@@ -19,6 +19,7 @@ const DEFAULT_MAX_STDOUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5_000;
 const GENERIC_WORKER_ERROR = "Ошибка воркера (нет ответа)";
 const TIMEOUT_ERROR = "Таймаут воркера";
+const ABORTED_ERROR = "Запрос отменён клиентом";
 
 export const ROUTES = Object.freeze({
   "/check-account": "check",
@@ -178,9 +179,11 @@ export function createPythonRunner(opts) {
   /**
    * @param {unknown} payload
    * @param {number} timeoutMs
+   * @param {AbortSignal} [signal] aborted when the HTTP client went away
    * @returns {Promise<Record<string, unknown>>}
    */
-  async function run(payload, timeoutMs) {
+  async function run(payload, timeoutMs, signal) {
+    if (signal?.aborted) return { ok: false, status: "disconnected", error: ABORTED_ERROR };
     const workDir = await mkdtemp(join(tmpRoot, WORK_DIR_PREFIX));
     await chmod(workDir, 0o700);
     return new Promise((resolve) => {
@@ -210,6 +213,12 @@ export function createPythonRunner(opts) {
         terminate();
         finish({ ok: false, status: "disconnected", error: TIMEOUT_ERROR });
       }, timeoutMs);
+      const onAbort = () => {
+        terminate();
+        finish({ ok: false, status: "disconnected", error: ABORTED_ERROR });
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
       child.stdout.on("data", (/** @type {Buffer} */ d) => {
         outBytes += d.length;
         if (outBytes > maxStdoutBytes) {
@@ -225,6 +234,7 @@ export function createPythonRunner(opts) {
       const closed = new Promise((done) => {
         child.on("close", () => {
           clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
           if (killTimer) clearTimeout(killTimer);
           rm(workDir, { recursive: true, force: true })
             .catch(() => console.warn("[tg-worker] failed to remove work dir"))
@@ -268,23 +278,43 @@ function isJson(contentType) {
 
 /**
  * @param {ReturnType<typeof resolveConfig>} config
- * @param {{ runPython: (payload: any, timeoutMs: number) => Promise<unknown>,
+ * @param {{ runPython: (payload: any, timeoutMs: number, signal?: AbortSignal) => Promise<unknown>,
  *   tickAutoRescan: (force: boolean) => Promise<unknown>,
  *   autoRescanStatus: () => Record<string, unknown> }} deps
  */
 export function createWorkerServer(config, deps) {
+  // Requests holding a place: reading their body, waiting for a slot or running.
+  // Reserved before the body is read, so slow senders cannot all pass the check.
+  let admitted = 0;
   let active = 0;
   /** @type {Array<() => void>} */
   const waiters = [];
-  const queueFull = () => active >= config.maxConcurrency && waiters.length >= config.maxQueue;
-  /** Resolves when a Python slot is free; FIFO. */
-  const acquire = () => {
+  /**
+   * Resolves true once a Python slot is held (FIFO), false if `signal` aborts first.
+   * @param {AbortSignal} signal
+   * @returns {Promise<boolean>}
+   */
+  const acquire = (signal) => {
+    if (signal.aborted) return Promise.resolve(false);
     if (active < config.maxConcurrency) {
       active += 1;
-      return Promise.resolve();
+      return Promise.resolve(true);
     }
-    return new Promise((resolve) => waiters.push(() => resolve(undefined)));
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        const i = waiters.indexOf(grant);
+        if (i >= 0) waiters.splice(i, 1);
+        resolve(false);
+      };
+      const grant = () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(true);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      waiters.push(grant);
+    });
   };
+  /** Hands the slot to the next waiter, or frees it. Call once per granted slot. */
   const release = () => {
     const next = waiters.shift();
     if (next) next();
@@ -305,6 +335,7 @@ export function createWorkerServer(config, deps) {
 
   const server = createServer(async (req, res) => {
     const send = (/** @type {number} */ code, /** @type {unknown} */ data, extra = {}) => {
+      if (res.destroyed || res.writableEnded) return;
       res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", ...extra });
       res.end(JSON.stringify(data));
     };
@@ -327,11 +358,39 @@ export function createWorkerServer(config, deps) {
       req.resume();
       return send(413, { ok: false, error: "Payload too large" }, { Connection: "close" });
     }
-    if (queueFull()) {
+    if (admitted >= config.maxConcurrency + config.maxQueue) {
       req.resume();
       return send(429, { ok: false, error: "Воркер занят, повторите позже" }, { "Retry-After": "5" });
     }
-    // Read the body before queueing so a waiting request can't hit requestTimeout.
+    admitted += 1;
+    let placeHeld = true;
+    const leave = () => {
+      if (!placeHeld) return;
+      placeHeld = false;
+      admitted -= 1;
+    };
+    // Client gone before we answered (e.g. app-side timeout): stop waiting / kill the job.
+    const clientGone = new AbortController();
+    res.on("close", () => {
+      if (!res.writableFinished) clientGone.abort();
+      leave();
+    });
+    try {
+      await handleJob(req, send, action, clientGone.signal);
+    } finally {
+      leave();
+    }
+  });
+
+  /**
+   * Reads the body (before queueing, so a waiting request can't hit requestTimeout),
+   * then runs the job in a Python slot.
+   * @param {import("node:http").IncomingMessage} req
+   * @param {(code: number, data: unknown, extra?: Record<string, string>) => void} send
+   * @param {string} action
+   * @param {AbortSignal} signal
+   */
+  async function handleJob(req, send, action, signal) {
     let payload;
     try {
       const raw = await readBody(req, config.maxBodyBytes);
@@ -344,15 +403,16 @@ export function createWorkerServer(config, deps) {
       return send(400, { ok: false, error: "Invalid JSON" });
     }
     payload.action = action;
-    await acquire();
+    if (!(await acquire(signal))) return;
     try {
-      return send(200, await deps.runPython(payload, timeoutForAction(/** @type {string} */ (action))));
+      if (signal.aborted) return;
+      return send(200, await deps.runPython(payload, timeoutForAction(action), signal));
     } catch {
       return send(500, { ok: false, error: GENERIC_WORKER_ERROR });
     } finally {
       release();
     }
-  });
+  }
   // Slow senders must not pin a concurrency slot while the body trickles in.
   server.requestTimeout = 60_000;
   return server;
@@ -380,8 +440,13 @@ function readBody(req, limit) {
       }
       chunks.push(c);
     });
+    let ended = false;
     req.on("end", () => {
+      ended = true;
       if (!overflow) resolve(Buffer.concat(chunks));
+    });
+    req.on("close", () => {
+      if (!ended && !overflow) reject(new Error("client aborted"));
     });
     req.on("error", reject);
   });

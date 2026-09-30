@@ -192,7 +192,7 @@ function startWeb() {
   const child = spawnLogged(
     "web",
     process.execPath,
-    [runner, "dev", "--host", "127.0.0.1", "--port", String(webPort), ...extraArgs],
+    [runner, "dev", "--hostname", "127.0.0.1", "--port", String(webPort), ...extraArgs],
     {
       env: {
         ...sharedSecrets,

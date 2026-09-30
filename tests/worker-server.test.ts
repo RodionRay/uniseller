@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,7 +84,7 @@ describe("tg-worker server", () => {
   });
 
   it("stays up when python dies before reading stdin", async () => {
-    const w = await startWorker({ FAKE_PY_CRASH: "1" });
+    const w = await startWorker({ FAKE_PY_CRASH: "1", TG_WORKER_PYTHON_ENV: "FAKE_PY_CRASH" });
     await waitHealthy(w.port);
     const r = await post(w.port, "/join-group", { blob: "b".repeat(3_000_000) });
     expect(r.body.ok).toBe(false);
@@ -120,12 +120,40 @@ describe("tg-worker server", () => {
     expect(Math.max(...results.map((r) => Number(r.body.running)))).toBeLessThanOrEqual(2);
   });
 
-  it("caps stdout at 1 MB", async () => {
+  it("caps check-proxy stdout at 1 MB", async () => {
     const w = await startWorker();
     await waitHealthy(w.port);
-    const r = await post(w.port, "/scan-group", { mode: "big" });
+    const r = await post(w.port, "/check-proxy", { mode: "big" });
     expect(r.body.ok).toBe(false);
     expect(String(r.body.error)).toMatch(/байт/);
+  });
+
+  it("returns a refreshed session larger than 1 MB from an account action", async () => {
+    const w = await startWorker();
+    await waitHealthy(w.port);
+    const size = 3 * 1024 * 1024;
+    const r = await post(w.port, "/send-message", { mode: "refreshed", size, accountId: "big" });
+    expect(r.body).toMatchObject({ ok: true, sessionRefreshed: true });
+    const session = r.body.refreshedSession as { zipBase64: string };
+    expect(session.zipBase64).toHaveLength(size);
+  });
+
+  it("does not pass app secrets to the python child", async () => {
+    const secrets = {
+      SESSION_SECRET: "session-secret-value",
+      ENCRYPTION_KEY: "encryption-key-value",
+      TG_WORKER_TOKEN: "worker-token-value",
+      CRON_SECRET: "cron-secret-value",
+      GOOGLE_CLIENT_SECRET: "oauth-secret-value",
+      ADMIN_PASSWORD_HASH: "admin-hash-value",
+    };
+    const w = await startWorker(secrets);
+    await waitHealthy(w.port);
+    const r = await post(w.port, "/check-account", { mode: "env" }, secrets.TG_WORKER_TOKEN);
+    const env = r.body.env as Record<string, string>;
+    expect(Object.keys(env)).toEqual(expect.arrayContaining(["PATH", "UNISELLER_WORK_DIR"]));
+    for (const name of Object.keys(secrets)) expect(env).not.toHaveProperty(name);
+    expect(JSON.stringify(env)).not.toMatch(/-value/);
   });
 
   it("exposes the version dev-local computes and appUrl in /health", async () => {
@@ -178,5 +206,81 @@ describe("tg-worker auth", () => {
     const w = await startWorker();
     await waitHealthy(w.port);
     expect((await post(w.port, "/scan-group", { mode: "echo" })).status).toBe(200);
+  });
+});
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor<T>(probe: () => T | undefined, ms = 5_000): Promise<T> {
+  for (const t0 = Date.now(); Date.now() - t0 < ms; ) {
+    const v = probe();
+    if (v !== undefined) return v;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error("condition not met in time");
+}
+
+/** Стартует запрос с долгим python, ждёт его pid и обрывает HTTP-соединение. */
+async function abortHungRequest(port: number, path: string, trackDir: string): Promise<number> {
+  const abort = new AbortController();
+  const pending = fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "hang-track", trackDir, accountId: "acc" }),
+    signal: abort.signal,
+  }).catch(() => null);
+  const pidFile = join(trackDir, "pid");
+  const pid = await waitFor(() => (existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : undefined));
+  abort.abort();
+  await pending;
+  return pid;
+}
+
+describe("tg-worker client abort", () => {
+  it("kills a started read-only action and frees the account queue", async () => {
+    const w = await startWorker({ TG_WORKER_KILL_GRACE_MS: "300" });
+    await waitHealthy(w.port);
+    const pid = await abortHungRequest(w.port, "/scan-group", join(w.tmp, "scan"));
+    await waitFor(() => (isAlive(pid) ? undefined : true));
+    const next = await post(w.port, "/scan-group", { mode: "echo", accountId: "acc" });
+    expect(next.body).toMatchObject({ ok: true, action: "scan" });
+    await waitFor(() => (readdirSync(w.tmp).some((n) => n.startsWith("uniseller-acc-")) ? undefined : true));
+  });
+
+  it("lets a started send finish instead of killing it on abort", async () => {
+    const w = await startWorker();
+    await waitHealthy(w.port);
+    const pid = await abortHungRequest(w.port, "/send-message", join(w.tmp, "send"));
+    await new Promise((r) => setTimeout(r, 500));
+    expect(isAlive(pid)).toBe(true);
+    process.kill(pid, "SIGKILL");
+  });
+});
+
+describe("tg-worker process-level errors", () => {
+  it("logs and survives unhandledRejection and uncaughtException", async () => {
+    const preload = join(mkdtempSync(join(tmpdir(), "worker-preload-")), "crash.mjs");
+    writeFileSync(
+      preload,
+      [
+        'setTimeout(() => { Promise.reject(new Error("test-rejection")); }, 300);',
+        'setTimeout(() => { throw new Error("test-exception"); }, 400);',
+      ].join("\n"),
+    );
+    const w = await startWorker({ NODE_OPTIONS: `--import=${preload}` });
+    let stderr = "";
+    w.child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+    await waitHealthy(w.port);
+    await waitFor(() => (/uncaughtException[\s\S]*test-exception/.test(stderr) ? true : undefined));
+    expect(stderr).toMatch(/unhandledRejection[\s\S]*test-rejection/);
+    expect(w.child.exitCode).toBeNull();
+    expect(await waitHealthy(w.port)).toMatchObject({ ok: true });
   });
 });

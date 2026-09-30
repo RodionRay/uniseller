@@ -12,12 +12,68 @@ import { join } from "node:path";
 export const WORK_DIR_PREFIX = "uniseller-acc-";
 export const DEFAULT_KILL_GRACE_MS = 5_000;
 export const DEFAULT_MAX_OUTPUT_BYTES = 1_048_576;
+/**
+ * Действия с аккаунтом могут вернуть перепакованный архив сессии (refreshedSession):
+ * импорт допускает архив до 1 МиБ, в base64 он больше — 1 МиБ на весь ответ мало.
+ */
+export const ACCOUNT_MAX_OUTPUT_BYTES = 8 * 1_048_576;
+/** Сбор аудитории отдаёт список участников — у больших групп это мегабайты. */
+export const COLLECT_MAX_OUTPUT_BYTES = 32 * 1_048_576;
 export const STALE_WORK_DIR_MS = 10 * 60_000;
+
+/**
+ * Python разбирает чужие tdata — секреты приложения (SESSION_SECRET, ENCRYPTION_KEY,
+ * OAuth, токены) ему не нужны. Передаём только окружение интерпретатора.
+ */
+const CHILD_ENV_NAMES = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LANG",
+  "LANGUAGE",
+  "TZ",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "SYSTEMROOT",
+  "VIRTUAL_ENV",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+]);
+const CHILD_ENV_PREFIXES = ["LC_", "PYTHON"];
+
+/** Минимальное окружение Python-процесса; `passthrough` — явные доп. имена (TG_WORKER_PYTHON_ENV). */
+export function childEnv(source, workDir, passthrough = []) {
+  const extra = new Set(passthrough);
+  const env = {};
+  for (const [name, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    const allowed =
+      CHILD_ENV_NAMES.has(name) ||
+      extra.has(name) ||
+      CHILD_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));
+    if (allowed) env[name] = value;
+  }
+  return { ...env, PYTHONUNBUFFERED: "1", UNISELLER_WORK_DIR: workDir };
+}
+
+/** Лимит stdout по действию; для аккаунтов растёт с размером присланного архива. */
+export function stdoutCapFor(action, payload, configured = DEFAULT_MAX_OUTPUT_BYTES) {
+  if (action === "check_proxy") return configured;
+  if (action === "collect") return Math.max(configured, COLLECT_MAX_OUTPUT_BYTES);
+  const archive = typeof payload?.zipBase64 === "string" ? payload.zipBase64.length : 0;
+  return Math.max(configured, ACCOUNT_MAX_OUTPUT_BYTES, 2 * archive + 1_048_576);
+}
 
 const CANCELLED = Object.freeze({
   ok: false,
   status: "disconnected",
   error: "Запрос отменён до запуска",
+});
+const ABORTED = Object.freeze({
+  ok: false,
+  status: "disconnected",
+  error: "Запрос отменён клиентом",
 });
 
 function failure(error) {
@@ -38,7 +94,8 @@ function hintFrom(err, out) {
 
 /**
  * Стартует Python. `result` резолвится ответом (или ошибкой таймаута сразу),
- * `exited` — когда процесс реально завершился и каталог убран.
+ * `exited` — когда процесс реально завершился и каталог убран,
+ * `cancel()` — ответить «отменён» и остановить процесс (SIGTERM → SIGKILL).
  */
 export function startPython({
   python,
@@ -50,6 +107,7 @@ export function startPython({
   maxStdoutBytes = DEFAULT_MAX_OUTPUT_BYTES,
   maxStderrBytes = DEFAULT_MAX_OUTPUT_BYTES,
   tempRoot = tmpdir(),
+  envPassthrough = [],
 }) {
   let resolveResult;
   let resolveExited;
@@ -70,24 +128,25 @@ export function startPython({
     rmSync(workDir, { recursive: true, force: true });
     resolveExited();
   };
+  const noop = () => {};
 
   let child;
   try {
     child = spawn(python, [script, "--payload", "-"], {
       cwd,
-      env: { ...process.env, PYTHONUNBUFFERED: "1", UNISELLER_WORK_DIR: workDir },
+      env: childEnv(process.env, workDir, envPassthrough),
     });
   } catch (e) {
     settle(failure(`Не удалось запустить Python: ${e.message || e}`));
     cleanup();
-    return { result, exited };
+    return { result, exited, cancel: noop };
   }
 
   let out = "";
   let outBytes = 0;
   let err = "";
   let overflow = false;
-  let timedOut = false;
+  let stopped = false;
   let killTimer = null;
 
   const terminate = () => {
@@ -96,11 +155,12 @@ export function startPython({
     killTimer = setTimeout(() => child.kill("SIGKILL"), killGraceMs);
   };
 
-  const timer = setTimeout(() => {
-    timedOut = true;
-    settle(failure("Таймаут воркера"));
+  const stop = (answer) => {
+    stopped = true;
+    settle(answer);
     terminate();
-  }, timeoutMs);
+  };
+  const timer = setTimeout(() => stop(failure("Таймаут воркера")), timeoutMs);
 
   child.stdout.on("data", (d) => {
     if (overflow) return;
@@ -128,7 +188,7 @@ export function startPython({
   child.on("close", () => {
     clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
-    if (!timedOut && !overflow) {
+    if (!stopped && !overflow) {
       try {
         settle(parseLastJsonLine(out));
       } catch {
@@ -139,13 +199,17 @@ export function startPython({
   });
 
   child.stdin.end(JSON.stringify(payload));
-  return { result, exited };
+  const cancel = () => {
+    if (!settled) stop(ABORTED);
+  };
+  return { result, exited, cancel };
 }
 
 /**
  * Глобальный семафор на число Python-процессов + последовательная очередь
  * на ключ (аккаунт): два запроса одного аккаунта не идут параллельно.
  * Слот держится до фактического выхода процесса, а не до ответа.
+ * `signal` снимает ещё не начатый запрос; с `killOnAbort` — и уже запущенный.
  */
 export function createProcessLimiter(maxConcurrent) {
   const max = Math.max(1, Math.floor(maxConcurrent) || 1);
@@ -166,7 +230,7 @@ export function createProcessLimiter(maxConcurrent) {
     else active -= 1;
   };
 
-  function run(key, start, signal) {
+  function run(key, start, signal, { killOnAbort = false } = {}) {
     let resolveResult;
     const result = new Promise((r) => (resolveResult = r));
     const prev = (key && tails.get(key)) || Promise.resolve();
@@ -179,7 +243,13 @@ export function createProcessLimiter(maxConcurrent) {
         }
         const handle = start();
         handle.result.then(resolveResult);
-        await handle.exited;
+        const onAbort = () => handle.cancel();
+        if (killOnAbort) signal?.addEventListener("abort", onAbort, { once: true });
+        try {
+          await handle.exited;
+        } finally {
+          signal?.removeEventListener("abort", onAbort);
+        }
       } catch (e) {
         resolveResult(failure(String(e?.message || e)));
       } finally {

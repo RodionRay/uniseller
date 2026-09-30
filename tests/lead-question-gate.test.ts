@@ -63,6 +63,13 @@ describe('lead core: seller questions the worker now passes',()=>{
     expect(d.temperature).toBe('warm');
   });
 
+  it('marks a pass that exists only thanks to the seller-question gate',()=>{
+    expect(explainLeadDecision('Как вы грузите остатки на три кабинета?',uniseller).questionGateOnly).toBe(true);
+    const buyer=explainLeadDecision('Ищу сервис для синхронизации остатков WB и МойСклад, готовы на демо',uniseller);
+    expect(buyer.pass).toBe(true);
+    expect(buyer.questionGateOnly).toBe(false);
+  });
+
   it('a seller question naming only one topic stays below warm',()=>{
     const d=explainLeadDecision('У всех по фбс Кизы не проходят сегодня?',uniseller);
     expect(d.pass).toBe(false);

@@ -17,6 +17,7 @@ import {
  explainLeadDecision,
  LEAD_SCORE_WARM,
  reasonFromCore,
+ passesWithoutAi,
  scoreLead,
  workerKeywordsFromSettings,
  type LeadCoreSettings,
@@ -2323,6 +2324,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
      const t=classifyWithLeadCore(m.message||'',coreSettings);
      if(!t)continue;
      const scored=m._core||scoreLead(m.message||'',coreSettings);
+     // Вопрос селлера без плюс-слова/намерения — только кандидат для AI, без AI не лид
+     if(!passesWithoutAi(scored))continue;
      temps.set(String(m.tgMsgId),t);
      reasons.set(String(m.tgMsgId),reasonFromCore({
       ...scored,

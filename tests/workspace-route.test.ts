@@ -210,6 +210,52 @@ describe("per-account lease (REQ-B1)", () => {
     );
   });
 
+  it.each([
+    ["AI qualification off", { aiQualify: false }],
+    ["no AI key", {}],
+  ])("scan_group without AI (%s) keeps question-gate-only messages out of leads", async (_label, ai) => {
+    const buyer = "Ищу сервис для синхронизации остатков WB и МойСклад, готовы на демо";
+    const question = "Как вы грузите остатки на три кабинета?";
+    mockWorker(() => ({
+      ok: true,
+      status: "active",
+      title: "G",
+      member: true,
+      scanMode: "group_messages",
+      messages: [
+        { tgMsgId: "1", message: buyer, name: "A", date: new Date().toISOString() },
+        { tgMsgId: "2", message: question, name: "B", date: new Date().toISOString() },
+      ],
+    }));
+    await seedAccount(sqlite());
+    insertRecord(sqlite(), {
+      id: "66666666-6666-4666-8666-666666666666",
+      owner: OWNER,
+      kind: "settings",
+      data: {
+        keywords: "остатки, синхронизация, МойСклад, несколько кабинетов, ищу сервис",
+        leadCriteria: "Ищет сервис для учёта остатков и нескольких кабинетов маркетплейсов",
+        hotSignals: "ищу сервис, синхронизация остатков",
+        product: "Uniseller — платформа для селлеров WB/Ozon: остатки, заказы, несколько кабинетов",
+        ...ai,
+      },
+    });
+    insertRecord(sqlite(), {
+      id: GROUP_ID,
+      owner: OWNER,
+      kind: "group",
+      data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "joined" },
+    });
+
+    const res = await POST(post({ action: "scan_group", id: GROUP_ID, force: true }));
+
+    expect(res.status).toBe(200);
+    const leads = sqlite()
+      .prepare("SELECT data FROM records WHERE owner=? AND kind='lead'")
+      .all(OWNER) as { data: string }[];
+    expect(leads.map((r) => (JSON.parse(r.data) as { message: string }).message)).toEqual([buyer]);
+  });
+
   it("check_account on a busy account keeps its status", async () => {
     const calls = mockWorker(() => ({ ok: true, status: "active" }));
     await seedAccount(sqlite(), ACCOUNT_ID, { status: "active" });

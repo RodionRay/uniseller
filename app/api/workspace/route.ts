@@ -7,7 +7,7 @@ import {canRunWorkspaceAction} from '@/lib/processes/workspace-access';
 import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
 import {mergeRefreshedSession,stripSessionMaterial} from '@/lib/processes/session-refresh';
 import {appTimeoutForWorker,proxyCheckTimeoutMs,workerSlots} from '@/lib/processes/worker-timeouts';
-import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
+import {catalogForProject,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
 import {JOIN_SUCCESS_PATCH,type JoinAccountState,type JoinProxyState,evaluateAccountJoinReadiness,isJoinFarmCandidate,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,classifyJoinFailure,deadLinkPatch,isAccountBlindResult,isAccountResolveBlind,isUsernameMissingResult,joinFailurePatch,missingAccountsOf,planGroupHeal,recordUsernameMissing,sanitizeJoinStateError,seedMissingAccounts} from '@/lib/processes/join-flow';
 import {buildRelevanceProfile,compareJoinPriority,joinGateFor,rescoreGroup,seedRejoin,type JoinGateState} from '@/lib/join-relevance';
 import {JOIN_RESERVE_MS,accountJoinWaitSec,channelsTooMuchPatch,joinAttemptPatch,farmThroughput,joinErrorPatch,joinFloodPatch,joinSuccessPatch,planJoinFarm,type FarmAccount} from '@/lib/join-pacing';
@@ -3251,7 +3251,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
     if(k)byUrl.set(k,String(r.id));
    }catch{/* */}
   }
-  const ready=GROUP_CATALOG.filter(g=>g.verified&&g.url&&!isCatalogPlaceholderUrl(g.url));
+  const {niches,groups:ready}=catalogForProject((await loadNotifySettings(db,owner))||{});
+  if(!ready.length)return reply({error:niches.length?'В каталоге нет проверенных чатов по нишам продукта — выберите чаты вручную':'В настройках AI нет ниш продукта — опишите продукт или выберите чаты в каталоге вручную'},400);
   let added=0;
   let skipped=0;
   const created:{id:string;name:string;url:string}[]=[];
@@ -3283,7 +3284,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    added++;
    created.push({id,name:g.name,url});
   }
-  return reply({ok:true,added,skipped,total:ready.length,created:created.slice(0,20)});
+  return reply({ok:true,added,skipped,total:ready.length,niches,created:created.slice(0,20)});
  }
  if(b.action==='mark_auto_rescan'){
   const config:any=await db.prepare('SELECT * FROM records WHERE owner=? AND kind=? LIMIT 1').bind(owner,'settings').first();

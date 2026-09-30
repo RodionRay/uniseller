@@ -370,6 +370,16 @@ function errorStack(e:unknown){
  return e instanceof Error?(e.stack||e.message):String(e);
 }
 
+/** A side effect failed but the action goes on: which step, whose workspace, which record. No secrets. */
+function logSideEffectError(action:string,owner:string,ref:string,err:unknown){
+ console.error('[workspace]',{action,owner,ref,err:err instanceof Error?`${err.name}: ${err.message}`:String(err)});
+}
+
+/** Corrupt JSON row skipped in a loop: error name only, JSON.parse messages quote the row data. */
+function logCorruptRow(action:string,owner:string,id:unknown,err:unknown){
+ console.warn('[workspace] corrupt row skipped',{action,owner,id:String(id),err:err instanceof Error?err.name:'unknown'});
+}
+
 /** One log line per failure at the API boundary: which action, whose workspace, full stack. */
 function logActionError(action:string,owner:string,e:unknown){
  console.error('[workspace]',{action,owner,err:errorStack(e)});
@@ -515,7 +525,7 @@ async function loadAccountSessionPayload(owner:string,accountId:string){
   if(prow){
    const pdata=JSON.parse(prow.data);
    let password='';
-   if(prow.secret){try{password=await unseal(prow.secret,owner)}catch{/* */}}
+   if(prow.secret){try{password=await unseal(prow.secret,owner)}catch(e){logSideEffectError('proxy_password_unseal',owner,String(data.proxyId),e)}}
    proxyPayload={host:pdata.host,port:Number(pdata.port),protocol:pdata.protocol||'socks5',username:pdata.username||'',password};
   }
  }
@@ -655,7 +665,7 @@ async function healStuckAccountChecks(owner:string,maxAgeMs=180_000){
    };
    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,String(row.id),'account').run();
    fixed++;
-  }catch{/* */}
+  }catch(e){logSideEffectError('heal_stuck_account_check',owner,String(row.id),e)}
  }
  return fixed;
 }
@@ -702,7 +712,7 @@ async function markProxyTelegramBad(owner:string,proxyId:string,reason:string){
   };
   if(next.status==='inactive')next.status='active';
   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,proxyId,'proxy').run();
- }catch{/* */}
+ }catch(e){logSideEffectError('mark_proxy_telegram_bad',owner,proxyId,e)}
 }
 
 function isSessionDeadError(status:string,error:string){
@@ -1539,6 +1549,12 @@ async function notifyTelegramText(token:string,chatId:string,text:string){
  }
 }
 
+/** notifyTelegramText never throws: surface its {ok:false} instead of dropping it, token redacted. */
+async function reportNotifyFailure(action:string,owner:string,token:string,res:{ok:boolean;error?:string}){
+ if(res.ok)return;
+ logSideEffectError(action,owner,'settings',String(res.error||'').split(token).join('***'));
+}
+
 async function loadNotifySettings(db:any,owner:string){
  const row:any=await db.prepare("SELECT data FROM records WHERE owner=? AND kind='settings' LIMIT 1").bind(owner).first();
  if(!row)return null;
@@ -1552,7 +1568,7 @@ async function notifyMailingEvent(db:any,owner:string,title:string,detail:string
  const chatId=String(settings.notifyChatId||'').trim();
  if(!token||!chatId)return;
  const text=`UniLab · рассылка\n${title}\n${detail}`.slice(0,3500);
- try{await notifyTelegramText(token,chatId,text)}catch{/* */}
+ await reportNotifyFailure('notify_mailing',owner,token,await notifyTelegramText(token,chatId,text));
 }
 
 async function notifyConversationEvent(db:any,owner:string,name:string,username:string,text:string){
@@ -1563,7 +1579,7 @@ async function notifyConversationEvent(db:any,owner:string,name:string,username:
  if(!token||!chatId)return;
  const who=username?`@${String(username).replace(/^@/,'')}`:(name||'Клиент');
  const body=`UniLab · переписка\nКлиент ответил: ${who}\n${String(text||'').slice(0,500)}\nОткройте «Переписки» — менеджер может подключиться.`.slice(0,3500);
- try{await notifyTelegramText(token,chatId,body)}catch{/* */}
+ await reportNotifyFailure('notify_reply',owner,token,await notifyTelegramText(token,chatId,body));
 }
 
 function normTgUser(v:unknown){
@@ -3164,7 +3180,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   const accRows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='account'").bind(owner).all();
   const accMap=new Map<string,any>();
   for(const r of accRows.results){
-   try{accMap.set(String(r.id),JSON.parse(String(r.data)))}catch{/* */}
+   try{accMap.set(String(r.id),JSON.parse(String(r.data)))}catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
   }
   const liveIds=accountIds.filter(aid=>isAccountUsable(accMap.get(aid)));
   if(!liveIds.length){
@@ -3190,7 +3206,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     try{
      const u=JSON.parse(String(r.data));
      if(u.taskId===id&&u.userId)seenIds.push(String(u.userId));
-    }catch{/* */}
+    }catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
    }
    const result=await accountWorkerPost(owner,accountId,'/collect-audience',{
     ...payload,
@@ -3402,7 +3418,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   const accRows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='account'").bind(owner).all();
   const accMap=new Map<string,any>();
   for(const r of accRows.results){
-   try{accMap.set(String(r.id),JSON.parse(String(r.data)))}catch{/* */}
+   try{accMap.set(String(r.id),JSON.parse(String(r.data)))}catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
   }
   const accName=(aid:string)=>{
    const a=accMap.get(aid);
@@ -3473,7 +3489,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     const u=JSON.parse(String(r.data));
     if(u.taskId!==data.audienceTaskId||u.invited)continue;
     candidates.push({id:String(r.id),userId:String(u.userId),username:String(u.username||'')});
-   }catch{/* */}
+   }catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
   }
   candidates.sort((a,b)=>(b.username?1:0)-(a.username?1:0));
   const batch=candidates.slice(0,batchSize);
@@ -3926,7 +3942,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   const accRows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='account'").bind(owner).all();
   const accMap=new Map<string,any>();
   for(const r of accRows.results){
-   try{accMap.set(String(r.id),JSON.parse(String(r.data)))}catch{/* */}
+   try{accMap.set(String(r.id),JSON.parse(String(r.data)))}catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
   }
   const accName=(aid:string)=>{
    const a=accMap.get(aid);
@@ -4054,7 +4070,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    const groups=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='group'").bind(owner).all();
    const gMap=new Map<string,any>();
    for(const g of groups.results){
-    try{gMap.set(String(g.id),JSON.parse(String(g.data)))}catch{/* */}
+    try{gMap.set(String(g.id),JSON.parse(String(g.data)))}catch(e){logCorruptRow(String(b.action),owner,g.id,e)}
    }
    for(const r of leads.results){
     try{
@@ -4079,7 +4095,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
       recordId:String(r.id),
       preferredAccountId:String(L.accountId||g?.accountId||g?.joinedAccountId||''),
      });
-    }catch{/* */}
+    }catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
    }
   }else{
    const audienceTaskId=String(data.audienceTaskId||'');
@@ -4109,7 +4125,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
       recordId:String(r.id),
       preferredAccountId:String(u.collectedByAccountId||''),
      });
-    }catch{/* */}
+    }catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
    }
    candidates.sort((a,b)=>(b.username?1:0)-(a.username?1:0));
   }
@@ -4625,7 +4641,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    try{
     const a=JSON.parse(String(r.data));
     if(canPollDmInbox(a))live.push({id:String(r.id),data:a});
-   }catch{/* */}
+   }catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
   }
   if(!live.length)return reply({ok:true,opened:0,skipped:true,reason:'no_accounts'});
 
@@ -4651,7 +4667,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
       accountId:aid,
      });
     }
-   }catch{/* */}
+   }catch(e){logCorruptRow(String(b.action),owner,r.id,e)}
   }
   const leadRows=await db.prepare("SELECT id,data FROM records WHERE owner=? AND kind='lead'").bind(owner).all();
   const leads=leadRows.results.map((r:any)=>{

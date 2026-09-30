@@ -7,9 +7,14 @@ export function useNowTick(enabled = true, ms = 1000) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!enabled) return;
-    setNow(Date.now());
-    const id = window.setInterval(() => setNow(Date.now()), ms);
-    return () => window.clearInterval(id);
+    const tick = () => setNow(Date.now());
+    // Immediate refresh after (re)enable, scheduled so the effect itself does not set state.
+    const first = window.setTimeout(tick, 0);
+    const id = window.setInterval(tick, ms);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(id);
+    };
   }, [enabled, ms]);
   return now;
 }

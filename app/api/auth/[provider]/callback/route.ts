@@ -1,5 +1,6 @@
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
+import { requestOrigin } from "@/lib/env";
 import {
   createSessionToken,
   sessionCookieName,
@@ -9,9 +10,11 @@ import {
   exchangeOAuthCode,
   oauthEnabled,
   parseOAuthState,
+  RegistrationClosedError,
+  signInOAuthUser,
   type OAuthProvider,
 } from "@/lib/oauth";
-import { upsertOAuthUser } from "@/lib/users";
+import { OAuthEmailTakenError } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
@@ -24,8 +27,9 @@ export async function GET(
 ) {
   const { provider } = await ctx.params;
   const url = new URL(req.url);
+  const origin = requestOrigin(req);
   const fail = (code: string) =>
-    NextResponse.redirect(new URL(`/login?error=${code}`, url.origin));
+    NextResponse.redirect(new URL(`/login?error=${code}`, origin));
   if (!PROVIDERS.has(provider as OAuthProvider) || !oauthEnabled(provider as OAuthProvider)) {
     return fail("oauth");
   }
@@ -42,14 +46,15 @@ export async function GET(
 
   try {
     const profile = await exchangeOAuthCode(
-      url.origin,
+      origin,
       provider as OAuthProvider,
       code,
     );
-    const user = await upsertOAuthUser({
+    const user = await signInOAuthUser({
       provider,
       providerUserId: profile.providerUserId,
       email: profile.email,
+      emailVerified: profile.emailVerified,
       name: profile.name,
     });
     const token = await createSessionToken({
@@ -57,11 +62,12 @@ export async function GET(
       email: user.email || "",
       displayName: user.name,
     });
-    const res = NextResponse.redirect(new URL(parsed.returnTo, url.origin));
-    res.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-    res.cookies.set(STATE_COOKIE, "", { ...sessionCookieOptions(0), maxAge: 0 });
+    const res = NextResponse.redirect(new URL(parsed.returnTo, origin));
+    res.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
+    res.cookies.set(STATE_COOKIE, "", { ...sessionCookieOptions(0, req.url), maxAge: 0 });
     return res;
-  } catch {
-    return fail("oauth");
+  } catch (error) {
+    if (error instanceof RegistrationClosedError) return fail("closed");
+    return fail(error instanceof OAuthEmailTakenError ? "exists" : "oauth");
   }
 }

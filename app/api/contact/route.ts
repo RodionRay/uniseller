@@ -1,9 +1,17 @@
 import { NextResponse } from "next/server";
 import { database } from "@/lib/server-store";
-import { readEnv } from "@/lib/auth";
+import { isSameOriginRequest, readEnv } from "@/lib/env";
 import { contactTasks } from "@/components/marketing/content";
+import { trustedClientIp } from "@/lib/security/client-ip";
+import {
+  RATE_LIMITS,
+  consumeRateLimits,
+  tooManyRequests,
+} from "@/lib/security/rate-limit";
 
 export const dynamic = "force-dynamic";
+
+const TELEGRAM_NOTIFY_TIMEOUT_MS = 5_000;
 
 function reply(data: unknown, status = 200) {
   return NextResponse.json(data, {
@@ -32,11 +40,15 @@ async function ensureTable() {
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  if (origin && origin !== new URL(req.url).origin) {
+  if (!isSameOriginRequest(req)) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
   }
   try {
+    const limit = await consumeRateLimits([
+      [RATE_LIMITS.contactPerIp, trustedClientIp(req)],
+      [RATE_LIMITS.contactGlobal, "all"],
+    ]);
+    if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
     const body = (await req.json()) as Record<string, string>;
     const name = String(body.name ?? "").trim().slice(0, 80);
     const email = String(body.email ?? "").trim().toLowerCase().slice(0, 120);
@@ -81,7 +93,11 @@ export async function POST(req: Request) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: chat, text }),
-      }).catch(() => null);
+        // The message is already stored; a slow Telegram API must not hang the form.
+        signal: AbortSignal.timeout(TELEGRAM_NOTIFY_TIMEOUT_MS),
+      }).catch((error: unknown) => {
+        console.warn("[contact] Telegram notify failed:", (error as Error)?.message ?? error);
+      });
     }
 
     return reply({ ok: true });

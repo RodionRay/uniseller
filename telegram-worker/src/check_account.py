@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import io
+import ipaddress
 import json
+import os
 import random
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +24,63 @@ TDESKTOP_API_ID = 2040
 TDESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
 
 
+REFRESHED_SESSION_NAME = "uniseller_refreshed.session"
+
+_FLOOD_CLASSES = frozenset({"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"})
+_FROZEN_CLASSES = frozenset({"FrozenMethodInvalidError", "UserDeactivatedBanError", "UserDeactivatedError"})
+_UNAUTHORIZED_CLASSES = frozenset(
+    {"AuthKeyUnregisteredError", "SessionRevokedError", "AuthKeyDuplicatedError", "SessionExpiredError"}
+)
+_FLOOD_TEXT = re.compile(r"flood_(?:premium_)?wait_(\d+)|a wait of (\d+) seconds", re.IGNORECASE)
+
+
+def _class_names(exc: BaseException) -> set[str]:
+    return {cls.__name__ for cls in type(exc).__mro__}
+
+
+def _rpc_message(exc: BaseException) -> str:
+    """Код ошибки Telegram (RPCError.message), напр. FROZEN_METHOD_INVALID / FLOOD_WAIT_X."""
+    return str(getattr(exc, "message", "") or "").upper()
+
+
+def is_flood_wait(exc: BaseException) -> bool:
+    if _class_names(exc) & _FLOOD_CLASSES:
+        return True
+    msg = _rpc_message(exc)
+    if msg.startswith(("FLOOD_WAIT_", "FLOOD_PREMIUM_WAIT_")):
+        return True
+    return bool(_FLOOD_TEXT.search(str(exc)))
+
+
+def flood_wait_seconds(exc: BaseException) -> int | None:
+    """Сколько ждать по FloodWait; None — это не FloodWait."""
+    if not is_flood_wait(exc):
+        return None
+    seconds = getattr(exc, "seconds", None)
+    if isinstance(seconds, int):
+        return seconds
+    m = _FLOOD_TEXT.search(f"{_rpc_message(exc)} {exc}")
+    return int(m.group(1) or m.group(2)) if m else 0
+
+
+def is_frozen_rpc(exc: BaseException) -> bool:
+    """FROZEN_METHOD_INVALID приходит с кодом 420, как и FloodWait — различаем по тексту."""
+    if is_flood_wait(exc):
+        return False
+    if _class_names(exc) & {"FrozenMethodInvalidError"}:
+        return True
+    return "FROZEN" in _rpc_message(exc) or "FROZEN_METHOD_INVALID" in str(exc).upper()
+
+
 def classify_error(exc: BaseException) -> str:
+    """Статус аккаунта по исключению: по классам Telethon, текст — только запасной путь."""
+    names = _class_names(exc)
+    if is_flood_wait(exc):
+        return "flood"
+    if names & _FROZEN_CLASSES or is_frozen_rpc(exc):
+        return "frozen"
+    if names & _UNAUTHORIZED_CLASSES or "UnauthorizedError" in names:
+        return "unauthorized"
     name = type(exc).__name__
     text = str(exc).lower()
     combined = f"{name} {text}"
@@ -37,10 +98,8 @@ def classify_error(exc: BaseException) -> str:
         if "deactivated" in combined or "banned" in combined:
             return "frozen"
         return "unauthorized"
-    if "frozen" in combined or "freeze" in combined or "420" in combined:
+    if "frozen" in combined:
         return "frozen"
-    if "flood" in combined:
-        return "disconnected"
     if any(
         x in combined
         for x in (
@@ -82,10 +141,64 @@ def humanize_connect_error(exc: BaseException, has_proxy: bool) -> str:
     return raw[:400]
 
 
-def is_frozen_rpc(exc: BaseException) -> bool:
-    text = str(exc).upper()
-    code = getattr(exc, "code", None)
-    return code == 420 or "FROZEN_METHOD_INVALID" in text or "FROZEN" in text
+def error_result(exc: BaseException, **extra: Any) -> dict[str, Any]:
+    """Единый ответ об ошибке: status по классу исключения, waitSec для FloodWait."""
+    out: dict[str, Any] = {"ok": False, "status": classify_error(exc), "error": str(exc)[:400], **extra}
+    wait = flood_wait_seconds(exc)
+    if wait is not None:
+        out["waitSec"] = wait
+    return out
+
+
+def flood_result(exc: BaseException, **extra: Any) -> dict[str, Any]:
+    """FloodWait: status flood + waitSec; floodWait — прежнее имя поля для старых читателей."""
+    wait = flood_wait_seconds(exc) or 0
+    return {
+        "ok": False,
+        "status": "flood",
+        "error": f"FloodWait {wait}с",
+        "waitSec": wait,
+        "floodWait": wait,
+        **extra,
+    }
+
+
+def invite_flood_result(exc: BaseException, *, results: list[dict[str, Any]], title: str) -> dict[str, Any]:
+    """Инвайт: приложение пока читает status «floodwait» — сохраняем его, плюс flood/waitSec."""
+    return {**flood_result(exc, results=results, title=title), "status": "floodwait", "flood": True}
+
+
+def is_peer_flood(exc: BaseException) -> bool:
+    return "PeerFloodError" in _class_names(exc) or _rpc_message(exc) == "PEER_FLOOD"
+
+
+_SPAMBLOCK_ERROR = (
+    "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы. "
+    "Смените аккаунт фермы или подождите 24ч."
+)
+
+
+def send_rpc_error_result(exc: BaseException) -> dict[str, Any]:
+    """Ответ отправки на RPCError: классификация по классу/коду ошибки, не по подстроке «flood»."""
+    if is_flood_wait(exc):
+        return flood_result(exc)
+    if is_peer_flood(exc):
+        return {"ok": False, "status": "spamblock", "error": f"PEER_FLOOD: {_SPAMBLOCK_ERROR}"[:400]}
+    if is_frozen_rpc(exc):
+        return frozen_action_error("отправка сообщения")
+    msg = str(exc)
+    low = msg.lower()
+    if "banned from sending" in low or "chat_write_forbidden" in low or "user_banned_in_channel" in low:
+        return {"ok": False, "status": "spamblock", "error": _SPAMBLOCK_ERROR}
+    if "invalid peer" in low:
+        return {
+            "ok": False,
+            "error": (
+                "Неверный peer для этого аккаунта (часто чужой access_hash). "
+                "Ответьте тем же аккаунтом или укажите @username клиента."
+            ),
+        }
+    return {"ok": False, "error": msg[:400]}
 
 
 def frozen_action_error(action: str) -> dict[str, Any]:
@@ -102,6 +215,74 @@ def frozen_action_error(action: str) -> dict[str, Any]:
     }
 
 
+class ProxyHostRejected(ValueError):
+    """Proxy host resolves to an internal address (SSRF guard) or does not resolve."""
+
+
+class ArchiveRejected(ValueError):
+    """Uploaded account archive exceeds extraction limits (zip bomb guard)."""
+
+
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+MAX_ZIP_ENTRIES = 5000
+MAX_ZIP_TOTAL_BYTES = 200 * 1024 * 1024
+
+
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+    ):
+        return False
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT:
+        return False
+    return ip.is_global
+
+
+def resolve_public_host(host: str, port: int, *, resolver=socket.getaddrinfo) -> str:
+    """Resolve host; reject if ANY address is internal. Returns an IP to connect to,
+    so a second (rebinding) DNS answer cannot redirect the connection."""
+    try:
+        infos = resolver(host, port, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as e:
+        raise ProxyHostRejected("Адрес прокси не резолвится") from e
+    addrs = [str(info[4][0]).split("%", 1)[0] for info in infos]
+    if not addrs:
+        raise ProxyHostRejected("Адрес прокси не резолвится")
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError as e:
+            raise ProxyHostRejected("Недопустимый адрес прокси") from e
+        if not _is_public_ip(ip):
+            raise ProxyHostRejected("Недопустимый адрес прокси (внутренняя сеть)")
+    return addrs[0]
+
+
+def safe_extract_zip(
+    zpath: Path,
+    dest: Path,
+    *,
+    max_entries: int = MAX_ZIP_ENTRIES,
+    max_total_bytes: int = MAX_ZIP_TOTAL_BYTES,
+) -> None:
+    # zipfile caps each member's output at its declared file_size, so summing
+    # declared sizes bounds the real extraction size.
+    with zipfile.ZipFile(zpath, "r") as zf:
+        infos = zf.infolist()
+        if len(infos) > max_entries:
+            raise ArchiveRejected("Архив содержит слишком много файлов")
+        if sum(i.file_size for i in infos) > max_total_bytes:
+            raise ArchiveRejected("Архив слишком большой после распаковки")
+        zf.extractall(dest)
+
+
 def make_proxy(proxy: dict | None):
     if not proxy or not proxy.get("host"):
         return None
@@ -110,7 +291,7 @@ def make_proxy(proxy: dict | None):
     kind = socks.SOCKS5 if proxy.get("protocol", "socks5") == "socks5" else socks.HTTP
     return (
         kind,
-        proxy["host"],
+        resolve_public_host(str(proxy["host"]).strip(), int(proxy["port"])),
         int(proxy["port"]),
         True,
         proxy.get("username") or None,
@@ -176,7 +357,8 @@ def probe_telegram_via_proxy(
                     "HTTP/1.1 200"
                 ):
                     return True, f"{proto}:{dc_host}:{dc_port}"
-                last_err = (first or "HTTP CONNECT отказ")[:120]
+                code = re.match(r"HTTP/\d(?:\.\d)? (\d{3})", first)
+                last_err = f"HTTP CONNECT отказ ({code.group(1)})" if code else "HTTP CONNECT отказ"
             else:
                 sock = socks.socksocket()
                 sock.set_proxy(
@@ -191,7 +373,7 @@ def probe_telegram_via_proxy(
                 sock.connect((dc_host, dc_port))
                 return True, f"{proto}:{dc_host}:{dc_port}"
         except Exception as e:
-            last_err = str(e)[:160]
+            last_err = f"нет соединения ({type(e).__name__})"
         finally:
             if sock is not None:
                 try:
@@ -289,6 +471,10 @@ async def check_proxy_alive(payload: dict[str, Any]) -> dict[str, Any]:
     password = str(payload.get("password") or "") or None
     if not host or not (1 <= port <= 65535):
         return {"ok": False, "error": "Некорректный host/port", "latencyMs": 0}
+    try:
+        host = resolve_public_host(host, port)
+    except ProxyHostRejected as e:
+        return {"ok": False, "error": str(e), "latencyMs": 0, "telegramOk": False}
 
     started = time.time()
     # Заявленный протокол → при фейле сразу альтернатива (мобильные часто SOCKS5).
@@ -311,15 +497,21 @@ async def check_proxy_alive(payload: dict[str, Any]) -> dict[str, Any]:
                 net_err = ""
                 break
             net_err = err or net_err
-        except socks.ProxyConnectionError as e:
-            net_err = f"Не удалось подключиться к прокси: {e}"[:400]
+        except socks.ProxyConnectionError:
+            net_err = "Не удалось подключиться к прокси"
         except socks.ProxyError as e:
-            net_err = f"Ошибка прокси: {e}"[:400]
+            net_err = (
+                "Неверный логин или пароль прокси"
+                if "auth" in str(e).lower()
+                else "Ошибка прокси"
+            )
         except Exception as e:
+            # Текст исключения может содержать ответ удалённого сервера — наружу только код.
             msg = str(e)
             if "407" in msg or "authentication" in msg.lower():
-                msg = "Неверный логин или пароль прокси"
-            net_err = msg[:400]
+                net_err = "Неверный логин или пароль прокси"
+            else:
+                net_err = f"Прокси не отвечает ({type(e).__name__})"
 
     if not net_ok:
         return {
@@ -387,6 +579,7 @@ async def load_client_from_tdata(
                 retry_delay=0,
                 timeout=6,
                 request_retries=1,
+                flood_sleep_threshold=0,
             )
             try:
                 client = await td.ToTelethon(**kwargs, password=two_fa or None)
@@ -394,7 +587,8 @@ async def load_client_from_tdata(
                 client = await td.ToTelethon(**kwargs)
             await client.connect()
             if await client.is_user_authorized():
-                client._uniseller_session_refreshed = flag is CreateNewSession  # type: ignore[attr-defined]
+                if flag is CreateNewSession:
+                    client._uniseller_refreshed_file = session_path  # type: ignore[attr-defined]
                 return client
             try:
                 await client.disconnect()
@@ -409,6 +603,9 @@ async def load_client_from_tdata(
                     await client.disconnect()
             except Exception:
                 pass
+            # FloodWait/заморозка не лечатся новой сессией — лишь плодят авторизации устройств
+            if classify_error(e) in ("flood", "frozen"):
+                raise
             low = str(e).lower()
             if any(
                 x in low
@@ -444,12 +641,67 @@ async def load_client_from_session_file(
         retry_delay=0,
         timeout=6,
         request_retries=1,
+        flood_sleep_threshold=0,
     )
     try:
         await client.connect()
     except Exception as e:
         raise RuntimeError(humanize_connect_error(e, bool(proxy))) from e
     return client
+
+
+# Задаётся Node-воркером (--work-dir): он создаёт каталог 0700 и удаляет его сам,
+# даже если процесс Python убит по таймауту (иначе сессии остаются в /tmp открытым текстом).
+_WORK_DIR_OVERRIDE: Path | None = None
+
+
+def make_work_dir() -> Path:
+    """Каталог под расшифрованную сессию внутри каталога Node (--work-dir или UNISELLER_WORK_DIR).
+
+    Node удаляет родительский каталог после выхода процесса; без него — системный tmp.
+    """
+    parent = _WORK_DIR_OVERRIDE or os.environ.get("UNISELLER_WORK_DIR") or None
+    if parent is not None:
+        Path(parent).mkdir(mode=0o700, parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="uniseller-acc-", dir=parent))
+
+
+def build_refreshed_archive(zip_b64: str, session_file: Path) -> str:
+    """Исходный архив + новая сессия (REFRESHED_SESSION_NAME в корне) → base64 zip.
+
+    open_client берёт эту сессию первой, поэтому следующая проверка не создаёт ещё одно устройство.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(zip_b64)), "r") as src, zipfile.ZipFile(
+        buf, "w", zipfile.ZIP_DEFLATED
+    ) as dst:
+        for item in src.infolist():
+            if Path(item.filename).name == REFRESHED_SESSION_NAME:
+                continue
+            dst.writestr(item, src.read(item))
+        dst.writestr(REFRESHED_SESSION_NAME, session_file.read_bytes())
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def attach_refreshed_session(result: dict[str, Any], client, payload: dict[str, Any]) -> dict[str, Any]:
+    """После disconnect (сессия сохранена на диск) вернуть новую сессию приложению.
+
+    sessionRefreshed=true только если refreshedSession реально в ответе.
+    """
+    session_file = getattr(client, "_uniseller_refreshed_file", None) if client else None
+    result["sessionRefreshed"] = False
+    if not session_file:
+        return result
+    try:
+        result["refreshedSession"] = {
+            "zipBase64": build_refreshed_archive(payload.get("zipBase64") or "", Path(session_file)),
+            "apiId": TDESKTOP_API_ID,
+            "apiHash": TDESKTOP_API_HASH,
+        }
+        result["sessionRefreshed"] = True
+    except Exception as e:
+        result["sessionRefreshError"] = f"{type(e).__name__}: {e}"[:200]
+    return result
 
 
 async def open_client(payload: dict[str, Any], work: Path):
@@ -466,8 +718,7 @@ async def open_client(payload: dict[str, Any], work: Path):
     raw = base64.b64decode(zip_b64)
     zpath = work / "account.zip"
     zpath.write_bytes(raw)
-    with zipfile.ZipFile(zpath, "r") as zf:
-        zf.extractall(work / "unz")
+    safe_extract_zip(zpath, work / "unz")
 
     root = work / "unz"
     tdata = None
@@ -475,7 +726,10 @@ async def open_client(payload: dict[str, Any], work: Path):
         if p.is_dir() and (p / "key_datas").exists():
             tdata = p
             break
-    session_files = [p for p in root.rglob("*.session") if p.is_file()]
+    refreshed = root / REFRESHED_SESSION_NAME
+    session_files = [
+        p for p in root.rglob("*.session") if p.is_file() and p.name != REFRESHED_SESSION_NAME
+    ]
     # не брать наши временные первыми
     session_files.sort(key=lambda p: (0 if "uniseller" not in p.name else 1, str(p)))
 
@@ -483,8 +737,10 @@ async def open_client(payload: dict[str, Any], work: Path):
     api_hash = payload.get("apiHash") or TDESKTOP_API_HASH
 
     errors: list[str] = []
-    # Порядок: по format, затем fallback на второй источник
+    # Порядок: сессия, выданная прошлым CreateNewSession; затем по format и fallback на второй источник
     attempts: list[tuple[str, Any]] = []
+    if refreshed.is_file():
+        attempts.append(("refreshed", refreshed))
     if fmt in ("tdata", "manual") and tdata:
         attempts.append(("tdata", tdata))
         if session_files:
@@ -495,7 +751,7 @@ async def open_client(payload: dict[str, Any], work: Path):
             attempts.append(("tdata", tdata))
     elif tdata:
         attempts.append(("tdata", tdata))
-    else:
+    elif not attempts:
         raise RuntimeError("В архиве нет tdata или session")
 
     last_exc: BaseException | None = None
@@ -506,7 +762,11 @@ async def open_client(payload: dict[str, Any], work: Path):
                     src, proxy, two_fa, allow_session_refresh=allow_refresh
                 )
             else:
-                client = await load_client_from_session_file(src, api_id, api_hash, proxy)
+                # refreshed создан через opentele API.TelegramDesktop → его api_id/hash
+                sid, shash = (
+                    (TDESKTOP_API_ID, TDESKTOP_API_HASH) if kind == "refreshed" else (api_id, api_hash)
+                )
+                client = await load_client_from_session_file(src, sid, shash, proxy)
                 if not await client.is_user_authorized():
                     try:
                         await client.disconnect()
@@ -517,6 +777,8 @@ async def open_client(payload: dict[str, Any], work: Path):
         except Exception as e:
             last_exc = e
             errors.append(f"{kind}: {str(e)[:120]}")
+            if classify_error(e) in ("flood", "frozen"):
+                raise
             # Сетевой сбой — нет смысла пробовать второй файл на том же прокси
             low = str(e).lower()
             if any(
@@ -592,35 +854,36 @@ def parse_group_ref(url: str) -> dict[str, str]:
     raise RuntimeError("Некорректная ссылка на группу/канал")
 
 
-async def join_group(client, url: str) -> dict[str, Any]:
+async def _is_member(client, entity) -> bool:
+    """Единая проверка членства. Неизвестно → False (не цементируем ложный join)."""
+    from telethon.tl.functions.channels import GetParticipantRequest
+    from telethon.errors import UserNotParticipantError
+
+    try:
+        me = await client.get_me()
+        await client(GetParticipantRequest(entity, me))
+        return True
+    except UserNotParticipantError:
+        return False
+    except Exception:
+        try:
+            perms = await client.get_permissions(entity)
+            return bool(perms) and not getattr(perms, "has_left", False)
+        except Exception:
+            return False
+
+
+async def join_group(client, url: str, peer_hint: dict | None = None) -> dict[str, Any]:
     from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
-    from telethon.tl.functions.channels import JoinChannelRequest, GetParticipantRequest
+    from telethon.tl.functions.channels import JoinChannelRequest
     from telethon.errors import (
         UserAlreadyParticipantError,
         InviteRequestSentError,
         FloodWaitError,
-        UsernameNotOccupiedError,
-        UserNotParticipantError,
         ChannelPrivateError,
         UserBannedInChannelError,
         RPCError,
     )
-
-    async def member_of(entity) -> bool:
-        try:
-            me = await client.get_me()
-            await client(GetParticipantRequest(entity, me))
-            return True
-        except UserNotParticipantError:
-            return False
-        except Exception:
-            try:
-                # fallback: диалоги / права
-                perms = await client.get_permissions(entity)
-                return bool(perms) and not getattr(perms, "has_left", False)
-            except Exception:
-                # Неизвестно — не форсим need_join (иначе цикл join→scan→requeue)
-                return True
 
     ref = parse_group_ref(url)
     try:
@@ -636,8 +899,9 @@ async def join_group(client, url: str) -> dict[str, Any]:
                 updates = await client(ImportChatInviteRequest(ref["value"]))
                 title = ""
                 chats = getattr(updates, "chats", None) or []
+                peer = _peer_fields(chats[0]) if chats else {}
                 if chats:
-                    title = getattr(chats[0], "title", "") or ""
+                    title = peer.get("title") or getattr(chats[0], "title", "") or ""
                 return {
                     "ok": True,
                     "status": "active",
@@ -645,8 +909,10 @@ async def join_group(client, url: str) -> dict[str, Any]:
                     "title": title,
                     "error": "",
                     "member": True,
+                    **peer,
                 }
             except UserAlreadyParticipantError:
+                # Без entity — peer не известен; ниже username-ветка всегда отдаёт peer
                 return {
                     "ok": True,
                     "status": "active",
@@ -669,23 +935,30 @@ async def join_group(client, url: str) -> dict[str, Any]:
                     return frozen_action_error("вступление по инвайту")
                 raise
         else:
-            try:
-                entity = await client.get_entity(ref["value"])
-            except (UsernameNotOccupiedError, ValueError):
+            entity, resolve_err = await _resolve_entity(client, url, peer_hint=peer_hint)
+            if resolve_err:
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "join": resolve_err.get("join") or "missing",
+                    "usernameMissing": bool(resolve_err.get("usernameMissing")),
+                    "accountBlind": bool(resolve_err.get("accountBlind")),
+                    "error": str(resolve_err.get("error") or "Не удалось найти группу")[:400],
+                    "member": False,
+                }
+            if entity is None:
                 return {
                     "ok": False,
                     "status": "error",
                     "join": "missing",
-                    "error": f'Группа @{ref["value"]} не найдена в Telegram. Укажите реальную ссылку t.me/… или инвайт.',
+                    "usernameMissing": True,
+                    "error": f"Слот не видит @{ref['value']}",
                     "member": False,
                 }
-            except RPCError as e:
-                if is_frozen_rpc(e):
-                    return frozen_action_error("поиск группы")
-                raise
             title = getattr(entity, "title", None) or getattr(entity, "username", "") or ""
+            peer = _peer_fields(entity)
             # Уже участник — сразу ok
-            if await member_of(entity):
+            if await _is_member(client, entity):
                 return {
                     "ok": True,
                     "status": "active",
@@ -693,6 +966,7 @@ async def join_group(client, url: str) -> dict[str, Any]:
                     "title": title,
                     "error": "",
                     "member": True,
+                    **peer,
                 }
             try:
                 await client(JoinChannelRequest(entity))
@@ -704,6 +978,7 @@ async def join_group(client, url: str) -> dict[str, Any]:
                     "title": title,
                     "error": "",
                     "member": True,
+                    **peer,
                 }
             except InviteRequestSentError:
                 return {
@@ -713,6 +988,7 @@ async def join_group(client, url: str) -> dict[str, Any]:
                     "title": title,
                     "error": "Заявка на вступление отправлена",
                     "member": False,
+                    **peer,
                 }
             except UserBannedInChannelError:
                 return {
@@ -737,7 +1013,7 @@ async def join_group(client, url: str) -> dict[str, Any]:
                     return frozen_action_error("вступление в канал/группу")
                 raise
             # Проверяем фактическое членство после JoinChannel
-            ok_member = await member_of(entity)
+            ok_member = await _is_member(client, entity)
             if not ok_member:
                 return {
                     "ok": False,
@@ -754,20 +1030,92 @@ async def join_group(client, url: str) -> dict[str, Any]:
                 "title": title,
                 "error": "",
                 "member": True,
+                **peer,
             }
     except FloodWaitError as e:
-        return {
-            "ok": False,
-            "status": "setup",
-            "join": "flood",
-            "error": f"FloodWait {e.seconds}с",
-            "member": False,
-            "waitSec": int(e.seconds),
-        }
+        return flood_result(e, join="flood", member=False)
     except RPCError as e:
         if is_frozen_rpc(e):
             return frozen_action_error("вступление")
         raise
+
+
+MIN_MINUS_TERM_LENGTH = 3
+MAX_MINUS_TERM_LENGTH = 100
+MAX_MINUS_TERMS = 120
+
+
+@dataclass(frozen=True)
+class MinusMatcher:
+    """Word-start matcher for stop terms; `combined` is one alternation so a clean message costs one scan."""
+
+    terms: tuple[tuple[str, re.Pattern[str]], ...]
+    combined: re.Pattern[str] | None
+
+
+# Closed junk words matched by stem ("крипта" also stops "криптовалюту"); mirrors
+# lib/lead-filter.ts::MINUS_JUNK_STEMS. Only these: a stem of an arbitrary word would over-match.
+MINUS_JUNK_STEMS: dict[str, str] = {
+    "крипта": "крипт",
+    "криптовалюта": "криптовалют",
+    "накрутка": "накрутк",
+    "вакансия": "ваканси",
+    "гадание": "гадани",
+    "эзотерика": "эзотерик",
+}
+
+
+def _minus_word_pattern(word: str) -> str:
+    stem = MINUS_JUNK_STEMS.get(word)
+    # A stem inside a phrase must swallow its ending before the next word.
+    return re.escape(stem) + r"[^\W_]*" if stem else re.escape(word)
+
+
+def _normalize_minus_text(text: str) -> str:
+    return (text or "").lower().replace("ё", "е")
+
+
+def compile_minus_terms(terms: list[str]) -> MinusMatcher:
+    """Minus terms as word-start patterns (phrases as phrases).
+
+    Substring matching made "нал" kill "канал"/"анализ" and "бот" kill "работа".
+    Only the first MAX_MINUS_TERMS non-empty terms count; terms <3 or >100 chars are ignored.
+    Mirrors lib/lead-filter.ts::findMinusHit (shared fixture tests/fixtures/minus-match.json).
+    """
+    head = [t for t in (_normalize_minus_text(r).strip() for r in terms) if t][:MAX_MINUS_TERMS]
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    alternatives: list[str] = []
+    for term in head:
+        if not MIN_MINUS_TERM_LENGTH <= len(term) <= MAX_MINUS_TERM_LENGTH:
+            continue
+        phrase = r"\s+".join(_minus_word_pattern(w) for w in term.split())
+        # (?<![^\W_]) = not preceded by a letter/digit (underscore does not count, as in the TS core)
+        compiled.append((term, re.compile(r"(?<![^\W_])" + phrase)))
+        alternatives.append(phrase)
+    combined = re.compile(r"(?<![^\W_])(?:" + "|".join(alternatives) + ")") if alternatives else None
+    return MinusMatcher(terms=tuple(compiled), combined=combined)
+
+
+def find_minus_hit(text: str, matcher: MinusMatcher) -> str | None:
+    if matcher.combined is None:
+        return None
+    low = _normalize_minus_text(text)
+    if not matcher.combined.search(low):
+        return None
+    for term, pattern in matcher.terms:
+        if pattern.search(low):
+            return term
+    return None
+
+
+# Чужая реклама / эзотерика / CTA @ / рассылки — не кандидат (начало слова, как минус-слова).
+AD_MARKERS = compile_minus_terms([
+    "матриц", "судьб", "таро", "гадан", "астролог", "нумеролог",
+    "эзотерик", "писать @", "пишите @", "пиши @", "писать@",
+    "передано через @", "занимаюсь разбором", "есть отзывы)",
+    "вам срочное сообщение", "каталоге решений", "нельзя пропустить",
+    "гайд для продавцов", "подписывайтесь",
+])
 
 
 async def scan_group(
@@ -784,24 +1132,13 @@ async def scan_group(
     """
     from datetime import datetime, timedelta, timezone
     from telethon.tl.functions.messages import CheckChatInviteRequest
-    from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannelRequest
+    from telethon.tl.functions.channels import GetFullChannelRequest
     from telethon.tl.types import ChatInviteAlready, User, Channel
-    from telethon.errors import RPCError, UserNotParticipantError
+    from telethon.errors import RPCError
     from telethon.utils import get_peer_id
 
     async def member_of(entity) -> bool:
-        try:
-            me = await client.get_me()
-            await client(GetParticipantRequest(entity, me))
-            return True
-        except UserNotParticipantError:
-            return False
-        except Exception:
-            try:
-                perms = await client.get_permissions(entity)
-                return bool(perms) and not getattr(perms, "has_left", False)
-            except Exception:
-                return False
+        return await _is_member(client, entity)
 
     def is_broadcast_channel(entity) -> bool:
         return bool(getattr(entity, "broadcast", False)) and not bool(
@@ -809,7 +1146,7 @@ async def scan_group(
         )
 
     kws = [k.strip().lower() for k in keywords if k and k.strip()]
-    minus = [k.strip().lower() for k in minus_keywords if k and k.strip()]
+    minus = compile_minus_terms(minus_keywords)
     # Только общий intent; нишевые алиасы не хардкодим — приходят в keywords из настроек AI
     intent_markers = (
         "ищу сервис", "ищу crm", "ищем сервис", "нужен сервис", "нужна crm",
@@ -832,6 +1169,15 @@ async def scan_group(
     scan_mode = "group"
     discussion_id = ""
     discussion_title = ""
+
+    def counters() -> dict[str, int]:
+        """Worker funnel for the scan log: read, dropped by stop-list, no keyword, not a person."""
+        return {
+            "fetched": fetched,
+            "skippedMinus": skipped_minus,
+            "skippedKw": skipped_kw,
+            "skippedNotUser": skipped_not_user,
+        }
 
     def passes_kw(text: str) -> bool:
         nonlocal skipped_kw
@@ -864,19 +1210,7 @@ async def scan_group(
                 md = md.replace(tzinfo=timezone.utc)
             if md < cutoff:
                 return
-        low = text.lower()
-        if minus and any(x in low for x in minus):
-            skipped_minus += 1
-            return
-        # чужая реклама / эзотерика / CTA @ / рассылки — не кандидат
-        ad_markers = (
-            "матриц", "судьб", "таро", "гадан", "астролог", "нумеролог",
-            "эзотерик", "писать @", "пишите @", "пиши @", "писать@",
-            "передано через @", "занимаюсь разбором", "есть отзывы)",
-            "вам срочное сообщение", "каталоге решений", "нельзя пропустить",
-            "гайд для продавцов", "подписывайтесь",
-        )
-        if any(x in low for x in ad_markers):
+        if find_minus_hit(text, minus) or find_minus_hit(text, AD_MARKERS):
             skipped_minus += 1
             return
         if not passes_kw(text):
@@ -939,10 +1273,34 @@ async def scan_group(
                     "error": "Сначала вступите в группу по инвайту",
                     "messages": [],
                     "member": False,
+                    **counters(),
                 }
             entity = invite.chat
         else:
-            entity = await client.get_entity(ref["value"])
+            entity, resolve_err = await _resolve_entity(client, url)
+            if resolve_err:
+                return {
+                    "ok": False,
+                    "status": "error" if resolve_err.get("usernameMissing") else "setup",
+                    "join": resolve_err.get("join") or "missing",
+                    "error": str(resolve_err.get("error") or "Не удалось найти группу")[:400],
+                    "messages": [],
+                    "member": False,
+                    **counters(),
+                    "usernameMissing": bool(resolve_err.get("usernameMissing")),
+                    "title": "",
+                }
+            if entity is None:
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "join": "missing",
+                    "error": f"Слот не видит @{ref.get('value')}",
+                    "messages": [],
+                    "member": False,
+                    **counters(),
+                    "usernameMissing": True,
+                }
             if not await member_of(entity):
                 return {
                     "ok": False,
@@ -951,6 +1309,7 @@ async def scan_group(
                     "error": "Аккаунт не в группе — сначала нажмите «Вступить»",
                     "messages": [],
                     "member": False,
+                    **counters(),
                     "title": getattr(entity, "title", None)
                     or getattr(entity, "username", "")
                     or url,
@@ -996,6 +1355,7 @@ async def scan_group(
                             "title": title,
                             "scanMode": scan_mode,
                             "needDiscussionJoin": True,
+                            **counters(),
                         }
                 async for m in client.iter_messages(linked, limit=fetch_limit):
                     await add_msg(m, kind="discussion", peer_entity=linked)
@@ -1035,7 +1395,7 @@ async def scan_group(
 
     except RPCError as e:
         if is_frozen_rpc(e):
-            return frozen_action_error("скан сообщений")
+            return {**frozen_action_error("скан сообщений"), **counters()}
         raise
 
     return {
@@ -1045,10 +1405,7 @@ async def scan_group(
         "messages": out[: max(limit, 40)],
         "error": "",
         "member": True,
-        "fetched": fetched,
-        "skippedMinus": skipped_minus,
-        "skippedKw": skipped_kw,
-        "skippedNotUser": skipped_not_user,
+        **counters(),
         "scanMode": scan_mode,
         "discussionId": discussion_id,
         "discussionTitle": discussion_title,
@@ -1100,14 +1457,152 @@ def _serialize_audience_user(user, *, is_admin: bool = False) -> dict[str, Any] 
         "premium": bool(getattr(user, "premium", False)),
         "isAdmin": bool(is_admin),
         "status": _user_status_bucket(user),
-        # access_hash этой сессии — нужен для ЛС тем же аккаунтом фермы
+        # access_hash этой сессии — чужой слот фермы его не примет
         "accessHash": str(getattr(user, "access_hash", "") or ""),
     }
 
 
-async def _resolve_entity(client, url: str):
+def _entity_usernames(ent) -> set[str]:
+    out: set[str] = set()
+    u = getattr(ent, "username", None)
+    if u:
+        out.add(str(u).lower().lstrip("@"))
+    for x in getattr(ent, "usernames", None) or []:
+        un = getattr(x, "username", None) or ""
+        if un:
+            out.add(str(un).lower().lstrip("@"))
+    return out
+
+
+def _peer_fields(entity) -> dict[str, str]:
+    """channelId + accessHash этой сессии — чтобы сбор не зависел от ResolveUsername."""
+    if entity is None:
+        return {}
+    cid = getattr(entity, "id", None)
+    ah = getattr(entity, "access_hash", None)
+    out: dict[str, str] = {}
+    if cid is not None:
+        out["channelId"] = str(cid)
+    if ah is not None:
+        out["accessHash"] = str(ah)
+    title = getattr(entity, "title", None) or getattr(entity, "username", None) or ""
+    if title:
+        out["title"] = str(title)
+    return out
+
+
+async def _match_username_in_peers(peers, want: str):
+    want = (want or "").lower().lstrip("@")
+    if not want:
+        return None
+    for ent in peers or []:
+        if ent is None:
+            continue
+        if want in _entity_usernames(ent):
+            return ent
+    return None
+
+
+async def _resolve_from_peer_hint(client, peer_hint: dict | None):
+    """InputChannel из кэша join (access_hash привязан к сессии слота)."""
+    if not peer_hint:
+        return None
+    cid_raw = str(peer_hint.get("channelId") or "").strip()
+    ah_raw = str(peer_hint.get("accessHash") or "").strip()
+    if not cid_raw.lstrip("-").isdigit() or not ah_raw.lstrip("-").isdigit():
+        return None
+    try:
+        from telethon.tl.types import InputPeerChannel, PeerChannel
+
+        cid = int(cid_raw)
+        ah = int(ah_raw)
+        try:
+            return await client.get_entity(InputPeerChannel(cid, ah))
+        except Exception:
+            return await client.get_entity(PeerChannel(cid))
+    except Exception:
+        return None
+
+
+async def _resolve_username_via_search(client, want: str):
+    """Ферма часто врёт на ResolveUsername; Search / SearchGlobal иногда видят тот же @."""
+    want = (want or "").lower().lstrip("@")
+    if not want:
+        return None
+    try:
+        from telethon.tl.functions.contacts import SearchRequest
+
+        res = await client(SearchRequest(q=want, limit=25))
+        found = await _match_username_in_peers(
+            list(getattr(res, "chats", None) or [])
+            + list(getattr(res, "users", None) or []),
+            want,
+        )
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    try:
+        from telethon.tl.functions.messages import SearchGlobalRequest
+        from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty
+
+        res = await client(
+            SearchGlobalRequest(
+                q=want,
+                filter=InputMessagesFilterEmpty(),
+                min_date=None,
+                max_date=None,
+                offset_rate=0,
+                offset_peer=InputPeerEmpty(),
+                offset_id=0,
+                limit=25,
+            )
+        )
+        found = await _match_username_in_peers(
+            list(getattr(res, "chats", None) or [])
+            + list(getattr(res, "users", None) or []),
+            want,
+        )
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    # Повторный Resolve после Search — иногда кэш сессии уже тёплый
+    try:
+        return await client.get_entity(want)
+    except Exception:
+        return None
+
+
+RESOLVE_CONTROL_USERNAME = "telegram"
+
+
+async def _account_resolve_blind(client) -> bool:
+    """Аккаунт не резолвит даже @telegram → ограничен сам слот, группа ни при чём.
+
+    Только явный UsernameNotOccupied/Invalid считаем слепотой; сеть/прочее — «не знаем» (False).
+    """
+    from telethon.tl.functions.contacts import ResolveUsernameRequest
+    from telethon.errors import UsernameNotOccupiedError, UsernameInvalidError
+
+    try:
+        await client(ResolveUsernameRequest(RESOLVE_CONTROL_USERNAME))
+        return False
+    except (UsernameNotOccupiedError, UsernameInvalidError):
+        return True
+    except Exception:
+        return False
+
+
+async def _resolve_entity(client, url: str, peer_hint: dict | None = None):
     from telethon.tl.functions.messages import CheckChatInviteRequest
     from telethon.tl.types import ChatInviteAlready
+    from telethon.errors import UsernameNotOccupiedError, UsernameInvalidError
+
+    # 0) Кэш peer с того же слота, что уже вступал
+    hinted = await _resolve_from_peer_hint(client, peer_hint)
+    if hinted is not None:
+        return hinted, None
 
     ref = parse_group_ref(url)
     if ref["kind"] == "invite":
@@ -1121,8 +1616,66 @@ async def _resolve_entity(client, url: str):
                 "hasMore": False,
             }
         return invite.chat, None
-    entity = await client.get_entity(ref["value"])
-    return entity, None
+    uname = str(ref.get("value") or "").lstrip("@")
+    want = uname.lower()
+    hint_cid = str((peer_hint or {}).get("channelId") or "").strip()
+    # Если слот уже в канале/чате — берём entity из диалогов, не ResolveUsername
+    if want or hint_cid:
+        try:
+            async for dialog in client.iter_dialogs(limit=500):
+                ent = getattr(dialog, "entity", None)
+                if ent is None:
+                    continue
+                if want and want in _entity_usernames(ent):
+                    return ent, None
+                if hint_cid and str(getattr(ent, "id", "")) == hint_cid:
+                    return ent, None
+        except Exception:
+            pass
+    try:
+        entity = await client.get_entity(ref["value"])
+        return entity, None
+    except (UsernameNotOccupiedError, UsernameInvalidError, ValueError) as e:
+        detail = str(e)
+        # Любой fail резолва username → Search fallback (ферма часто врёт)
+        found = await _resolve_username_via_search(client, want)
+        if found is not None:
+            return found, None
+        if (
+            isinstance(e, (UsernameNotOccupiedError, UsernameInvalidError))
+            or "no user has" in detail.lower()
+            or "nobody is using" in detail.lower()
+            or "username not occupied" in detail.lower()
+            or "cannot find any entity" in detail.lower()
+            or "no user has" in detail.lower()
+        ):
+            if await _account_resolve_blind(client):
+                return None, {
+                    "ok": False,
+                    "status": "error",
+                    "join": "missing",
+                    "usernameMissing": True,
+                    "accountBlind": True,
+                    "error": (
+                        f"Аккаунт не резолвит даже @{RESOLVE_CONTROL_USERNAME} — ограничен Telegram, "
+                        f"@{uname} тут ни при чём ({type(e).__name__}: {detail})"
+                    )[:400],
+                    "users": [],
+                    "hasMore": False,
+                }
+            return None, {
+                "ok": False,
+                "status": "error",
+                "join": "missing",
+                "usernameMissing": True,
+                "error": (
+                    f"Слот не видит @{uname} (ResolveUsername). "
+                    "Часто ложь фермы — нужен другой аккаунт или инвайт-ссылка."
+                )[:400],
+                "users": [],
+                "hasMore": False,
+            }
+        raise
 
 
 async def collect_audience(client, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1152,9 +1705,10 @@ async def collect_audience(client, payload: dict[str, Any]) -> dict[str, Any]:
     batch_size = max(20, min(200, int(payload.get("batchSize") or 80)))
     cursor = str(payload.get("cursor") or "")
     seen_ids = set(str(x) for x in (payload.get("seenIds") or []) if x)
+    peer_hint = payload.get("peerHint") if isinstance(payload.get("peerHint"), dict) else None
 
     try:
-        entity, err = await _resolve_entity(client, url)
+        entity, err = await _resolve_entity(client, url, peer_hint=peer_hint)
         if err:
             return err
         title = getattr(entity, "title", None) or getattr(entity, "username", "") or url
@@ -1370,34 +1924,35 @@ async def collect_audience(client, payload: dict[str, Any]) -> dict[str, Any]:
                 except Exception:
                     pass
             return primary
-        # discussions = участники чата/супергруппы
+        # discussions = участники чата/супергруппы (курсор = skip count, не userId)
         users: list[dict[str, Any]] = []
-        next_cursor = cursor
-        has_more = False
-        offset_user = int(cursor) if str(cursor).isdigit() else 0
+        skip = int(cursor) if str(cursor).isdigit() else 0
         scanned = 0
+        has_more = False
+        next_cursor = str(skip)
         try:
             async for user in client.iter_participants(entity):
+                scanned += 1
+                if scanned <= skip:
+                    continue
                 uid = getattr(user, "id", None)
                 if not uid:
                     continue
-                uid_i = int(uid)
-                if offset_user and uid_i <= offset_user:
-                    continue
-                scanned += 1
                 is_admin = str(uid) in admin_ids
                 u = _serialize_audience_user(user, is_admin=is_admin)
                 if accept(u):
                     users.append(u)  # type: ignore[arg-type]
                     seen_ids.add(u["userId"])  # type: ignore[index]
-                    next_cursor = str(uid)
                     if len(users) >= batch_size:
                         has_more = True
+                        next_cursor = str(scanned)
                         break
                 if range_mode == "count" and len(seen_ids) >= message_limit:
                     has_more = False
+                    next_cursor = str(scanned)
                     break
             else:
+                next_cursor = str(scanned)
                 has_more = False
         except (ChatAdminRequiredError, RPCError) as e:
             if "CHAT_ADMIN_REQUIRED" in str(e).upper() or isinstance(e, ChatAdminRequiredError):
@@ -1486,33 +2041,66 @@ async def invite_users(client, payload: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 source_entity = None
 
-        async def resolve_peer(uid: str, uname: str):
-            if uname:
-                try:
-                    return await client.get_input_entity(uname.lstrip("@"))
-                except Exception:
-                    pass
-            if uid:
-                # 1) из кэша / диалогов
-                try:
-                    return await client.get_input_entity(int(uid))
-                except Exception:
-                    pass
-                # 2) через участника исходного чата (access_hash)
-                if source_entity is not None:
+        async def resolve_peer(uid: str, uname: str, access_hash: str = ""):
+            from telethon.tl.types import InputPeerUser, InputUser
+
+            uid_ok = bool(uid and str(uid).lstrip("-").isdigit())
+            uid_i = int(uid) if uid_ok else 0
+            ah_ok = bool(access_hash and str(access_hash).lstrip("-").isdigit())
+            ah_i = int(access_hash) if ah_ok else 0
+            clean = (uname or "").strip().lstrip("@")
+
+            # 1) Участник исходного чата — свежий access_hash ЭТОЙ сессии
+            #    (ResolveUsername на ферме часто врёт, ручной поиск в TG — другой клиент)
+            if source_entity is not None and uid_ok:
+                for peer_try in (
+                    InputPeerUser(uid_i, ah_i) if ah_ok else None,
+                    InputPeerUser(uid_i, 0),
+                    InputUser(uid_i, ah_i) if ah_ok else None,
+                    InputUser(uid_i, 0),
+                    uid_i,
+                ):
+                    if peer_try is None:
+                        continue
                     try:
-                        part = await client(GetParticipantRequest(source_entity, int(uid)))
-                        user = getattr(part, "users", [None])[0] if getattr(part, "users", None) else None
-                        if user is None:
-                            # Telethon кладёт user в part.participant / clients cache
-                            user = await client.get_entity(int(uid))
-                        return await client.get_input_entity(user)
+                        part = await client(GetParticipantRequest(source_entity, peer_try))
+                        users = list(getattr(part, "users", None) or [])
+                        if users:
+                            return await client.get_input_entity(users[0])
+                        # participant без users — пробуем кэш после RPC
+                        return await client.get_input_entity(uid_i)
                     except Exception:
-                        try:
-                            user = await client.get_entity(int(uid))
-                            return await client.get_input_entity(user)
-                        except Exception:
-                            pass
+                        continue
+
+            # 2) @username → ResolveUsername; при лжи фермы — contacts.Search
+            if clean:
+                try:
+                    return await client.get_input_entity(clean)
+                except Exception:
+                    pass
+                try:
+                    found = await _resolve_username_via_search(client, clean)
+                    if found is not None:
+                        return await client.get_input_entity(found)
+                except Exception:
+                    pass
+
+            # 3) access_hash сборщика (валиден только если слот тот же)
+            if uid_ok and ah_ok:
+                try:
+                    peer = InputPeerUser(uid_i, ah_i)
+                    # лёгкая проверка — иначе InviteToChannel даст PEER_ID_INVALID
+                    await client.get_entity(peer)
+                    return peer
+                except Exception:
+                    pass
+
+            # 4) кэш / диалоги этой сессии
+            if uid_ok:
+                try:
+                    return await client.get_input_entity(uid_i)
+                except Exception:
+                    pass
             return None
 
         results: list[dict[str, Any]] = []
@@ -1520,8 +2108,9 @@ async def invite_users(client, payload: dict[str, Any]) -> dict[str, Any]:
         for item in raw_users[:20]:
             uid = str(item.get("userId") or item.get("id") or "")
             uname = str(item.get("username") or "")
+            access_hash = str(item.get("accessHash") or item.get("senderAccessHash") or "")
             try:
-                peer = await resolve_peer(uid, uname)
+                peer = await resolve_peer(uid, uname, access_hash)
                 if peer is None:
                     results.append({"userId": uid, "username": uname, "ok": False, "error": "no_entity"})
                     continue
@@ -1604,14 +2193,7 @@ async def invite_users(client, payload: dict[str, Any]) -> dict[str, Any]:
                     "title": title,
                 }
             except FloodWaitError as e:
-                return {
-                    "ok": False,
-                    "status": "floodwait",
-                    "error": f"FloodWait {e.seconds}s",
-                    "floodWait": int(e.seconds),
-                    "results": results,
-                    "title": title,
-                }
+                return invite_flood_result(e, results=results, title=title)
             except RPCError as e:
                 if is_frozen_rpc(e):
                     return {**frozen_action_error("инвайт"), "results": results}
@@ -1647,7 +2229,6 @@ async def send_message(
     delete_dialog: bool = False,
 ) -> dict[str, Any]:
     from telethon.errors import (
-        FloodWaitError,
         RPCError,
         UserPrivacyRestrictedError,
         UserBannedInChannelError,
@@ -1717,10 +2298,10 @@ async def send_message(
             except Exception as e:
                 errors.append(("username/entity: " + str(e))[:160])
 
-        # 2) Уже есть диалог в этой сессии
+        # 2) Уже есть диалог / entity в кэше этой сессии
         if uid_clean.isdigit():
             try:
-                async for dialog in client.iter_dialogs(limit=40):
+                async for dialog in client.iter_dialogs(limit=200):
                     if not getattr(dialog, "is_user", False):
                         continue
                     ent = dialog.entity
@@ -1733,27 +2314,50 @@ async def send_message(
             except Exception as e:
                 errors.append(("id/cache: " + str(e))[:160])
 
-        # 3) Через исходную группу / сообщение лида
+        # 3) Через исходную группу / сообщение лида (свежий access_hash для ЭТОЙ сессии)
         if uid_clean.isdigit() and source_url:
             try:
                 source_entity, err = await _resolve_entity(client, source_url)
                 if source_entity is not None and not err:
-                    if msg_id and str(msg_id).isdigit():
-                        try:
-                            m = await client.get_messages(source_entity, ids=int(msg_id))
-                            if m:
-                                sender = await m.get_sender()
-                                if sender is not None and isinstance(sender, User):
-                                    return await client.get_input_entity(sender), ""
-                        except Exception as e:
-                            errors.append(("id/msg: " + str(e))[:160])
+                    # Канал-витрина: участники/комментаторы часто в linked discussion
+                    peer_targets = [source_entity]
                     try:
-                        part = await client(GetParticipantRequest(source_entity, int(uid_clean)))
-                        users = getattr(part, "users", None) or []
-                        if users:
-                            return await client.get_input_entity(users[0]), ""
+                        if (
+                            isinstance(source_entity, Channel)
+                            and bool(getattr(source_entity, "broadcast", False))
+                            and not bool(getattr(source_entity, "megagroup", False))
+                        ):
+                            from telethon.tl.functions.channels import GetFullChannelRequest
+
+                            full_ch = await client(GetFullChannelRequest(source_entity))
+                            linked_id = getattr(full_ch.full_chat, "linked_chat_id", None)
+                            if linked_id:
+                                linked = await client.get_entity(int(linked_id))
+                                if linked is not None:
+                                    peer_targets.append(linked)
                     except Exception as e:
-                        errors.append(("id/participant: " + str(e))[:160])
+                        errors.append(("id/linked: " + str(e))[:160])
+
+                    if msg_id and str(msg_id).isdigit():
+                        for peer_ent in peer_targets:
+                            try:
+                                m = await client.get_messages(peer_ent, ids=int(msg_id))
+                                if m:
+                                    sender = await m.get_sender()
+                                    if sender is not None and isinstance(sender, User):
+                                        return await client.get_input_entity(sender), ""
+                            except Exception as e:
+                                errors.append(("id/msg: " + str(e))[:160])
+                    for peer_ent in peer_targets:
+                        try:
+                            part = await client(
+                                GetParticipantRequest(peer_ent, int(uid_clean))
+                            )
+                            users = getattr(part, "users", None) or []
+                            if users:
+                                return await client.get_input_entity(users[0]), ""
+                        except Exception as e:
+                            errors.append(("id/participant: " + str(e))[:160])
                     try:
                         return await client.get_input_entity(int(uid_clean)), ""
                     except Exception as e:
@@ -1783,10 +2387,15 @@ async def send_message(
                 "Ответьте тем же аккаунтом, что писал ранее, или укажите @username клиента."
             )
             return None, hint
-        if "could not find the input entity" in low or "cannot find any entity" in low or "access_hash" in low:
+        if (
+            "could not find the input entity" in low
+            or "cannot find any entity" in low
+            or "access_hash" in low
+            or detail == "peer not found"
+        ):
             hint = (
-                "Не удалось открыть пользователя. "
-                "Нужен @username или тот же аккаунт фермы, что сканировал группу."
+                "Не удалось открыть пользователя (нет access_hash). "
+                "Нужен @username или аккаунт фермы из той же группы/сбора."
             )
             return None, hint
         if "username" in low and ("not occupied" in low or "invalid" in low or "no user" in low):
@@ -1939,47 +2548,11 @@ async def send_message(
                 "Смените аккаунт фермы или подождите 24ч."
             )[:400],
         }
-    except FloodWaitError as e:
-        return {"ok": False, "status": "flood", "error": f"FloodWait {e.seconds}с", "waitSec": int(e.seconds)}
     except RPCError as e:
-        if is_frozen_rpc(e):
-            return frozen_action_error("отправка сообщения")
-        msg = str(e)
-        low = msg.lower()
-        if "banned from sending" in low or "chat_write_forbidden" in low or "user_banned_in_channel" in low:
-            return {
-                "ok": False,
-                "status": "spamblock",
-                "error": (
-                    "Аккаунт ограничен Telegram: нельзя писать в чаты/каналы. "
-                    "Смените аккаунт фермы или подождите 24ч."
-                )[:400],
-            }
-        if "invalid peer" in low:
-            return {
-                "ok": False,
-                "error": (
-                    "Неверный peer для этого аккаунта (часто чужой access_hash). "
-                    "Ответьте тем же аккаунтом или укажите @username клиента."
-                )[:400],
-            }
-        # Telethon иногда отдаёт Flood как обычный RPC «Too many requests» без FloodWaitError
-        if "too many requests" in low or ("flood" in low and "peer_flood" not in low and "banned" not in low):
-            wait = 900
-            m = re.search(r"(\d+)\s*(?:seconds?|s\b)", msg, re.I)
-            if m:
-                try:
-                    wait = max(60, min(86400, int(m.group(1))))
-                except Exception:
-                    wait = 900
-            return {
-                "ok": False,
-                "status": "flood",
-                "error": msg[:400],
-                "waitSec": wait,
-            }
-        return {"ok": False, "error": msg[:400]}
+        return send_rpc_error_result(e)
     except Exception as e:
+        if is_flood_wait(e):
+            return flood_result(e)
         msg = str(e)
         low = msg.lower()
         if "banned from sending" in low:
@@ -2159,21 +2732,24 @@ async def ensure_account_username(
             last_err = f"@{candidate} недопустим"
             continue
         except RPCError as e:
-            msg = str(e)
-            if e.code == 420 or "FROZEN" in msg.upper() or "frozen" in msg.lower():
+            wait = flood_wait_seconds(e)
+            if wait is not None:
+                last_err = f"FloodWait {wait}с"
+                break
+            if is_frozen_rpc(e):
                 me = await client.get_me()
                 return profile_from(
                     me,
                     usernameError="Telegram ограничил смену username (заморозка)",
                     frozenMethod=not bool(me.username),
                 )
-            last_err = msg[:200]
-            if "flood" in last_err.lower():
-                break
+            last_err = str(e)[:200]
             continue
         except Exception as e:
             last_err = str(e)[:200]
-            if "flood" in last_err.lower() or "frozen" in last_err.lower():
+            if is_flood_wait(e):
+                break
+            if classify_error(e) == "frozen":
                 me = await client.get_me()
                 return profile_from(
                     me,
@@ -2206,10 +2782,11 @@ async def update_profile(client, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         await client(UpdateProfileRequest(**kwargs))
     except RPCError as e:
-        msg = str(e)
-        if e.code == 420 or "FROZEN" in msg.upper():
+        if is_flood_wait(e):
+            return error_result(e)
+        if is_frozen_rpc(e):
             return {"ok": False, "status": "frozen", "error": "Telegram ограничил смену профиля (заморозка)"}
-        return {"ok": False, "error": msg[:300]}
+        return {"ok": False, "error": str(e)[:300]}
     me = await client.get_me()
     phone = me.phone or ""
     if phone and not str(phone).startswith("+"):
@@ -2250,178 +2827,156 @@ async def upload_profile_photo(client, payload: dict[str, Any]) -> dict[str, Any
         uploaded = await client.upload_file(raw, file_name="avatar.jpg")
         await client(UploadProfilePhotoRequest(file=uploaded))
     except RPCError as e:
-        msg = str(e)
-        if e.code == 420 or "FROZEN" in msg.upper():
+        if is_flood_wait(e):
+            return error_result(e)
+        if is_frozen_rpc(e):
             return {"ok": False, "status": "frozen", "error": "Telegram ограничил смену фото (заморозка)"}
-        return {"ok": False, "error": msg[:300]}
+        return {"ok": False, "error": str(e)[:300]}
     except Exception as e:
         return {"ok": False, "error": str(e)[:300]}
     return {"ok": True, "hasPhoto": True}
 
-async def run_check(payload: dict[str, Any]) -> dict[str, Any]:
-    work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+CANCELLED_ERROR = "Операция прервана (таймаут/отмена)"
+
+
+async def check_account(client, payload: dict[str, Any]) -> dict[str, Any]:
+    create_username = payload.get("ensureUsername", True)
+    force_username = bool(payload.get("forceUsername"))
+    desired = str(payload.get("desiredUsername") or "").strip()
+    if create_username or force_username:
+        profile = await ensure_account_username(
+            client,
+            desired=desired or None,
+            force=force_username,
+        )
+    else:
+        me = await client.get_me()
+        phone = me.phone or ""
+        if phone and not str(phone).startswith("+"):
+            phone = "+" + phone
+        profile = {
+            "firstName": me.first_name or "",
+            "lastName": me.last_name or "",
+            "username": me.username or "",
+            "usernameCreated": False,
+            "phone": phone,
+            "userId": me.id,
+        }
+    restriction = None
+    if payload.get("checkRestrictions", True):
+        restriction = await check_spambot(client)
+    status = "active"
+    error = ""
+    if profile.get("frozenMethod"):
+        # UpdateUsername заморожен — часто и JoinChannel тоже; помечаем аккаунт
+        status = "frozen"
+        error = "Аккаунт заморожен Telegram (FROZEN_METHOD_INVALID). Вступление в группы недоступно — нужен другой аккаунт."
+    elif restriction == "spamblock":
+        status = "spamblock"
+        error = "Ограничения по SpamBot"
+    elif restriction == "frozen":
+        status = "frozen"
+        error = "Аккаунт заморожен"
+    elif not profile.get("username") and profile.get("usernameError"):
+        error = f"Без @username: {profile['usernameError']}"
+    return {"ok": status == "active", "status": status, "error": error, "profile": profile}
+
+
+def _split_words(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        return [x.strip() for x in raw.replace(";", ",").split(",")]
+    return list(raw or [])
+
+
+async def dispatch_account_action(client, payload: dict[str, Any], action: str) -> dict[str, Any]:
+    # Join/scan НЕ трогают username: UpdateUsername на frozen даёт FROZEN_METHOD_INVALID
+    # и ломает вступление. @username нужен только по желанию при проверке аккаунта.
+    url = payload.get("url") or ""
+    if action == "check":
+        return await check_account(client, payload)
+    if action == "join":
+        peer_hint = payload.get("peerHint") if isinstance(payload.get("peerHint"), dict) else None
+        return await join_group(client, url, peer_hint=peer_hint)
+    if action == "scan":
+        keywords = _split_words(payload.get("keywords"))
+        minus = _split_words(payload.get("minusKeywords") or payload.get("minus_keywords"))
+        limit = int(payload.get("limit") or 40)
+        days = int(payload.get("days") or 0)
+        return await scan_group(client, url, keywords, minus, limit, days=days)
+    if action == "collect":
+        return await collect_audience(client, payload)
+    if action == "invite":
+        return await invite_users(client, payload)
+    if action == "send":
+        return await send_message(
+            client,
+            mode=str(payload.get("mode") or "dm"),
+            text=str(payload.get("text") or ""),
+            url=str(payload.get("url") or ""),
+            reply_to=str(payload.get("replyTo") or payload.get("tgMsgId") or ""),
+            sender_id=str(payload.get("senderId") or ""),
+            sender_username=str(payload.get("senderUsername") or ""),
+            sender_access_hash=str(
+                payload.get("senderAccessHash") or payload.get("accessHash") or ""
+            ),
+            silent=bool(payload.get("silent") or False),
+            delete_dialog=bool(
+                payload.get("deleteDialog") or payload.get("delete_dialog") or False
+            ),
+        )
+    if action == "inbox":
+        return await poll_dm_inbox(
+            client,
+            since_ts=int(payload.get("sinceTs") or payload.get("since_ts") or 0),
+            limit_dialogs=int(payload.get("limitDialogs") or 20),
+        )
+    if action == "update_profile":
+        return await update_profile(client, payload)
+    if action == "upload_photo":
+        return await upload_profile_photo(client, payload)
+    return {"ok": False, "error": f"Неизвестное действие: {action}"}
+
+
+ACCOUNT_ACTIONS = frozenset(
+    {"check", "join", "scan", "collect", "invite", "send", "inbox", "update_profile", "upload_photo"}
+)
+
+
+async def run_account_action(payload: dict[str, Any], action: str) -> dict[str, Any]:
+    """Открыть клиент, выполнить действие, закрыть; новая сессия (если создана) — в ответ."""
+    error_extra: dict[str, Any] = {} if action == "check" else {"messages": []}
+    work = make_work_dir()
     client = None
     try:
         client = await open_client(payload, work)
-        create_username = payload.get("ensureUsername", True)
-        force_username = bool(payload.get("forceUsername"))
-        desired = str(payload.get("desiredUsername") or "").strip()
-        if create_username or force_username:
-            profile = await ensure_account_username(
-                client,
-                desired=desired or None,
-                force=force_username,
-            )
-        else:
-            me = await client.get_me()
-            phone = me.phone or ""
-            if phone and not str(phone).startswith("+"):
-                phone = "+" + phone
-            profile = {
-                "firstName": me.first_name or "",
-                "lastName": me.last_name or "",
-                "username": me.username or "",
-                "usernameCreated": False,
-                "phone": phone,
-                "userId": me.id,
-            }
-        restriction = None
-        if payload.get("checkRestrictions", True):
-            restriction = await check_spambot(client)
-        status = "active"
-        error = ""
-        if profile.get("frozenMethod"):
-            # UpdateUsername заморожен — часто и JoinChannel тоже; помечаем аккаунт
-            status = "frozen"
-            error = "Аккаунт заморожен Telegram (FROZEN_METHOD_INVALID). Вступление в группы недоступно — нужен другой аккаунт."
-        elif restriction == "spamblock":
-            status = "spamblock"
-            error = "Ограничения по SpamBot"
-        elif restriction == "frozen":
-            status = "frozen"
-            error = "Аккаунт заморожен"
-        elif not profile.get("username") and profile.get("usernameError"):
-            error = f"Без @username: {profile['usernameError']}"
-        return {
-            "ok": status == "active",
-            "status": status,
-            "error": error,
-            "profile": profile,
-            "sessionRefreshed": bool(
-                getattr(client, "_uniseller_session_refreshed", False)
-            ),
-        }
+        result = await dispatch_account_action(client, payload, action)
     except asyncio.CancelledError:
-        return {"ok": False, "status": "disconnected", "error": "Операция прервана (таймаут/отмена)"}
+        result = {"ok": False, "status": "disconnected", "error": CANCELLED_ERROR, **error_extra}
     except Exception as e:
-        return {"ok": False, "status": classify_error(e), "error": str(e)[:400]}
+        result = error_result(e, **error_extra)
+    try:
+        if client:
+            await client.disconnect()
+    except Exception:
+        pass
+    try:
+        return attach_refreshed_session(result, client, payload)
     finally:
-        try:
-            if client:
-                await client.disconnect()
-        except Exception:
-            pass
         shutil.rmtree(work, ignore_errors=True)
 
 
 async def run_action(payload: dict[str, Any]) -> dict[str, Any]:
     action = payload.get("action") or "check"
     try:
-        if action == "check":
-            return await run_check(payload)
         if action == "check_proxy":
             return await check_proxy_alive(payload)
-
-        work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
-        client = None
-        try:
-            client = await open_client(payload, work)
-            # Join/scan НЕ трогают username: UpdateUsername на frozen даёт FROZEN_METHOD_INVALID
-            # и ломает вступление. @username нужен только по желанию при проверке аккаунта.
-            url = payload.get("url") or ""
-            if action == "join":
-                return await join_group(client, url)
-            if action == "scan":
-                keywords = payload.get("keywords") or []
-                if isinstance(keywords, str):
-                    keywords = [x.strip() for x in keywords.replace(";", ",").split(",")]
-                minus = payload.get("minusKeywords") or payload.get("minus_keywords") or []
-                if isinstance(minus, str):
-                    minus = [x.strip() for x in minus.replace(";", ",").split(",")]
-                limit = int(payload.get("limit") or 40)
-                days = int(payload.get("days") or 0)
-                return await scan_group(client, url, keywords, minus, limit, days=days)
-            if action == "collect":
-                return await collect_audience(client, payload)
-            if action == "invite":
-                return await invite_users(client, payload)
-            if action == "send":
-                return await send_message(
-                    client,
-                    mode=str(payload.get("mode") or "dm"),
-                    text=str(payload.get("text") or ""),
-                    url=str(payload.get("url") or ""),
-                    reply_to=str(payload.get("replyTo") or payload.get("tgMsgId") or ""),
-                    sender_id=str(payload.get("senderId") or ""),
-                    sender_username=str(payload.get("senderUsername") or ""),
-                    sender_access_hash=str(
-                        payload.get("senderAccessHash")
-                        or payload.get("accessHash")
-                        or ""
-                    ),
-                    silent=bool(payload.get("silent") or False),
-                    delete_dialog=bool(
-                        payload.get("deleteDialog")
-                        or payload.get("delete_dialog")
-                        or False
-                    ),
-                )
-            if action == "inbox":
-                return await poll_dm_inbox(
-                    client,
-                    since_ts=int(payload.get("sinceTs") or payload.get("since_ts") or 0),
-                    limit_dialogs=int(payload.get("limitDialogs") or 20),
-                )
-            if action == "update_profile":
-                return await update_profile(client, payload)
-            if action == "upload_photo":
-                return await upload_profile_photo(client, payload)
+        if action not in ACCOUNT_ACTIONS:
             return {"ok": False, "error": f"Неизвестное действие: {action}"}
-        except asyncio.CancelledError:
-            return {
-                "ok": False,
-                "status": "disconnected",
-                "error": "Операция прервана (таймаут/отмена)",
-                "messages": [],
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "status": classify_error(e),
-                "error": str(e)[:400],
-                "messages": [],
-            }
-        finally:
-            try:
-                if client:
-                    await client.disconnect()
-            except Exception:
-                pass
-            shutil.rmtree(work, ignore_errors=True)
+        return await run_account_action(payload, action)
     except asyncio.CancelledError:
-        return {
-            "ok": False,
-            "status": "disconnected",
-            "error": "Операция прервана (таймаут/отмена)",
-            "messages": [],
-        }
+        return {"ok": False, "status": "disconnected", "error": CANCELLED_ERROR, "messages": []}
     except Exception as e:
-        return {
-            "ok": False,
-            "status": classify_error(e),
-            "error": str(e)[:400],
-            "messages": [],
-        }
+        return error_result(e, messages=[])
 
 
 def _emit_error(exc: BaseException) -> int:
@@ -2429,8 +2984,9 @@ def _emit_error(exc: BaseException) -> int:
     if isinstance(exc, asyncio.CancelledError):
         text = "Операция прервана (таймаут/отмена)"
     else:
-        msg = str(exc).strip()
-        text = f"{name}: {msg}" if msg else name
+        # Сообщение исключения может содержать пути/секреты — наружу только тип.
+        text = f"Ошибка воркера ({name})"
+    print(f"[check_account] unhandled {name}", file=sys.stderr)
     err = {
         "ok": False,
         "status": "disconnected",
@@ -2448,7 +3004,11 @@ def _emit_error(exc: BaseException) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--payload", help="JSON file or - for stdin")
+    parser.add_argument("--work-dir", help="Scratch dir owned (and removed) by the caller")
     args = parser.parse_args()
+    global _WORK_DIR_OVERRIDE
+    if args.work_dir:
+        _WORK_DIR_OVERRIDE = Path(args.work_dir)
     try:
         if args.payload == "-" or not args.payload:
             payload = json.load(sys.stdin)

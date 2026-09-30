@@ -1,18 +1,13 @@
 "use client";
-import {useState,useEffect,useCallback,useRef,useMemo,Suspense} from 'react';
+import {useState,useEffect,useEffectEvent,useCallback,useRef,useMemo,Suspense,lazy} from 'react';
 import {useSearchParams} from 'next/navigation';
-import {Users,Radio,Shield,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge,AlertTriangle,BarChart3,Folder,CircleX} from 'lucide-react';
+import {Users,Radio,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge,AlertTriangle,BarChart3,Folder,CircleX} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {OverviewDashboard} from '@/components/product/overview-dashboard';
-import {LeadCorePanel} from '@/components/product/lead-core-panel';
 import {WorkspaceNav,parseWorkspaceView,persistWorkspaceView,readStoredWorkspaceView,WORKSPACE_VIEW_PARAM,type NavName} from '@/components/product/workspace-nav';
 import {NotificationsBell,NotificationsPanel} from '@/components/product/notifications-center';
 import {useWorkspaceNotices} from '@/hooks/useWorkspaceNotices';
-import {AudiencePanel,AudienceTaskFields} from '@/components/product/audience-panel';
-import {InvitePanel,InviteModePicker,InviteTaskFields} from '@/components/product/invite-panel';
-import {MailingPanel,MailingTaskFields,MailingDeliveriesView} from '@/components/product/mailing-panel';
-import {TaskLogDialog} from '@/components/product/task-log-dialog';
-import {EmployeesPanel} from '@/components/product/employees-panel';
+import {PanelErrorBoundary} from '@/components/product/error-fallback';
 import {DEFAULT_DM_SOFT_CLOSE,DEFAULT_MAILING_TASK} from '@/lib/mailing';
 import {canAccessNav,type CrmAccess,type WorkspaceInvite,type WorkspaceMember} from '@/lib/staff-types';
 import {DEFAULT_NAV} from '@/components/product/workspace-nav';
@@ -31,7 +26,7 @@ import {toast} from '@/lib/workspace-notifications';
 import {SidebarProvider,Sidebar,SidebarHeader,SidebarContent,SidebarFooter,SidebarInset,SidebarTrigger} from '@/components/ui/sidebar';
 import {parseProxyLine,parseProxyLines,type ProxyProtocol} from '@/lib/proxy-line';
 import {accountPhoneKey,canonicalizeTgUrl,duplicateReason,findDuplicate,proxyIdentityKey,telegramEntityKey} from '@/lib/record-identity';
-import {accountSessionSecret,formatArchiveSize,parseAccountZip,ACCOUNT_ARCHIVE_ACCEPT,MAX_ACCOUNT_ARCHIVE_BYTES} from '@/lib/account-zip';
+import type * as AccountZipModule from '@/lib/account-zip';
 import {
   ACCOUNT_STATUS_LABELS,
   ACCOUNT_STATUSES,
@@ -87,6 +82,28 @@ import {
 } from '@/lib/audience-invite';
 import {useTableSort} from '@/hooks/useTableSort';
 import type {SortValueType} from '@/lib/table-sort';
+import {ApiError,busyWaitSec,isForbidden,requestJson,timeoutForAction,waitLabel} from './api-client';
+import {createPollGate} from './poll-gate';
+
+// Разделы и формы задач грузятся отдельными чанками: главный бандл кабинета был ~730 kB.
+const loadAudience=()=>import('@/components/product/audience-panel');
+const loadInvite=()=>import('@/components/product/invite-panel');
+const loadMailing=()=>import('@/components/product/mailing-panel');
+const AudiencePanel=lazy(()=>loadAudience().then(m=>({default:m.AudiencePanel})));
+const AudienceTaskFields=lazy(()=>loadAudience().then(m=>({default:m.AudienceTaskFields})));
+const InvitePanel=lazy(()=>loadInvite().then(m=>({default:m.InvitePanel})));
+const InviteModePicker=lazy(()=>loadInvite().then(m=>({default:m.InviteModePicker})));
+const InviteTaskFields=lazy(()=>loadInvite().then(m=>({default:m.InviteTaskFields})));
+const MailingPanel=lazy(()=>loadMailing().then(m=>({default:m.MailingPanel})));
+const MailingTaskFields=lazy(()=>loadMailing().then(m=>({default:m.MailingTaskFields})));
+const MailingDeliveriesView=lazy(()=>loadMailing().then(m=>({default:m.MailingDeliveriesView})));
+const EmployeesPanel=lazy(()=>import('@/components/product/employees-panel').then(m=>({default:m.EmployeesPanel})));
+const LeadCorePanel=lazy(()=>import('@/components/product/lead-core-panel').then(m=>({default:m.LeadCorePanel})));
+const TaskLogDialog=lazy(()=>import('@/components/product/task-log-dialog').then(m=>({default:m.TaskLogDialog})));
+
+function SectionSkeleton(){
+  return <Skeleton className="h-64 w-full rounded-xl"/>;
+}
 
 type Kind='account'|'proxy'|'group'|'lead'|'settings'|'audience_task'|'invite_task'|'mailing_task';
 type RecordItem={id:string;kind:Kind;data:any;hasSecret:boolean;created:string};
@@ -143,20 +160,35 @@ AI будет использовать этот текст для отбора �
 };
 const viewCopy:Record<string,string>={'Обзор':'Лиды, чаты и статус подключений — всё важное на одном экране.','Уведомления':'Журнал событий кабинета: сканы, вступления, рассылки, ошибки и сохранения.','Лиды':'Новые запросы: просмотренные скрываются из общей сетки.','Переписки':'Ответы клиентов: откройте диалог — он уйдёт в «Просмотренные». Новый ответ клиента снова в «Новые».','Группы и каналы':'Поиск тем под AI → вступление → реальные лиды из чатов.','Сбор аудитории':'Аккаунт → источник → фильтры → база участников для инвайтинга.','Инвайтинг':'Приглашение собранной аудитории в вашу группу: обычный и продвинутый режим.','Рассылка':'Личные сообщения базе или лидам: смешанные аккаунты, Spintax или уникальные AI-тексты, полный лог доставок.','Аккаунты':'Статусы, дневные лимиты, отлёжка, прокси и группы — всё по каждому аккаунту.','Прокси':'host:port:user:password — список или по одному.','AI-ассистент':'Ядро поиска лидов, продукт, плюс/минус слова, обучение и обход групп.','Сотрудники':'Роли, доступы к разделам CRM и приглашения коллег по ссылке.','Настройки':'Глубина скана, профиль кабинета и уведомления о лидах в Telegram-бота.'};
 
-async function api(body?:unknown){
-  const r=await fetch('/api/workspace',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});
-  const data:any=await r.json();
-  if(!r.ok){
-    const err=new Error(data.error||'Ошибка соединения') as Error & {status?:number;data?:any};
-    err.status=r.status;
-    err.data=data;
-    throw err;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- workspace payloads are untyped records across the cabinet
+async function api(body?:{action?:string}&Record<string,unknown>):Promise<any>{
+  const init:RequestInit=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'};
+  return requestJson('/api/workspace',init,{timeoutMs:timeoutForAction(body?.action)});
+}
+
+/** jszip + unrar (~140 kB) нужны только в импорте аккаунтов — грузим по требованию. */
+const loadAccountZip=()=>import('@/lib/account-zip');
+
+/** Сеть, таймаут или 5xx — повод для backoff поллера; 4xx/409 «занято» — обычный ответ. */
+function isTransportFailure(e:unknown){
+  return e instanceof ApiError&&(e.kind!=='http'||e.status>=500);
+}
+
+type StaffListResponse={members?:WorkspaceMember[];invites?:WorkspaceInvite[]};
+type StaffActionResponse={url?:string;removed?:number;members?:number;invites?:number};
+
+/** POST /api/staff; an HTTP error without a server message falls back to the action-specific text. */
+async function staffApi(body:{action:string}&Record<string,unknown>,fallbackError:string):Promise<StaffActionResponse>{
+  try{
+    return await requestJson<StaffActionResponse>('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  }catch(e){
+    if(e instanceof ApiError&&e.kind==='http'&&typeof e.data.error!=='string')throw new ApiError(fallbackError,'http',e.status,e.data);
+    throw e;
   }
-  return data;
 }
 
 /** Чистый payload группы: не тащим битый joinStateError из records в save. */
-function cleanGroupSaveData(data:Record<string,unknown>){
+function cleanGroupSaveData(data:Record<string,unknown>):Record<string,unknown>{
   const err=data.joinStateError;
   const joinStateError=
     err==null||typeof err==='object'?'':String(err).slice(0,500);
@@ -192,21 +224,6 @@ function proxyDisplayLabel(data:any){
   if(name&&!name.startsWith(':'))return name;
   if(name.startsWith(':')&&port)return `?:${port}`;
   return name||'Прокси';
-}
-
-function ProxyRefLabel({proxy}:{proxy:{id:string;data:any}|undefined}){
-  if(!proxy)return <span className="muted">Не назначен</span>;
-  const st=String(proxy.data.status||'inactive');
-  const active=st==='active';
-  const label=proxyDisplayLabel(proxy.data);
-  return (
-    <span className={`proxy-ref ${active?'is-active':st==='checking'?'is-checking':''}`} title={label}>
-      <span className="proxy-ref-name">{label}</span>
-      {active&&<span className="badge success">активен</span>}
-      {st==='checking'&&<span className="badge warning">проверка</span>}
-      {st==='inactive'&&<span className="badge neutral">неактивен</span>}
-    </span>
-  );
 }
 
 function Pick({value,onChange,options,placeholder}:{
@@ -252,12 +269,6 @@ function tempBadge(t?:string){
   return <span className={`temp-badge ${temp}`}>{LEAD_TEMPERATURE_LABELS[temp]}</span>;
 }
 
-function groupRatingStars(rating:number){
-  const n=Math.max(0,Math.min(5,Math.round(Number(rating)||0)));
-  if(!n)return <span className="muted text-sm">Нет оценки</span>;
-  return <span className="group-rating" aria-label={`Рейтинг ${n} из 5`}>{'★'.repeat(n)}{'☆'.repeat(5-n)}</span>;
-}
-
 function parseKeywordList(value:string){
   return String(value||'').split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean);
 }
@@ -301,8 +312,6 @@ function groupAlreadyIn(item:RecordItem){
   if(d.membership==='joined'||d.membership==='pending')return true;
   if(d.status==='pending')return true;
   if(d.joinedAt)return true;
-  if(Number(d.leadsTotal)>0||Number(d.leadsHot)>0||Number(d.leadsWarm)>0||Number(d.scanMatched)>0)return true;
-  if(Array.isArray(d.scanLog)&&d.scanLog.length>0)return true;
   return false;
 }
 
@@ -450,6 +459,18 @@ function AccountLimitsCell({data}:{data:any}){
   );
 }
 
+/** Итог «вступление + скан» для тоста. */
+type OnboardSummary={
+  joined:'requested'|'already'|'joined';
+  scanned:number;
+  matched:number;
+  added:number;
+  aiUsed:boolean;
+  title:string;
+  metrics?:unknown;
+  addedByTemp?:{hot?:number;warm?:number;cold?:number}|null;
+};
+
 function WorkspaceHome(){
   const searchParams=useSearchParams();
   const notices=useWorkspaceNotices();
@@ -459,10 +480,17 @@ function WorkspaceHome(){
   const [groupImportText,setGroupImportText]=useState('');
   const [groupImportAccountId,setGroupImportAccountId]=useState('');
   const [groupImportJoin,setGroupImportJoin]=useState(true);
-  const [accountImportOpen,setAccountImportOpen]=useState(false),[accountImportProxyId,setAccountImportProxyId]=useState(''),[accountImportNames,setAccountImportNames]=useState<string[]>([]);
+  const [accountImportOpen,setAccountImportOpen]=useState(false),[accountImportProxyId,setAccountImportProxyId]=useState('');
   const [accountImportFiles,setAccountImportFiles]=useState<File[]>([]);
+  const [accountZip,setAccountZip]=useState<typeof AccountZipModule|null>(null);
   const [accountImportSessionMode,setAccountImportSessionMode]=useState<SessionMode>('keep');
   const [accountImportMixProxy,setAccountImportMixProxy]=useState(true);
+  useEffect(()=>{
+    if(!accountImportOpen||accountZip)return;
+    let cancelled=false;
+    loadAccountZip().then(m=>{if(!cancelled)setAccountZip(m)}).catch(()=>{/* повторим при следующем открытии */});
+    return()=>{cancelled=true};
+  },[accountImportOpen,accountZip]);
   const [accountImportProgress,setAccountImportProgress]=useState('');
   const [proxyCheckProgress,setProxyCheckProgress]=useState<{done:number;total:number;active:number;inactive:number}|null>(null);
   const [telegramConnected,setTelegramConnected]=useState(false);
@@ -509,7 +537,7 @@ function WorkspaceHome(){
   const [bulkProxyMix,setBulkProxyMix]=useState(false);
   const [bulkDeleteOpen,setBulkDeleteOpen]=useState(false);
   const [bulkLimitsOpen,setBulkLimitsOpen]=useState(false);
-  const [bulkLimits,setBulkLimits]=useState({
+  const [bulkLimits,setBulkLimits]=useState<{invite:number;message:number;chat:number;memberInvite:number}>({
     invite:TELEGRAM_RECOMMENDED_LIMITS.invite,
     message:TELEGRAM_RECOMMENDED_LIMITS.message,
     chat:TELEGRAM_RECOMMENDED_LIMITS.chat,
@@ -548,18 +576,17 @@ function WorkspaceHome(){
   /** Задачи, которые пользователь только что поставил на паузу — poller не трогает до play */
   const pausedTasksRef=useRef(new Set<string>());
   const lastInboxPollAt=useRef(0);
+  /** 403 на set_group_join_state — больше не шлём (UI-состояние остаётся локальным). */
+  const joinStateForbiddenRef=useRef(false);
 
   const refreshStaff=useCallback(async()=>{
     try{
-      const r=await fetch('/api/staff',{cache:'no-store'});
-      if(!r.ok){
-        if(r.status===403){setStaffMembers([]);setStaffInvites([]);return}
-        return;
-      }
-      const data=await r.json();
+      const data=await requestJson<StaffListResponse>('/api/staff',{cache:'no-store'});
       setStaffMembers(data.members||[]);
       setStaffInvites(data.invites||[]);
-    }catch{/* */}
+    }catch(e){
+      if(e instanceof ApiError&&e.status===403){setStaffMembers([]);setStaffInvites([])}
+    }
   },[]);
 
   const refresh=useCallback(async()=>{
@@ -595,20 +622,20 @@ function WorkspaceHome(){
   useEffect(()=>{recordsRef.current=records},[records]);
   useEffect(()=>{busyRef.current=busy},[busy]);
 
-  function replaceTaskData(id:string,data:Record<string,unknown>){
+  const replaceTaskData=useCallback((id:string,data:Record<string,unknown>)=>{
     const apply=(prev:RecordItem[])=>prev.map(x=>x.id===id?{...x,data}:x);
     setRecords(apply);
     recordsRef.current=apply(recordsRef.current);
-  }
+  },[]);
 
-  function applyTickTask(id:string,task:Record<string,unknown>|undefined){
+  const applyTickTask=useCallback((id:string,task:Record<string,unknown>|undefined)=>{
     if(!task)return;
     const cur=recordsRef.current.find(x=>x.id===id);
     // Устаревший tick после паузы не должен вернуть «running» в UI
     if(cur?.data.status==='paused'&&task.status==='running')return;
     if(pausedTasksRef.current.has(id)&&task.status==='running')return;
     replaceTaskData(id,task);
-  }
+  },[replaceTaskData]);
 
   useEffect(()=>{joinQueueRef.current=joinQueue;saveJoinQueue(joinQueue,joinWorkRef.current)},[joinQueue]);
 
@@ -620,7 +647,9 @@ function WorkspaceHome(){
     const joinStateAt=joinState?new Date().toISOString():'';
     const err=String(joinStateError||'').slice(0,500);
     patchGroupLocal(id,{joinState,joinStateAt,joinStateError:err});
-    try{await api({action:'set_group_join_state',id,joinState,joinStateError:err})}catch{/* сеть — UI уже обновлён */}
+    if(joinStateForbiddenRef.current)return;
+    try{await api({action:'set_group_join_state',id,joinState,joinStateError:err})}
+    catch(e){if(isForbidden(e))joinStateForbiddenRef.current=true/* сеть — UI уже обновлён */}
   }
 
   function setJoinQueueSync(updater:(prev:JoinQItem[])=>JoinQItem[]){
@@ -689,6 +718,7 @@ function WorkspaceHome(){
     setModal({kind,item});setForm(data);setSecret('');setClearSecret(false);setFormError('');setProxyPaste('');setOnboardAfterSave(false);
   };
 
+  const openGroupCreation=useEffectEvent(()=>{navigate('Группы и каналы');open('group')});
   useEffect(()=>{
     const context=(document as any).modelContext;
     if(!context?.registerTool)return;
@@ -700,7 +730,7 @@ function WorkspaceHome(){
       annotations:{readOnlyHint:false},
       execute(input:unknown){
         if(!input||typeof input!=='object'||Object.keys(input).length)throw new Error('Ожидается пустой объект');
-        navigate('Группы и каналы');open('group');return {opened:true};
+        openGroupCreation();return {opened:true};
       }
     },{signal:abort.signal})).catch(()=>{});
     return()=>abort.abort();
@@ -735,9 +765,9 @@ function WorkspaceHome(){
   },[allowedNav,view]);
 
   const navBadges=useMemo(()=>{
+    // Только непрочитанные ответы клиента — не все открытые переписки
+    // Бейдж «Переписки» — только needsManager (непрочитанный ответ клиента)
     const needManager=list('lead').filter(r=>!!r.data.needsManager&&!r.data.excludeFromTraining).length;
-    const unreadChats=list('lead').filter(r=>(!!r.data.conversationOpen||!!r.data.draft)&&!r.data.viewed&&!r.data.excludeFromTraining).length;
-    const drafts=needManager||unreadChats;
     const groups=list('group').filter(r=>{
       const d=r.data||{};
       return d.status==='error'||d.membership==='pending'||JOIN_BUSY.has(String(d.joinState||''));
@@ -753,7 +783,7 @@ function WorkspaceHome(){
     const badges:Partial<Record<NavName,number>>={
       'Уведомления':notices.filter(n=>!n.read).length,
       'Лиды':freshLeads.length,
-      'Переписки':drafts,
+      'Переписки':needManager,
       'Группы и каналы':groups,
       'Сбор аудитории':audienceBusy,
       'Инвайтинг':inviteBusy,
@@ -767,7 +797,8 @@ function WorkspaceHome(){
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[records,freshLeads.length,aiKeyReady,notices,staffInvites.length]);
 
-  useEffect(()=>{
+  // Синхронизируем форму только при смене значимых полей, а не на каждый refresh records.
+  const syncGenSettings=useEffectEvent(()=>{
     const d=settings?.data||{};
     setGenSettings({
       scanDepthDays:Math.max(1,Math.min(90,Number(d.scanDepthDays)||7)),
@@ -780,7 +811,8 @@ function WorkspaceHome(){
       notifyBotToken:String(d.notifyBotToken||''),
       notifyChatId:String(d.notifyChatId||''),
     });
-  },[settings?.id,settings?.data?.scanDepthDays,settings?.data?.autoRescanEnabled,settings?.data?.autoRescanMinutes,settings?.data?.profileName,settings?.data?.profileAbout,settings?.data?.profileContact,settings?.data?.notifyEnabled,settings?.data?.notifyBotToken,settings?.data?.notifyChatId]);
+  });
+  useEffect(()=>{syncGenSettings()},[settings?.id,settings?.data?.scanDepthDays,settings?.data?.autoRescanEnabled,settings?.data?.autoRescanMinutes,settings?.data?.profileName,settings?.data?.profileAbout,settings?.data?.profileContact,settings?.data?.notifyEnabled,settings?.data?.notifyBotToken,settings?.data?.notifyChatId]);
 
   // Автообход лидов крутит tg-worker → /api/cron/auto-rescan (24/7, без открытого кабинета).
   // Здесь только кнопка «Собрать лиды» и отображение статуса.
@@ -788,8 +820,25 @@ function WorkspaceHome(){
   /** Poller: сбор аудитории + инвайтинг пока кабинет открыт */
   useEffect(()=>{
     if(!telegramConnected)return;
+    // Не наслаиваем тики, притормаживаем в скрытой вкладке и отступаем при сбоях сети/сервера.
+    const gate=createPollGate({baseBackoffMs:10_000,maxBackoffMs:120_000,hiddenMinIntervalMs:30_000});
+    let failed=false;
+    // 403 (нет доступа к разделу) — тихо прекращаем опрашивать это действие.
+    const forbidden=new Set<string>();
+    const track=(action:string,e:unknown)=>{
+      if(isForbidden(e))forbidden.add(action);
+      else if(isTransportFailure(e))failed=true;
+    };
+    // Ошибки тиков показываем (403 — молча), сеть/сервер — ещё и в backoff.
+    const fail=(action:string,label:string,e:unknown)=>{
+      track(action,e);
+      if(!isForbidden(e))toast.error(`${label}: ${String((e as Error)?.message||e).slice(0,100)}`);
+    };
     const tick=async()=>{
-      if(taskPollLock.current||busyRef.current||joinRunnerLock.current||autoRescanLock.current)return;
+      if(taskPollLock.current)return;
+      // autoRescan/join не стопят тики задач — иначе сбор/инвайт простаивают минутами
+      if(!gate.tryEnter(Date.now(),document.hidden))return;
+      failed=false;
       const snap=recordsRef.current;
       const runningAudience=snap.filter(r=>r.kind==='audience_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
       const runningInvite=snap.filter(r=>r.kind==='invite_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
@@ -797,37 +846,42 @@ function WorkspaceHome(){
       taskPollLock.current=true;
       try{
         if(runningAudience.length||runningInvite.length||runningMailing.length){
-        for(const t of runningAudience){
+        for(const t of forbidden.has('tick_audience')?[]:runningAudience){
           try{
             const r=await api({action:'tick_audience',id:t.id});
+            // busy/skipped — «попробуйте позже», не затираем задачу устаревшим снимком
+            if(r.skipped||r.busy)continue;
             applyTickTask(t.id,r.task);
             if(r.joined)toast.message(`${displayTgHandle(t.data.url||'')}: вступили в источник`);
             if(r.task?.status==='completed')toast.success(`Сбор завершён: ${displayTgHandle(t.data.url||'')} · ${r.task.collected||0}`);
-          }catch{/* */}
+            if(r.task?.status==='paused'&&r.task?.error)toast.error(String(r.task.error).slice(0,120));
+          }catch(e){fail('tick_audience','Сбор',e)}
         }
-        for(const t of runningInvite){
+        for(const t of forbidden.has('tick_invite')?[]:runningInvite){
           try{
             const r=await api({action:'tick_invite',id:t.id});
+            if(r.skipped||r.busy||r.waiting)continue;
             applyTickTask(t.id,r.task);
             if(r.completed)toast.success(`Инвайт завершён: ${displayTgHandle(t.data.targetUrl||'')}`);
-          }catch{/* */}
+          }catch(e){fail('tick_invite','Инвайт',e)}
         }
-        for(const t of runningMailing){
+        for(const t of forbidden.has('tick_mailing')?[]:runningMailing){
           try{
             const r=await api({action:'tick_mailing',id:t.id});
             // skipped/busy — не затираем локальный running устаревшим paused
-            if(r.skipped||r.busy)continue;
+            if(r.skipped||r.busy||r.waiting)continue;
             applyTickTask(t.id,r.task);
             if(r.stopped){
               toast.error(r.task?.error||`Рассылка остановлена: ${t.data.name||''}`);
             }else if(r.completed){
               toast.success(`Рассылка завершена: ${t.data.name||''} · ${r.task?.sentTotal||0}`);
             }
-          }catch{/* */}
+          }catch(e){fail('tick_mailing','Рассылка',e)}
         }
         }
         try{
-          if(Date.now()-lastInboxPollAt.current>15_000){
+          // В скрытой вкладке входящие собирает серверный cron — не дублируем.
+          if(!forbidden.has('poll_dm_replies')&&!document.hidden&&Date.now()-lastInboxPollAt.current>15_000){
             lastInboxPollAt.current=Date.now();
             const inbox=await api({action:'poll_dm_replies'});
             if(inbox?.opened>0){
@@ -835,15 +889,16 @@ function WorkspaceHome(){
               await refresh();
             }
           }
-        }catch{/* */}
+        }catch(e){track('poll_dm_replies',e)}
       }finally{
         taskPollLock.current=false;
+        gate.leave(Date.now(),!failed);
       }
     };
     const id=window.setInterval(()=>{void tick()},5_000);
     const first=window.setTimeout(()=>{void tick()},1_000);
     return()=>{window.clearInterval(id);window.clearTimeout(first)};
-  },[telegramConnected]);
+  },[telegramConnected,applyTickTask,refresh]);
 
   async function startAudienceTask(id:string){
     if(!telegramConnected){toast.error('Запустите: npm run dev');return}
@@ -854,7 +909,7 @@ function WorkspaceHome(){
       const started=await api({action:'start_audience',id});
       if(started.task)replaceTaskData(id,started.task);
       toast.success('Сбор аудитории запущен');
-      void api({action:'tick_audience',id}).then(r=>{applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
+      void api({action:'tick_audience',id}).then(r=>{if(!r.busy&&!r.skipped)applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
   async function pauseAudienceTask(id:string){
@@ -895,7 +950,7 @@ function WorkspaceHome(){
       const started=await api({action:'start_invite',id});
       if(started.task)replaceTaskData(id,started.task);
       toast.success(started.already?'Инвайтинг уже запущен':'Инвайтинг запущен');
-      void api({action:'tick_invite',id}).then(r=>{applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
+      void api({action:'tick_invite',id}).then(r=>{if(!r.busy&&!r.skipped)applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
   async function pauseInviteTask(id:string){
@@ -930,19 +985,22 @@ function WorkspaceHome(){
       toast.success(started.already?'Рассылка уже запущена':'Рассылка запущена');
       try{
         const r=await api({action:'tick_mailing',id});
-        applyTickTask(id,r.task);
-        if(r.stopped){
-          toast.error(r.task?.error||'Рассылка остановлена — откройте лог');
-          setTaskLog({title:r.task?.name||'Рассылка',log:r.task?.log||[],taskId:id});
-        }else if(r.needAi){
-          toast.message('Ждём AI-тексты для рассылки…');
-        }else if(r.sent){
-          toast.success(`Отправлено: ${r.sent}`);
-        }else if(r.completed){
-          toast.success('Рассылка завершена');
+        // busy/skipped — сервер уже тикает эту задачу, poller подхватит
+        if(!r.busy&&!r.skipped){
+          applyTickTask(id,r.task);
+          if(r.stopped){
+            toast.error(r.task?.error||'Рассылка остановлена — откройте лог');
+            setTaskLog({title:r.task?.name||'Рассылка',log:r.task?.log||[],taskId:id});
+          }else if(r.needAi){
+            toast.message('Ждём AI-тексты для рассылки…');
+          }else if(r.sent){
+            toast.success(`Отправлено: ${r.sent}`);
+          }else if(r.completed){
+            toast.success('Рассылка завершена');
+          }
         }
       }catch(e){
-        toast.error(`Тик рассылки: ${(e as Error).message}`);
+        if(busyWaitSec(e)===null)toast.error(`Тик рассылки: ${(e as Error).message}`);
       }
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
@@ -970,7 +1028,9 @@ function WorkspaceHome(){
       if(attempt>0)await sleep(Math.min(4+attempt*3,12)*1000);
       try{
         const scan=await api({action:'scan_group',id,force:true});
-        return scan;
+        if(!scan?.busy)return scan;
+        // Группу уже сканирует другой процесс: ждём и повторяем; soft → вызывающий оставит membership.
+        lastErr=Object.assign(new Error(`${name}: скан уже идёт`),{data:{soft:true}});
       }catch(e){
         lastErr=e as Error & {data?:any;status?:number};
         const data=(lastErr as any)?.data;
@@ -1010,7 +1070,7 @@ function WorkspaceHome(){
         if(err.data?.farmExhausted||err.data?.limitReached)throw err;
         const wait=Number(err.data?.waitSec||0);
         if(wait>0&&(err.data?.pace||err.data?.flood||err.status===429)){
-          toast.message(`Холд ${Math.ceil(wait/60)} мин — антибан`);
+          toast.message(`Холд ${waitLabel(wait)} — антибан`);
           await holdJoin(Math.min(wait,JOIN_GAP_DEFAULT_SEC+120),id,name||'Группа');
           continue;
         }
@@ -1136,8 +1196,8 @@ function WorkspaceHome(){
               scan=await scanAfterJoin(g.id,g.name);
             }catch(scanErr){
               const scanData=(scanErr as Error & {data?:any})?.data;
-              // Soft need_join после успешного join: membership сохраняем, не в авто-rejoin
-              const keepJoined=!!scanData?.soft||!!scanData?.preserved||!!scanData?.needJoin;
+              // Soft need_join только при soft/preserved от API (не любой needJoin)
+              const keepJoined=!!scanData?.soft||!!scanData?.preserved;
               void persistJoinState(g.id,'');
               if(keepJoined){
                 patchGroupLocal(g.id,{
@@ -1149,11 +1209,22 @@ function WorkspaceHome(){
                   joinStateError:'',
                   error:'',
                 });
+                setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
+                toast.message(`${g.name}: вступили, скан подхватит автообход`);
+                onboarded++;
+              }else{
+                patchGroupLocal(g.id,{
+                  status:'setup',
+                  membership:'none',
+                  joinedAt:'',
+                  joinState:'queued',
+                  joinStateAt:new Date().toISOString(),
+                  joinStateError:String(scanData?.error||(scanErr as Error).message||'').slice(0,200),
+                  error:String(scanData?.error||(scanErr as Error).message||'').slice(0,200),
+                });
+                setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'error',error:String(scanData?.error||'нужно вступить снова').slice(0,120)}:q));
+                toast.message(`${g.name}: скан не подтвердил членство — снова в очередь`);
               }
-              setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
-              toast.message(`${g.name}: вступили, скан подхватит автообход`);
-              // Не ставим autoRescanPending→rejoin: иначе снова в очередь
-              onboarded++;
               await refresh();
               continue;
             }
@@ -1278,8 +1349,12 @@ function WorkspaceHome(){
   useEffect(()=>{
     if(!telegramConnected||loading)return;
     let cancelled=false;
+    let stopped=false;
+    const gate=createPollGate({baseBackoffMs:5*60_000,maxBackoffMs:30*60_000,hiddenMinIntervalMs:15*60_000});
     const heal=async()=>{
-      if(joinRunnerLock.current||busyRef.current)return;
+      if(stopped||joinRunnerLock.current||busyRef.current)return;
+      if(!gate.tryEnter(Date.now(),document.hidden))return;
+      let ok=true;
       try{
         const r=await api({action:'heal_dead_group_accounts'});
         if(cancelled)return;
@@ -1291,7 +1366,12 @@ function WorkspaceHome(){
           await refresh();
           void startBackgroundJoins(r.items.map((i:{id:string;name?:string})=>({id:i.id,name:i.name||'Группа'})));
         }
-      }catch{/* */}
+      }catch(e){
+        // 403: нет доступа к разделу — тихо выключаем автопочинку до перезагрузки.
+        if(isForbidden(e))stopped=true;
+        ok=!isTransportFailure(e);
+      }
+      finally{gate.leave(Date.now(),ok)}
     };
     const first=window.setTimeout(()=>{void heal()},8_000);
     const id=window.setInterval(()=>{void heal()},5*60_000);
@@ -1299,30 +1379,7 @@ function WorkspaceHome(){
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[telegramConnected,loading]);
 
-  /** Вступление + скан лидов по сохранённой группе. */
-  async function onboardGroup(id:string,name?:string){
-    if(!telegramConnected)throw new Error('Запустите: npm run dev');
-    const join=await joinGroupPaced(id,name);
-    if(join.result?.join==='requested'){
-      return {joined:'requested' as const,scanned:0,matched:0,added:0,aiUsed:false,title:''};
-    }
-    if(!join.ok&&join.result?.join!=='already'){
-      throw new Error(join.result?.error||join.error||'Не удалось вступить в группу');
-    }
-    const scan=await scanAfterJoin(id,name||'Группа');
-    return {
-      joined:(join.result?.join==='already'?'already':'joined') as 'already'|'joined',
-      scanned:scan.scanned||0,
-      matched:scan.matched??scan.added??0,
-      added:scan.added||0,
-      aiUsed:!!scan.aiUsed,
-      title:scan.title||'',
-      metrics:scan.metrics||null,
-      addedByTemp:scan.addedByTemp||null,
-    };
-  }
-
-  function toastOnboard(name:string,r:Awaited<ReturnType<typeof onboardGroup>>){
+  function toastOnboard(name:string,r:OnboardSummary){
     if(r.joined==='requested'){
       toast.message(`${name}: заявка на вступление отправлена — скан после одобрения`);
       return;
@@ -1410,7 +1467,7 @@ function WorkspaceHome(){
       if(modal.kind==='group')payload.url=canonicalizeTgUrl(payload.url||'');
       if(modal.kind==='audience_task')payload.url=canonicalizeTgUrl(payload.url||'');
       if(modal.kind==='invite_task')payload.targetUrl=canonicalizeTgUrl(payload.targetUrl||'');
-      const dup=findDuplicate(modal.kind,payload,records,modal.item?.id);
+      const dup=findDuplicate(modal.kind,payload,records.filter(r=>r.kind===modal.kind),modal.item?.id);
       if(dup){
         setFormError(duplicateReason(modal.kind,payload,dup.data)||'Такая запись уже есть');
         setBusy(false);
@@ -1438,11 +1495,18 @@ function WorkspaceHome(){
           void (async()=>{
             try{
               const r=await api({action:'check_account',id:newAccountId,forceUsername:true,ensureUsername:true,rotateProxy:true});
+              if(busyWaitSec(r)!==null||busyWaitSec(r.result)!==null){
+                toast.message('Аккаунт занят другой операцией — ник запишем при следующей проверке');
+                return;
+              }
               const nick=String(r.result?.profile?.username||desiredNick||'').replace(/^@/,'');
               await refresh();
               if(r.result?.ok&&nick)toast.success(`@${nick} записан в Telegram`);
               else if(r.result?.error)toast.error(`Ник не записался: ${String(r.result.error).slice(0,160)}`);
-            }catch(e){toast.error(`Ник не записался: ${(e as Error).message.slice(0,160)}`)}
+            }catch(e){
+              if(busyWaitSec(e)!==null)toast.message('Аккаунт занят другой операцией — ник запишем при следующей проверке');
+              else toast.error(`Ник не записался: ${(e as Error).message.slice(0,160)}`);
+            }
           })();
         }else toast.success(modal.item?.hasSecret?'Аккаунт сохранён в кабинете':'Аккаунт сохранён');
       }else if(modal.kind==='audience_task'){
@@ -1529,7 +1593,9 @@ function WorkspaceHome(){
       );
       setChatText('');
     }catch(e){
-      toast.error((e as Error).message);
+      const wait=busyWaitSec(e);
+      if(wait!==null)toast.message(`Аккаунт занят отправкой — повторите через ${waitLabel(wait)}`);
+      else toast.error((e as Error).message);
       await refresh();
     }finally{setBusy(false)}
   }
@@ -1554,11 +1620,12 @@ function WorkspaceHome(){
     }
     let added=0,scanned=0;
     const rejoin: {id:string;name:string}[]=[];
+    const scanErrors:string[]=[];
     for(const id of ids){
       if(!opts?.force&&(busyRef.current||joinRunnerLock.current))break;
       try{
         const r=await api({action:'scan_group',id,force:!!opts?.force});
-        if(r.skipped)continue;
+        if(r.skipped||r.busy)continue;
         if(r.rejoinItem?.id){
           if(r.soft||r.preserved)continue;
           rejoin.push({id:r.rejoinItem.id,name:r.rejoinItem.name||'Группа'});
@@ -1570,14 +1637,30 @@ function WorkspaceHome(){
         const data=(err as any)?.data;
         if(data?.rejoinItem?.id){
           // Soft/preserved — не перекидываем в очередь вступлений
-          if(data?.soft||data?.preserved)continue;
+          if(data?.soft||data?.preserved){
+            if(data?.usernameMissing&&!quiet){
+              const msg=String(data?.error||(err as Error).message||'').slice(0,120);
+              if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
+            }
+            continue;
+          }
           rejoin.push({id:data.rejoinItem.id,name:data.rejoinItem.name||'Группа'});
           continue;
         }
-        if(!quiet)toast.error(`Скан: ${(err as Error).message}`);
+        if(data?.usernameMissing||data?.skipped){
+          const msg=String(data?.error||(err as Error).message||'').slice(0,120);
+          if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
+          continue;
+        }
+        const msg=String((err as Error).message||'ошибка').slice(0,140);
+        if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
       }
     }
     if(rejoin.length)void startBackgroundJoins(rejoin);
+    if(!quiet&&scanErrors.length){
+      const head=scanErrors[0];
+      toast.error(scanErrors.length>1?`Скан: ${head} · ещё ${scanErrors.length-1}`:`Скан: ${head}`);
+    }
     if(scanned>0||added>0)await refresh();
     return {scanned,added,due:Number(pack.total)||ids.length,reassigned:Number(pack.reassigned)||0};
   }
@@ -1655,8 +1738,10 @@ function WorkspaceHome(){
       const added=Array.isArray(r.minusAdded)?r.minusAdded.filter(Boolean):[];
       if(added.length){
         toast.success(`В стоп-слова AI: ${added.slice(0,6).join(', ')}${added.length>6?'…':''}`);
+      }else if(Number(r.minusSkippedAsProduct)>0){
+        toast.message('Лид скрыт. В стоп-слова ничего не добавлено — слова общие или пересекаются с продуктом и плюс-словами.');
       }else{
-        toast.message('Лид скрыт. Новых стоп-слов не вышло (уже были в минусе).');
+        toast.message('Лид скрыт. Новых стоп-слов нет.');
       }
       setDetail(null);
     }catch(e){toast.error((e as Error).message)}
@@ -1807,7 +1892,11 @@ function WorkspaceHome(){
     }
   }
 
-  function addAccountArchiveFiles(list:File[]){
+  async function addAccountArchiveFiles(list:File[]){
+    let zip:typeof AccountZipModule;
+    try{zip=await loadAccountZip()}
+    catch{setFormError('Не удалось загрузить модуль импорта — перезагрузите страницу');return}
+    const {MAX_ACCOUNT_ARCHIVE_BYTES}=zip;
     const next:File[]=[];
     const errs:string[]=[];
     for(const f of list){
@@ -1821,7 +1910,6 @@ function WorkspaceHome(){
       for(const f of next)map.set(f.name,f);
       return [...map.values()].slice(0,50);
     });
-    setAccountImportNames([]);
     setFormError(errs.slice(0,3).join(' · '));
   }
 
@@ -1848,6 +1936,7 @@ function WorkspaceHome(){
       let done=0,skipped=0;
       const savedIds:string[]=[];
       const total=accountImportFiles.length;
+      const {parseAccountZip,accountSessionSecret}=await loadAccountZip();
       for(let i=0;i<accountImportFiles.length;i++){
         const file=accountImportFiles[i];
         setAccountImportProgress(`${i+1}/${total}`);
@@ -1891,7 +1980,6 @@ function WorkspaceHome(){
       await refresh();
       setAccountImportOpen(false);
       setAccountImportFiles([]);
-      setAccountImportNames([]);
       setAccountImportProxyId('');
       setAccountImportSessionMode('keep');
       setAccountImportMixProxy(true);
@@ -2127,12 +2215,23 @@ function WorkspaceHome(){
     }
   }
 
+  function restoreAccountStatus(item:RecordItem){
+    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,status:item.data.status,error:item.data.error||'',checkingAt:''}}:r));
+  }
+
   async function checkOneAccount(item:RecordItem,opts?:{silent?:boolean;deep?:boolean}){
     if(!opts?.silent)setBusy(true);
     setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,status:'checking',error:'',checkingAt:new Date().toISOString()}}:r));
     try{
       const res=await api({action:'check_account',id:item.id,deep:!!opts?.deep,rotateProxy:true});
-      const result=res.result;
+      const result=res.result??res;
+      const busyWait=busyWaitSec(result)??busyWaitSec(res);
+      if(busyWait!==null){
+        // Аккаунт держит другая операция — это не «отключён»: возвращаем прежний статус.
+        restoreAccountStatus(item);
+        if(!opts?.silent)toast.message(`Аккаунт занят другой операцией — проверьте через ${waitLabel(busyWait)}`);
+        return {ok:false,status:String(item.data.status||''),busy:true};
+      }
       setRecords(prev=>prev.map(r=>{
         if(r.id!==item.id)return r;
         return {...r,data:{
@@ -2150,7 +2249,8 @@ function WorkspaceHome(){
       if(!opts?.silent){
         const st=result?.status||'disconnected';
         const proxyNote=result?.proxyRotated?' · прокси сменён':'';
-        if(st==='active')toast.success(`Активен · ${result?.profile?.username? '@'+result.profile.username : item.data.phone}${proxyNote}${result?.sessionRefreshed?' · сессия обновлена':''}`);
+        if(st==='active'&&result?.flood)toast.message(`Активен, но Telegram просит паузу ${waitLabel(Number(result?.waitSec)||0)} — действия после отлёжки${proxyNote}`);
+        else if(st==='active')toast.success(`Активен · ${result?.profile?.username? '@'+result.profile.username : item.data.phone}${proxyNote}${result?.sessionRefreshed?' · сессия обновлена':''}`);
         else if(st==='cooldown')toast.message(`Отлёжка по лимиту / спамблоку${proxyNote}`);
         else if(st==='disconnected'||st==='proxy_error')toast.error(`Не удалось подключить${proxyNote}. Проверьте прокси и сессию.`);
         else if(st==='unauthorized')toast.error(`Сессия недействительна — загрузите свежий tdata/session${proxyNote}`);
@@ -2158,6 +2258,12 @@ function WorkspaceHome(){
       }
       return result;
     }catch(e){
+      const wait=busyWaitSec(e);
+      if(wait!==null){
+        restoreAccountStatus(item);
+        if(!opts?.silent)toast.message(`Аккаунт занят другой операцией — проверьте через ${waitLabel(wait)}`);
+        return {ok:false,status:String(item.data.status||''),busy:true};
+      }
       setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,status:'disconnected',error:(e as Error).message,checkingAt:''}}:r));
       if(!opts?.silent)toast.error((e as Error).message);
       return {ok:false,status:'disconnected',error:(e as Error).message};
@@ -2321,6 +2427,11 @@ function WorkspaceHome(){
       if(res.funnel)setLastLeadFunnel(res.funnel);
       else if(res.workerRaw!=null||res.prefilter!=null){
         setLastLeadFunnel({worker:res.workerRaw,core:res.prefilter,matched:res.matched,added:res.added});
+      }
+      const scanWait=busyWaitSec(res);
+      if(scanWait!==null){
+        toast.message(`Скан этой группы уже идёт — повторите через ${waitLabel(scanWait)}`);
+        return;
       }
       if(res.skipped){
         toast.message(res.message||`Скан по настройкам: раз в ${settings?.data.autoRescanMinutes||30} мин`);
@@ -2713,8 +2824,7 @@ function WorkspaceHome(){
     const handle=window.setTimeout(()=>{
       if(catalogMarket==='db'){
         const q=catalogQuery.trim().toLowerCase();
-        const groups=list('group');
-        const hits=groups
+        const hits=records.filter(r=>r.kind==='group')
           .map(r=>{
             const url=String(r.data.url||'');
             const name=String(r.data.name||'Без названия');
@@ -3138,7 +3248,7 @@ function WorkspaceHome(){
                     disabled={busy}
                     onClick={()=>void importFullCatalogToDb()}
                   >Залить каталог ({catalogStats().uniqueUrls})</Button>
-                  <Button onClick={openCatalog}><Search size={16}/>Поиск по темам</Button>
+                  <Button onClick={()=>openCatalog()}><Search size={16}/>Поиск по темам</Button>
                 </>
               ):view==='Настройки'||view==='Сбор аудитории'||view==='Инвайтинг'||view==='Рассылка'||view==='Уведомления'||view==='Сотрудники'?null:(
                 <Button onClick={()=>open(currentKind||'group',currentKind==='settings'?settings:undefined)}>
@@ -3156,6 +3266,8 @@ function WorkspaceHome(){
             </div>
           )}
 
+          <PanelErrorBoundary key={view} section={view}>
+          <Suspense fallback={<SectionSkeleton/>}>
           {view==='Уведомления'&&(
             <NotificationsPanel onOpenItem={(next)=>{if(next)navigate(next)}}/>
           )}
@@ -3259,21 +3371,17 @@ function WorkspaceHome(){
                 onCreateInvite={async(input)=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'create_invite',...input})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось создать приглашение');
+                    const data=await staffApi({action:'create_invite',...input},'Не удалось создать приглашение');
                     await refreshStaff();
                     toast.success('Ссылка-приглашение создана');
-                    return data.url as string;
+                    return data.url||null;
                   }catch(e){toast.error((e as Error).message);return null}
                   finally{setBusy(false)}
                 }}
                 onRevokeInvite={(id)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'revoke_invite',id})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось отозвать');
+                    await staffApi({action:'revoke_invite',id},'Не удалось отозвать');
                     await refreshStaff();
                     toast.success('Приглашение отозвано');
                   }catch(e){toast.error((e as Error).message)}
@@ -3282,9 +3390,7 @@ function WorkspaceHome(){
                 onRevokeInvites={(ids)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'revoke_invites',ids})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось отозвать');
+                    const data=await staffApi({action:'revoke_invites',ids},'Не удалось отозвать');
                     await refreshStaff();
                     toast.success(`Отозвано: ${data.removed||ids.length}`);
                   }catch(e){toast.error((e as Error).message)}
@@ -3293,9 +3399,7 @@ function WorkspaceHome(){
                 onUpdateMember={(input)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update_member',...input})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось сохранить');
+                    await staffApi({action:'update_member',...input},'Не удалось сохранить');
                     await refreshStaff();
                     toast.success('Доступы обновлены');
                   }catch(e){toast.error((e as Error).message)}
@@ -3304,9 +3408,7 @@ function WorkspaceHome(){
                 onRemoveMember={(id)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove_member',id})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось удалить');
+                    await staffApi({action:'remove_member',id},'Не удалось удалить');
                     await refreshStaff();
                     toast.success('Сотрудник удалён');
                   }catch(e){toast.error((e as Error).message)}
@@ -3315,9 +3417,7 @@ function WorkspaceHome(){
                 onRemoveMembers={(ids)=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove_members',ids})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось удалить');
+                    const data=await staffApi({action:'remove_members',ids},'Не удалось удалить');
                     await refreshStaff();
                     toast.success(`Удалено: ${data.removed||ids.length}`);
                   }catch(e){toast.error((e as Error).message)}
@@ -3326,9 +3426,7 @@ function WorkspaceHome(){
                 onClearAll={()=>{void (async()=>{
                   setBusy(true);
                   try{
-                    const r=await fetch('/api/staff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear_all'})});
-                    const data=await r.json();
-                    if(!r.ok)throw new Error(data.error||'Не удалось очистить');
+                    const data=await staffApi({action:'clear_all'},'Не удалось очистить');
                     await refreshStaff();
                     toast.success(`Удалено сотрудников: ${data.members||0}, приглашений: ${data.invites||0}`);
                   }catch(e){toast.error((e as Error).message)}
@@ -3420,7 +3518,7 @@ function WorkspaceHome(){
                   )}
                   <Button variant="outline" disabled={busy} onClick={async()=>{setFarmProfileOpen(true);if(!farmAbout)await generateFarmProfile()}}><UserRound size={15}/>Профили фермы</Button>
                   <Button variant="outline" onClick={()=>{setFarmLogoOpen(true);setFarmLogoFile(null);setFarmLogoPreview('')}}><ImagePlus size={15}/>Логотип фермы</Button>
-                  <Button variant="outline" onClick={()=>{setAccountImportOpen(true);setFormError('');setAccountImportFiles([]);setAccountImportNames([]);setAccountImportProxyId('');setAccountImportSessionMode('keep');setAccountImportMixProxy(true)}}><Upload size={15}/>Импорт ZIP/RAR</Button>
+                  <Button variant="outline" onClick={()=>{setAccountImportOpen(true);setFormError('');setAccountImportFiles([]);setAccountImportProxyId('');setAccountImportSessionMode('keep');setAccountImportMixProxy(true)}}><Upload size={15}/>Импорт ZIP/RAR</Button>
                 </>
               ):currentKind==='group'?(
                 <div className="flex flex-wrap gap-2 items-center">
@@ -3548,7 +3646,7 @@ function WorkspaceHome(){
                 <div className="groups-page">
                   <div className="groups-top">
                     <div className="groups-top-actions">
-                      <Button onClick={openCatalog} disabled={busy}><Search size={15}/>Найти темы</Button>
+                      <Button onClick={()=>openCatalog()} disabled={busy}><Search size={15}/>Найти темы</Button>
                       <Button variant="outline" onClick={openManualGroup}><Plus size={15}/>Ссылка</Button>
                       <Button variant="outline" onClick={openMassGroups} disabled={busy}><Upload size={15}/>Массово</Button>
                       <Button
@@ -4265,6 +4363,8 @@ function WorkspaceHome(){
               </div>
             </div>
           )}
+          </Suspense>
+          </PanelErrorBoundary>
 
           <footer className="app-footer">
             <span>UniLab · Тёплые заявки из Telegram</span>
@@ -4293,8 +4393,13 @@ function WorkspaceHome(){
           </DialogHeader>
           <form className="form-stack" onSubmit={save}>
             {modal?.kind!=='settings'&&modal?.kind!=='audience_task'&&modal?.kind!=='invite_task'&&modal?.kind!=='mailing_task'&&field('name','Название')}
+            <Suspense fallback={<SectionSkeleton/>}>
             {modal?.kind==='audience_task'&&(
-              <AudienceTaskFields form={form} setForm={setForm} accounts={accountsUsableOpts}/>
+              <AudienceTaskFields
+                form={form}
+                setForm={(fn)=>{setFormError('');setForm(fn)}}
+                accounts={accountsUsableOpts}
+              />
             )}
             {modal?.kind==='invite_task'&&inviteWizardStep===1&&(
               <InviteModePicker mode={form.mode||'ordinary'} onPick={m=>setForm((f:any)=>({...f,mode:m}))} onContinue={()=>setInviteWizardStep(2)}/>
@@ -4305,6 +4410,7 @@ function WorkspaceHome(){
             {modal?.kind==='mailing_task'&&(
               <MailingTaskFields form={form} setForm={setForm} accounts={accountsUsableOpts} audienceTasks={list('audience_task').map(r=>({id:r.id,data:r.data}))}/>
             )}
+            </Suspense>
             {modal?.kind==='account'&&<>
               {field('phone','Телефон','tel','+79991234567')}
               <label className="field">Прокси
@@ -4558,12 +4664,14 @@ function WorkspaceHome(){
         </DialogContent>
       </Dialog>
 
+      <Suspense fallback={null}>
       <TaskLogDialog
         open={taskLog}
         liveLog={taskLog?.taskId?(records.find(r=>r.id===taskLog.taskId)?.data?.log||taskLog.log):taskLog?.log}
         liveNextAt={taskLog?.taskId?String(records.find(r=>r.id===taskLog.taskId)?.data?.nextAt||''):''}
         onClose={()=>setTaskLog(null)}
       />
+      </Suspense>
 
       <Dialog open={!!mailingDeliveries} onOpenChange={o=>{if(!o)setMailingDeliveries(null)}}>
         <DialogContent className="sm:max-w-xl max-h-[70vh] overflow-y-auto">
@@ -4571,7 +4679,9 @@ function WorkspaceHome(){
             <DialogTitle>Доставки · {mailingDeliveries?.title}</DialogTitle>
             <DialogDescription>Ссылки на сообщения в ЛС или в чате, статус и превью текста</DialogDescription>
           </DialogHeader>
-          <MailingDeliveriesView deliveries={mailingDeliveries?.deliveries||[]}/>
+          <Suspense fallback={<SectionSkeleton/>}>
+            <MailingDeliveriesView deliveries={mailingDeliveries?.deliveries||[]}/>
+          </Suspense>
         </DialogContent>
       </Dialog>
 
@@ -4643,7 +4753,7 @@ function WorkspaceHome(){
               </SelectContent>
             </Select>
           </label>
-          <Textarea aria-label="Список прокси" rows={7} value={importText} onChange={e=>setImportText(e.target.value)} placeholder={'176.56.35.182:5545:user:pass\n46.149.174.113:5545:user:pass'}/>
+          <Textarea aria-label="Список прокси" rows={7} value={importText} onChange={e=>setImportText(e.target.value)} placeholder={'192.0.2.10:5545:user:pass\n198.51.100.20:5545:user:pass'}/>
           <label className="field">Или загрузите .txt
             <Input type="file" accept=".txt" onChange={async e=>{const f=e.target.files?.[0];if(f){if(f.size>500000){setFormError('Файл больше 500 КБ');return}setImportText(await f.text());setFormError('')}}}/>
           </label>
@@ -4652,7 +4762,7 @@ function WorkspaceHome(){
         </DialogContent>
       </Dialog>
 
-      <Dialog open={accountImportOpen} onOpenChange={o=>{if(!busy){setAccountImportOpen(o);if(!o){setAccountImportFiles([]);setAccountImportNames([]);setFormError('')}}}}>
+      <Dialog open={accountImportOpen} onOpenChange={o=>{if(!busy){setAccountImportOpen(o);if(!o){setAccountImportFiles([]);setFormError('')}}}}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Выберите аккаунты для загрузки</DialogTitle>
@@ -4693,7 +4803,7 @@ function WorkspaceHome(){
               onDrop={e=>{
                 e.preventDefault();
                 e.stopPropagation();
-                addAccountArchiveFiles(Array.from(e.dataTransfer.files||[]));
+                void addAccountArchiveFiles(Array.from(e.dataTransfer.files||[]));
               }}
             >
               <CloudUpload size={36} className="text-[var(--spike-primary)] mb-3"/>
@@ -4704,10 +4814,10 @@ function WorkspaceHome(){
                 <input
                   type="file"
                   className="sr-only"
-                  accept={ACCOUNT_ARCHIVE_ACCEPT}
+                  accept={accountZip?.ACCOUNT_ARCHIVE_ACCEPT}
                   multiple
                   onChange={e=>{
-                    addAccountArchiveFiles(Array.from(e.target.files||[]));
+                    void addAccountArchiveFiles(Array.from(e.target.files||[]));
                     e.target.value='';
                   }}
                 />
@@ -4723,7 +4833,7 @@ function WorkspaceHome(){
                   <li key={f.name}>
                     <FileArchive size={16}/>
                     <span className="min-w-0 flex-1 truncate">{f.name}</span>
-                    <span className="small-note shrink-0">{formatArchiveSize(f.size)}</span>
+                    <span className="small-note shrink-0">{accountZip?.formatArchiveSize(f.size)}</span>
                     <button
                       type="button"
                       className="text-[var(--spike-muted)] hover:text-[var(--spike-text)]"

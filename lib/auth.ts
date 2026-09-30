@@ -1,5 +1,9 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { readEnv, type EnvReader } from "@/lib/env";
+import { safeRelativeReturnPath } from "@/lib/security/return-path";
+
+export { readEnv, safeRelativeReturnPath };
 
 export type SessionUser = {
   userId: string;
@@ -20,20 +24,6 @@ const LOGIN_PATH = "/login";
 const LOGOUT_PATH = "/logout";
 const SESSION_TTL_SEC = 60 * 60 * 24 * 14;
 const PBKDF2_ITERATIONS = 210_000;
-
-export function readEnv(name: string): string | undefined {
-  const fromProcess = process.env[name]?.trim();
-  if (fromProcess) return fromProcess;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { env } = require("cloudflare:workers") as {
-      env: Record<string, string | undefined>;
-    };
-    return env[name]?.trim();
-  } catch {
-    return undefined;
-  }
-}
 
 export function getAdminEmail(): string | undefined {
   return readEnv("ADMIN_EMAIL")?.toLowerCase();
@@ -81,11 +71,27 @@ export function sessionCookieName(): string {
   return COOKIE_NAME;
 }
 
-export function sessionCookieOptions(maxAge = SESSION_TTL_SEC) {
+const INSECURE_COOKIE_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** HTTPS deployments (APP_URL https://…) or production builds get `Secure` cookies. */
+export function cookieSecure(read: EnvReader = readEnv): boolean {
+  if (read("APP_URL")?.toLowerCase().startsWith("https://")) return true;
+  return process.env.NODE_ENV === "production";
+}
+
+/**
+ * Secure when `cookieSecure()` says so, and otherwise unless the request is for a
+ * loopback host (plain-http local dev). Without a request URL the cookie is always Secure.
+ */
+export function sessionCookieOptions(
+  maxAge = SESSION_TTL_SEC,
+  requestUrl?: string,
+) {
+  const host = requestUrl ? new URL(requestUrl).hostname : "";
   return {
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: process.env.NODE_ENV === "production",
+    secure: cookieSecure() || !INSECURE_COOKIE_HOSTS.has(host),
     path: "/",
     maxAge,
   };
@@ -184,27 +190,6 @@ export async function verifyPasswordHash(
   return timingSafeEqualBytes(expected, actual);
 }
 
-export function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
-  try {
-    const url = new URL(value, "https://app.local");
-    if (url.origin !== "https://app.local") return "/";
-    if (
-      url.pathname === LOGIN_PATH ||
-      url.pathname === "/register" ||
-      url.pathname === LOGOUT_PATH ||
-      url.pathname === "/signin-with-chatgpt" ||
-      url.pathname === "/signout-with-chatgpt" ||
-      url.pathname === "/callback"
-    ) {
-      return "/app";
-    }
-    return `${url.pathname}${url.search}${url.hash}`;
-  } catch {
-    return "/";
-  }
-}
-
 async function sign(payload: string): Promise<string> {
   const key = await sessionKey();
   const mac = await crypto.subtle.sign(
@@ -231,7 +216,7 @@ async function sessionKey(): Promise<CryptoKey> {
 
 async function deriveKey(
   password: string,
-  salt: Buffer | Uint8Array,
+  salt: Uint8Array,
   iterations: number,
 ): Promise<ArrayBuffer> {
   const baseKey = await crypto.subtle.importKey(
@@ -244,7 +229,9 @@ async function deriveKey(
   return crypto.subtle.deriveBits(
     {
       name: "PBKDF2",
-      salt,
+      // Copy into a fresh ArrayBuffer-backed view: WebCrypto's BufferSource type
+      // rejects Buffer/SharedArrayBuffer-backed views.
+      salt: new Uint8Array(salt),
       iterations,
       hash: "SHA-256",
     },

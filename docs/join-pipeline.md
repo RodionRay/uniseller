@@ -25,8 +25,9 @@ niches / description / audience / subscriber count (`catalogEntryFor`, `membersF
 | < 300 subscribers | −5 |
 | no topical evidence at all | capped at 30 |
 
-Bands (`RELEVANCE_AUTO_MIN` = 60, `RELEVANCE_REVIEW_MIN` = 35): **auto** joins by itself,
-**review** («На подтверждение») waits for the owner, **skip** («Не вступать») is not joined. Nothing is
+Bands (`RELEVANCE_AUTO_MIN` = 60, `RELEVANCE_REVIEW_MIN` = 35): **auto** («Рекомендуем») and **review**
+(«На подтверждение») wait for the owner, **skip** («Не вступать») is not joined. Only owner-queued groups
+join (owner decision 2026-09-30: daily join limits are precious) — the score labels and orders, it never joins. Nothing is
 deleted: every parked group stays in the list with its score and reason. Settings without product
 config put every group in review — never a blind auto-join.
 
@@ -36,7 +37,8 @@ always allowed and never rescored — so is a group whose membership was reset b
 successful join; `seedRejoin` migrates older groups that have `joinedAccountId` but lost membership).
 A dead link and the owner's «не вступать» still win over a rejoin; rejoins are scored for queue order; owner decisions (`joinDecision`: `approved` / `skipped`) beat the
 score (`joinWanted: true` from the earlier «only owner-queued groups» rule counts as approval);
-a dead link (`joinDead`) is never auto-joined; a group without a score is parked, not joined blind.
+a dead link (`joinDead`) is never joined; a group without a score is parked, not joined blind; any other
+group (auto band included) is parked until the owner queues it (`enqueue_joins` / «Одобрить»).
 Queue order: `compareJoinPriority` — approved first, then score, then subscribers.
 
 Where it applies (`app/api/workspace/route.ts`):
@@ -96,7 +98,11 @@ The worker reports `join: "peer_flood"` / `"too_many"` explicitly
 goes only to an untried account (join: farm `exclude`; scan: rotation). After
 `USERNAME_DEAD_AFTER_ACCOUNTS` = 3 the group is marked `joinDead` and leaves the auto-queue with the
 reason «Ссылка не открывается …». Approving it (or editing its link) clears the mark and retries.
-`seedMissingAccounts` migrates groups that failed before tracking existed. When every usable account is
+`seedMissingAccounts` migrates groups that failed before tracking existed.
+The worker's «account blind» verdict (control @telegram does not resolve either) is counted for the group
+too, and trusted only from the group's first witness (`trustAccountBlind`): later accounts get a half gap
+instead of the 6 h `resolveBlindUntil`, so one dead link blinds at most one account (e2e 2026-09-30:
+@marketplace_wbchat blinded 3 accounts). When every usable account is
 already in the tried list the group is marked dead at once (small farms); when untried accounts exist but
 are capped/paused the group is deferred (`409 {deferred:true}`, retried in 30 min) — never reported as a
 farm-wide limit.

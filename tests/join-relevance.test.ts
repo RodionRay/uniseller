@@ -114,8 +114,9 @@ describe("join gate", () => {
     expect(rescoreGroup(g, profile, { force: true })).toBeNull();
   });
 
-  it("auto band joins; review and skip are parked with a reason; nothing is dropped", () => {
-    expect(joinGateFor({ joinRelevance: rel("auto", 80) })).toMatchObject({ allow: true, state: "auto" });
+  it("only owner-queued groups join: the auto band is a recommendation; nothing is dropped", () => {
+    expect(joinGateFor({ joinRelevance: rel("auto", 80) })).toMatchObject({ allow: false, state: "auto", label: "Рекомендуем" });
+    expect(joinGateFor({ joinWanted: true, joinRelevance: rel("auto", 80) })).toMatchObject({ allow: true, state: "approved" });
     expect(joinGateFor({ joinRelevance: rel("review", 45) })).toMatchObject({ allow: false, state: "review", reason: "r" });
     expect(joinGateFor({ joinRelevance: rel("skip", 10) })).toMatchObject({ allow: false, state: "skip", label: "Не вступать" });
   });
@@ -139,10 +140,12 @@ describe("join gate", () => {
     expect(joinGateFor({ name: "x" })).toMatchObject({ allow: false, state: "review" });
   });
 
-  it("rescoring clears the queue state of parked groups only", () => {
+  it("rescoring clears the queue state of every group the owner did not queue", () => {
     const off = { name: "Главред", url: "https://t.me/glvrd_test", source: "tgstat-blogs", joinState: "queued" };
     expect(rescoreGroup(off, profile)?.clearQueue).toBe(true);
-    const on = { name: "Ozon | Чат поставщиков", url: "https://t.me/ozon_suppliers_test", joinState: "queued" };
+    const recommended = { name: "Ozon | Чат поставщиков", url: "https://t.me/ozon_suppliers_test", joinState: "queued" };
+    expect(rescoreGroup(recommended, profile)?.clearQueue).toBe(true);
+    const on = { ...recommended, joinWanted: true };
     expect(rescoreGroup(on, profile)?.clearQueue).toBe(false);
     const fresh = { ...on, joinRelevance: rescoreGroup(on, profile)!.joinRelevance };
     expect(rescoreGroup(fresh, profile)).toBeNull();

@@ -8,7 +8,7 @@ import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
 import {mergeRefreshedSession,stripSessionMaterial} from '@/lib/processes/session-refresh';
 import {appTimeoutForWorker,proxyCheckTimeoutMs,workerSlots} from '@/lib/processes/worker-timeouts';
 import {catalogForProject,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
-import {JOIN_SUCCESS_PATCH,type JoinAccountState,type JoinProxyState,evaluateAccountJoinReadiness,isJoinFarmCandidate,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,classifyJoinFailure,deadLinkPatch,isAccountBlindResult,isAccountResolveBlind,isUsernameMissingResult,joinFailurePatch,missingAccountsOf,planGroupHeal,recordUsernameMissing,sanitizeJoinStateError,seedMissingAccounts} from '@/lib/processes/join-flow';
+import {JOIN_SUCCESS_PATCH,type JoinAccountState,type JoinProxyState,evaluateAccountJoinReadiness,isJoinFarmCandidate,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,classifyJoinFailure,deadLinkPatch,isAccountBlindResult,isAccountResolveBlind,isUsernameMissingResult,joinFailurePatch,missingAccountsOf,planGroupHeal,recordUsernameMissing,sanitizeJoinStateError,seedMissingAccounts,trustAccountBlind} from '@/lib/processes/join-flow';
 import {buildRelevanceProfile,compareJoinPriority,joinGateFor,rescoreGroup,seedRejoin,type JoinGateState} from '@/lib/join-relevance';
 import {JOIN_RESERVE_MS,accountJoinWaitSec,channelsTooMuchPatch,joinAttemptPatch,farmThroughput,joinErrorPatch,joinFloodPatch,joinSuccessPatch,planJoinFarm,type FarmAccount} from '@/lib/join-pacing';
 import {database,seal,unseal} from '@/lib/server-store';
@@ -2199,7 +2199,9 @@ export async function POST(req:Request){const session=await getSessionUser();con
    };
    // «Слот не видит @»: считаем разные аккаунты; после K — ссылка мёртвая, ферму больше не жжём.
    let deadLink=false;
-   if(!joinedOk&&!accountBlind&&isUsernameMissingResult(result)){
+   // «Слеп аккаунт» от второго и следующих аккаунтов на той же ссылке — это мёртвая ссылка, а не ферма.
+   const blindTrusted=accountBlind&&trustAccountBlind(gdata,accountId);
+   if(!joinedOk&&(accountBlind||isUsernameMissingResult(result))){
     const step=recordUsernameMissing(gdata,accountId,String(result.error||''));
     next={...next,...step.patch};
     deadLink=step.dead;
@@ -2250,7 +2252,11 @@ export async function POST(req:Request){const session=await getSessionUser();con
    }
    // Пометка аккаунта выше пишет прочитанную копию (с резервом) — снимаем резерв после неё.
    if(sessionFault||workerTransient)await patchAccount(owner,accountId,release);
-   if(accountBlind){
+   if(accountBlind&&!blindTrusted){
+    // Попытка дошла до Telegram: половинная пауза, но без отлёжки 6 ч и без серии ошибок.
+    await patchAccount(owner,accountId,alreadyIn?release:joinAttemptPatch(ageDays));
+   }
+   if(blindTrusted){
     await patchAccount(owner,accountId,{...accountBlindPatch(),...release,error:String(result.error||'').slice(0,500)});
     try{await appendGlobalRescanLog(owner,'warn',`Аккаунт ${accountId.slice(0,8)} слеп на ResolveUsername${result.sessionRefreshed?' (новая сессия)':''} — отлёжка 6 ч`)}catch{/* */}
    }

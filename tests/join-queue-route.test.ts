@@ -80,7 +80,8 @@ async function seedWorkspace(){
 describe('workspace API: relevance gate before joining',()=>{
   beforeEach(async()=>{
     await seedWorkspace();
-    addRecord(G_WB,'group',unjoined('WB Official Chat','https://t.me/wb_official_chat_test'));
+    // Владелец поставил WB в очередь; Ozon только рекомендован баллом (owner 2026-09-30: вступаем лишь по очереди).
+    addRecord(G_WB,'group',unjoined('WB Official Chat','https://t.me/wb_official_chat_test',{joinWanted:true}));
     addRecord(G_OZON,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
     addRecord(G_SMM,'group',unjoined('DNative — блог Ткачука про SMM','https://t.me/dnative',{source:'tgstat-blogs'}));
     addRecord(G_JOINED_SMM,'group',{...unjoined('Бескромный','https://t.me/beskromny_test',{source:'tgstat-blogs'}),membership:'joined',joinedAt:'2026-09-20T10:00:00Z',joinState:'',status:'active'});
@@ -90,14 +91,17 @@ describe('workspace API: relevance gate before joining',()=>{
     vi.unstubAllEnvs();
   });
 
-  it('heal queues only relevant groups, best first, and parks off-niche ones with a reason',async()=>{
+  it('heal queues only owner-queued groups; recommended and off-niche ones wait with a reason',async()=>{
     const res=await POST(post({action:'heal_dead_group_accounts'}));
     const data=await body(res);
 
     expect(res.status).toBe(200);
     const ids=data.items.map((i:{id:string})=>i.id);
     expect(ids).not.toContain(G_SMM);
-    expect(new Set(ids)).toEqual(new Set([G_WB,G_OZON]));
+    expect(ids).toEqual([G_WB]);
+    const ozon=group(G_OZON);
+    expect(ozon.joinState).toBe('');
+    expect(ozon.joinRelevance.band).toBe('auto');
     const smm=group(G_SMM);
     expect(smm.joinState).toBe('');
     expect(smm.joinRelevance.band).toBe('skip');
@@ -112,9 +116,8 @@ describe('workspace API: relevance gate before joining',()=>{
     const data=await body(res);
 
     const scores=data.rejoinItems.map((i:{id:string})=>group(i.id).joinRelevance.score);
-    expect(scores.length).toBe(2);
-    expect([...scores].sort((a:number,b:number)=>b-a)).toEqual(scores);
-    expect(data.joinStats).toMatchObject({auto:2,skip:1});
+    expect(scores.length).toBe(1);
+    expect(data.joinStats).toMatchObject({approved:1,auto:1,skip:1});
   });
 
   it('join_group refuses a parked group without calling the worker',async()=>{
@@ -156,14 +159,15 @@ describe('workspace API: relevance gate before joining',()=>{
     expect(group(G_WB).joinDecision).toBe('');
   });
 
-  it('rescore_join_queue reports band counts and clears the queue of parked groups',async()=>{
+  it('rescore_join_queue reports gate counts and clears the queue of every group the owner did not queue',async()=>{
     const res=await POST(post({action:'rescore_join_queue'}));
     const data=await body(res);
 
     expect(res.status).toBe(200);
-    expect(data.counts).toMatchObject({auto:2,skip:1,joined:1});
-    expect(data.cleared).toBe(1);
+    expect(data.counts).toMatchObject({approved:1,auto:1,skip:1,joined:1});
+    expect(data.cleared).toBe(2);
     expect(group(G_SMM).joinState).toBe('');
+    expect(group(G_OZON).joinState).toBe('');
     expect(group(G_WB).joinState).toBe('queued');
   });
 
@@ -180,7 +184,7 @@ describe('workspace API: join pacing',()=>{
   beforeEach(async()=>{
     await seedWorkspace();
     setCreated(ACCOUNT_ID,'2026-01-01T00:00:00Z');
-    addRecord(G_WB,'group',unjoined('WB Official Chat','https://t.me/wb_official_chat_test'));
+    addRecord(G_WB,'group',unjoined('WB Official Chat','https://t.me/wb_official_chat_test',{joinWanted:true}));
     await POST(post({action:'heal_dead_group_accounts'}));
   });
   afterEach(()=>{
@@ -331,7 +335,7 @@ describe('workspace API: join pacing',()=>{
 
   it('two parallel joins never share one account (CAS reservation)',async()=>{
     const G2='a0000000-0000-4000-8000-000000000010';
-    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
+    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test',{joinWanted:true}));
     await POST(post({action:'heal_dead_group_accounts'}));
     const joins:string[]=[];
     mockWorker(async(path)=>{
@@ -349,7 +353,7 @@ describe('workspace API: join pacing',()=>{
 
   it('one join at a time per proxy even with two free accounts on it',async()=>{
     const G2='a0000000-0000-4000-8000-000000000011';
-    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
+    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test',{joinWanted:true}));
     const SHARED='33333333-3333-4333-8333-333333333399';
     addRecord(SHARED,'proxy',{name:'shared',host:'proxy.example.com',port:1081,protocol:'socks5',status:'active'});
     addRecord(ACC2,'account',{name:'Farm 2',phone:'+79990001123',status:'active',proxyId:SHARED},await sealedSession('s2'));
@@ -387,7 +391,7 @@ describe('workspace API: join pacing',()=>{
 
   it('a failed attempt still spends a (half) gap on the account — no back-to-back Telegram calls',async()=>{
     const G2='a0000000-0000-4000-8000-000000000013';
-    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test'));
+    addRecord(G2,'group',unjoined('Ozon | Чат поставщиков','https://t.me/ozon_suppliers_test',{joinWanted:true}));
     const calls=stubWorker({ok:false,join:'private',error:'Группа приватная — нужен инвайт-ссылка'});
 
     await POST(post({action:'join_group',id:G_WB}));

@@ -331,6 +331,12 @@ function groupParked(item:RecordItem){
   return !joinGateFor(item.data||{}).allow;
 }
 
+/** Ждёт решения владельца: рекомендуемые (высокий балл) и «на подтверждение». */
+function groupAwaitsOwner(item:RecordItem){
+  const st=joinGateFor(item.data||{}).state;
+  return st==='review'||st==='auto';
+}
+
 type GroupFilter='all'|'need'|'review'|'skip'|'joined'|'pending'|'error';
 
 function groupStatusLabel(item:RecordItem){
@@ -345,7 +351,7 @@ function groupStatusLabel(item:RecordItem){
   if(d.membership==='joined'||(s==='active'&&d.joinedAt)||groupAlreadyIn(item))return {label:'Вступили',tone:'success' as const};
   const gate=joinGateFor(d);
   if(gate.state==='dead')return {label:gate.label,tone:'danger' as const};
-  if(gate.state==='review')return {label:gate.label,tone:'warning' as const};
+  if(gate.state==='review'||gate.state==='auto')return {label:gate.label,tone:'warning' as const};
   if(gate.state==='skip'||gate.state==='skipped')return {label:gate.label,tone:'neutral' as const};
   if(s==='error')return {label:'Ошибка',tone:'danger' as const};
   if(s==='active')return {label:'Не вступили',tone:'warning' as const};
@@ -2781,8 +2787,8 @@ function WorkspaceHome(){
     if(currentKind==='group'){
       return displayed.filter(r=>{
         if(groupFilter==='need')return groupNeedsJoin(r);
-        if(groupFilter==='review')return groupParked(r)&&joinGateFor(r.data).state==='review';
-        if(groupFilter==='skip')return groupParked(r)&&joinGateFor(r.data).state!=='review';
+        if(groupFilter==='review')return groupParked(r)&&groupAwaitsOwner(r);
+        if(groupFilter==='skip')return groupParked(r)&&!groupAwaitsOwner(r);
         if(groupFilter==='joined')return groupAlreadyIn(r);
         if(groupFilter==='pending')return r.data.status==='pending';
         if(groupFilter==='error')return r.data.status==='error';
@@ -3114,7 +3120,7 @@ function WorkspaceHome(){
                     <Check size={14}/>Одобрить
                   </Button>
                 )}
-                {parked&&gate?.state==='review'&&(
+                {parked&&(gate?.state==='review'||gate?.state==='auto')&&(
                   <Button size="sm" variant="ghost" disabled={busy} onClick={()=>void setGroupJoinDecision([r.id],'skipped')}>
                     Не вступать
                   </Button>
@@ -3773,8 +3779,8 @@ function WorkspaceHome(){
                     {([
                       ['all',`Все ${list('group').length}`],
                       ['need',`Ждут ${list('group').filter(groupNeedsJoin).length}`],
-                      ['review',`На подтверждение ${list('group').filter(g=>groupParked(g)&&joinGateFor(g.data).state==='review').length}`],
-                      ['skip',`Не вступать ${list('group').filter(g=>groupParked(g)&&joinGateFor(g.data).state!=='review').length}`],
+                      ['review',`На подтверждение ${list('group').filter(g=>groupParked(g)&&groupAwaitsOwner(g)).length}`],
+                      ['skip',`Не вступать ${list('group').filter(g=>groupParked(g)&&!groupAwaitsOwner(g)).length}`],
                       ['joined',`Вступили ${list('group').filter(groupAlreadyIn).length}`],
                       ['pending',`Заявки ${list('group').filter(g=>g.data.status==='pending').length}`],
                       ['error',`Ошибки ${list('group').filter(g=>g.data.status==='error').length}`],

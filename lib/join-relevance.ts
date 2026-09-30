@@ -3,7 +3,7 @@
  *
  * A group is scored 0–100 against the product settings from what we know without joining it:
  * title, @username, catalog niches/description/audience/subscribers, source (TGStat = broadcast channel).
- * Bands: auto (join by itself) · review (owner approves in UI) · skip (not joined, reversible).
+ * Bands: auto (recommended, joins only after the owner queues it) · review (owner approves in UI) · skip (not joined, reversible).
  * Joined groups are never touched by the gate.
  */
 
@@ -419,7 +419,7 @@ export type JoinGate = {
 export const JOIN_GATE_LABELS: Record<JoinGateState, string> = {
   joined: "Вступили",
   approved: "Одобрена",
-  auto: "Авто",
+  auto: "Рекомендуем",
   review: "На подтверждение",
   skip: "Не вступать",
   skipped: "Пропущена",
@@ -431,8 +431,8 @@ function groupIsMember(g: JoinGateGroup): boolean {
 }
 
 /**
- * May the auto-queue join this group? Owner decisions beat the score; a missing score
- * (never rescored yet) parks the group for review instead of joining blind.
+ * May the queue join this group? Only owner-queued groups join (owner 2026-09-30: daily join limits are
+ * precious); the score only labels and orders them — the auto band is a recommendation, not a join.
  */
 export function joinGateFor(group: JoinGateGroup): JoinGate {
   const rel = group.joinRelevance as Partial<GroupRelevance> | undefined;
@@ -452,7 +452,7 @@ export function joinGateFor(group: JoinGateGroup): JoinGate {
   if (group.joinDecision === "approved" || group.joinWanted === true) return gate(true, "approved", "одобрено вручную");
   if (score == null) return gate(false, "review", "ещё не оценена");
   const band = rel?.band === "auto" || rel?.band === "review" || rel?.band === "skip" ? rel.band : bandOf(score);
-  return gate(band === "auto", band);
+  return gate(false, band);
 }
 
 /** Queue order: owner-approved first, then score, then audience size, then name. */

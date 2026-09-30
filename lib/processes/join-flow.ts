@@ -306,6 +306,15 @@ export function recordUsernameMissing(
   return { dead, missingAccounts, patch: { ...base, ...deadLinkPatch(msg) } };
 }
 
+/**
+ * The worker says «account blind» when the control @telegram does not resolve either — but a dead @username
+ * made every farm account look blind (e2e 2026-09-30). Trust the verdict only from the group's first witness;
+ * later accounts are counted as «не видит @» for the group, so one bad link blinds at most one account.
+ */
+export function trustAccountBlind(group: MissingTrackedGroup, accountId: string): boolean {
+  return missingAccountsOf(group).every((id) => id === String(accountId || ""));
+}
+
 /** Group leaves the auto-queue as a dead link (owner approval or a new URL brings it back). */
 export function deadLinkPatch(message: string): Record<string, unknown> {
   const msg = String(message || "Ссылка не открывается").slice(0, 500);

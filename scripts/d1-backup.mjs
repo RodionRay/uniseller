@@ -8,13 +8,12 @@
 import { createRequire } from "node:module";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
-import { persistDir } from "./wrangler-local.mjs";
+import { locateD1File, persistDir } from "./wrangler-local.mjs";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
 
 const BACKUP_PREFIX = "uniseller-d1-";
-const d1Dir = path.join(persistDir(), "v3/d1/miniflare-D1DatabaseObject");
 const backupDir = path.resolve(process.env.BACKUP_DIR?.trim() || path.join(persistDir(), "../backups"));
 const keep = Number(process.env.BACKUP_KEEP || 14);
 if (!Number.isInteger(keep) || keep < 1) {
@@ -22,21 +21,13 @@ if (!Number.isInteger(keep) || keep < 1) {
   process.exit(1);
 }
 
-function locateDatabaseFile() {
-  let files;
-  try {
-    files = readdirSync(d1Dir).filter((f) => f.endsWith(".sqlite") && f !== "metadata.sqlite");
-  } catch {
-    files = [];
-  }
-  if (files.length !== 1) {
-    console.error(`Expected exactly one D1 sqlite file in ${d1Dir}, found: ${files.join(", ") || "none"}`);
-    process.exit(1);
-  }
-  return path.join(d1Dir, files[0]);
+let source;
+try {
+  source = locateD1File();
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
 }
-
-const source = locateDatabaseFile();
 mkdirSync(backupDir, { recursive: true });
 const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
 const target = path.join(backupDir, `${BACKUP_PREFIX}${stamp}.sqlite`);

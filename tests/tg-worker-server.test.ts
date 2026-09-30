@@ -8,6 +8,7 @@ import type {Server} from 'node:http';
 import {
   createPythonRunner,
   createWorkerServer,
+  cronSecretProblem,
   cronTargetAllowed,
   purgeStaleWorkDirs,
   resolveConfig,
@@ -78,6 +79,29 @@ describe('tg-worker config', () => {
     });
     const code = await new Promise<number | null>((r) => child.on('exit', (c) => r(c)));
     expect(code).not.toBe(0);
+  });
+
+  it('flags a missing or short CRON_SECRET', () => {
+    expect(cronSecretProblem('')).toMatch(/CRON_SECRET/);
+    expect(cronSecretProblem(undefined)).toMatch(/CRON_SECRET/);
+    expect(cronSecretProblem('x'.repeat(31))).toMatch(/32/);
+    expect(cronSecretProblem('x'.repeat(32))).toBeNull();
+  });
+
+  it('warns once at startup when CRON_SECRET is missing', async () => {
+    const child = spawn(process.execPath, [SERVER_ENTRY], {
+      env: {...process.env, TG_WORKER_TOKEN: TOKEN, TG_WORKER_PORT: '0', CRON_SECRET: ''},
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (c) => (stderr += c));
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.on('data', (c) => String(c).includes('tg-worker http') && resolve());
+      child.on('exit', (code) => reject(new Error(`exited ${code}: ${stderr}`)));
+    });
+    child.kill();
+    expect(stderr.match(/CRON_SECRET/g)?.length).toBe(1);
+    expect(stderr).toMatch(/auto-rescan/);
   });
 
   it('compares tokens exactly', () => {

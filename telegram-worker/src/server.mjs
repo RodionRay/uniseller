@@ -11,6 +11,7 @@ import { readFileSync, existsSync, readdirSync, chmodSync } from "node:fs";
 import {
   createPythonRunner,
   createWorkerServer,
+  cronSecretProblem,
   cronTargetAllowed,
   purgeStaleWorkDirs,
   resolveConfig,
@@ -70,6 +71,7 @@ try {
 
 const APP_URL = (process.env.APP_URL || "http://localhost:5173").replace(/\/$/, "");
 const CRON_SECRET = process.env.CRON_SECRET || "";
+const CRON_SECRET_PROBLEM = cronSecretProblem(CRON_SECRET);
 /** Как часто дергать cron (сам API режет по autoRescanMinutes на группу). */
 const AUTO_RESCAN_EVERY_MS = Math.max(
   60_000,
@@ -101,10 +103,8 @@ async function tickAutoRescan(force = false) {
     console.warn("[auto-rescan] снимаю залипший busy-lock");
     autoRescanBusy = false;
   }
-  if (!CRON_SECRET) {
-    console.warn("[auto-rescan] нет CRON_SECRET — пропуск");
-    return { skipped: true, reason: "no_secret" };
-  }
+  // Logged once at startup; repeating it every tick would only bury it.
+  if (CRON_SECRET_PROBLEM) return { skipped: true, reason: "no_secret" };
   if (!cronTargetAllowed(APP_URL)) {
     console.warn("[auto-rescan] APP_URL не https и не loopback — секрет не отправляю");
     return { skipped: true, reason: "insecure_app_url" };
@@ -168,6 +168,12 @@ const server = createWorkerServer(config, {
     last: lastAutoRescanResult,
   }),
 });
+
+if (CRON_SECRET_PROBLEM) {
+  console.error(
+    `[tg-worker] WARNING: ${CRON_SECRET_PROBLEM} (need >= 32 chars, same value as the web app) — auto-rescan is DISABLED until it is set and the worker restarts.`,
+  );
+}
 
 tightenDataFilePerms();
 const purged = await purgeStaleWorkDirs();

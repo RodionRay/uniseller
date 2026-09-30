@@ -157,9 +157,34 @@ describe('tg-worker HTTP guard', () => {
   });
 
   it('returns 413 for an oversized body', async () => {
-    const {base} = await listen();
-    const res = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json', body: JSON.stringify({x: 'y'.repeat(7_000_000)})});
-    expect(res.status).toBe(413);
+    // Declare a huge body but send only a few bytes: the server must refuse on the
+    // declared length alone. Streaming 7 MB raced the server's Connection: close
+    // and failed with EPIPE/ECONNRESET before the 413 could be read.
+    const {port} = await listen();
+    const {request} = await import('node:http');
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request(
+        {
+          host: '127.0.0.1',
+          port,
+          path: '/check-proxy',
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${TOKEN}`,
+            'Content-Type': 'application/json',
+            'Content-Length': '7000000',
+          },
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+          req.destroy();
+        },
+      );
+      req.on('error', reject);
+      req.write('{"x":"');
+    });
+    expect(status).toBe(413);
   });
 
   it('returns 429 when all worker slots are busy', async () => {

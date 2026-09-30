@@ -31,25 +31,20 @@ type Props = {
 
 export function TaskLogDialog({ open, liveLog, liveNextAt, onClose }: Props) {
   const now = useNowTick(!!open);
-  const entries = liveLog ?? open?.log ?? [];
   const nextAt = liveNextAt || open?.nextAt || "";
   const waitLeft = remainSec(nextAt, now);
+  const openLog = open?.log;
 
   const rows = useMemo(() => {
-    const list = [...entries].reverse();
-    let waitPatched = false;
-    return list.map((e) => {
-      const raw = String(e?.text || "");
-      if (!waitPatched && /^Ожидание \d+ секунд$/.test(raw)) {
-        waitPatched = true;
-        return {
-          ...e,
-          text: liveWaitLogText(raw, e?.at, nextAt, now),
-        };
-      }
-      return e;
-    });
-  }, [entries, nextAt, now]);
+    const list = [...(liveLog ?? openLog ?? [])].reverse();
+    // Only the newest "Ожидание N секунд" entry gets the live countdown.
+    const waitIndex = list.findIndex((e) => /^Ожидание \d+ секунд$/.test(String(e?.text || "")));
+    return list.map((e, i) =>
+      i === waitIndex
+        ? { ...e, text: liveWaitLogText(String(e?.text || ""), e?.at, nextAt, now) }
+        : e,
+    );
+  }, [liveLog, openLog, nextAt, now]);
 
   return (
     <Dialog open={!!open} onOpenChange={(o) => { if (!o) onClose(); }}>

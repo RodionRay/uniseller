@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
+import { ApiError, requestJson } from '@/app/app/api-client';
 import {
   CRM_ACCESS_LABELS,
   STAFF_ROLE_LABELS,
@@ -17,6 +18,17 @@ type InviteInfo = {
   expiresAt: string;
   ownerName: string;
 };
+
+type InviteLookupResponse = {
+  invite?: InviteInfo;
+  me?: { userId: string; email: string; name: string } | null;
+};
+
+/** Server message when present, otherwise the screen-specific fallback. */
+function inviteErrorMessage(e: unknown, fallback: string): string {
+  if (e instanceof ApiError && e.kind === 'http' && typeof e.data.error !== 'string') return fallback;
+  return e instanceof Error ? e.message : fallback;
+}
 
 export function InviteAcceptClient() {
   const params = useParams<{ token: string }>();
@@ -32,17 +44,16 @@ export function InviteAcceptClient() {
     let cancelled = false;
     (async () => {
       try {
-        const r = await fetch(`/api/staff?token=${encodeURIComponent(token)}`, {
-          cache: 'no-store',
-        });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.error || 'Не удалось загрузить приглашение');
+        const data = await requestJson<InviteLookupResponse>(
+          `/api/staff?token=${encodeURIComponent(token)}`,
+          { cache: 'no-store' },
+        );
         if (!cancelled) {
-          setInvite(data.invite);
+          setInvite(data.invite ?? null);
           setMe(data.me || null);
         }
       } catch (e) {
-        if (!cancelled) setError((e as Error).message);
+        if (!cancelled) setError(inviteErrorMessage(e, 'Не удалось загрузить приглашение'));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -56,16 +67,14 @@ export function InviteAcceptClient() {
     setBusy(true);
     setError('');
     try {
-      const r = await fetch('/api/staff', {
+      await requestJson('/api/staff', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'accept_invite', token }),
       });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || 'Не удалось принять приглашение');
       router.replace('/app');
     } catch (e) {
-      setError((e as Error).message);
+      setError(inviteErrorMessage(e, 'Не удалось принять приглашение'));
       setBusy(false);
     }
   };

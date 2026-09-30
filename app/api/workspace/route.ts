@@ -357,6 +357,15 @@ const schemas={
  }),
 };
 function reply(data:unknown,status=200){return Response.json(data,{status,headers:{'Cache-Control':'no-store'}})}
+/** Messages safe to show the user verbatim; any other error text stays in server logs. */
+class UserFacingError extends Error{}
+
+function internalError(context:string,e:unknown,publicMessage:string){
+ if(e instanceof UserFacingError)return e.message;
+ console.error(`[workspace] ${context}:`,String((e as Error)?.message||e).slice(0,500));
+ return publicMessage;
+}
+
 async function readOwner(){
   const u=await getSessionUser();
   if(!u?.userId)return;
@@ -477,8 +486,8 @@ async function healStuckProxyChecks(owner:string,maxAgeMs=45_000){
 async function loadAccountSessionPayload(owner:string,accountId:string){
  const db=database();
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
- if(!row)throw new Error('Аккаунт не найден');
- if(!row.secret)throw new Error('У аккаунта нет сессии');
+ if(!row)throw new UserFacingError('Аккаунт не найден');
+ if(!row.secret)throw new UserFacingError('У аккаунта нет сессии');
  const data=JSON.parse(row.data);
  const secretRaw=await unseal(row.secret,owner);
  const session=JSON.parse(secretRaw);
@@ -1411,7 +1420,7 @@ export async function GET(){const session=await getSessionUser();if(!session?.us
   workspace,
   me:{userId:session.userId,email:session.email,name:session.displayName},
  });
-}catch{return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
+}catch(e){internalError('GET',e,'');return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
 export async function POST(req:Request){const owner=await readOwner();if(!owner)return reply({error:'Войдите в рабочее пространство'},401);const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);const db=database();
  if(b.action==='draft'){
   const id=z.string().uuid().parse(b.id);
@@ -1444,7 +1453,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if(!update.meta.changes)return reply({error:'Сообщение изменено или лид удалён во время подготовки. Откройте актуальную карточку.'},409);
    return reply({ok:true,draft,model:resolveAiConfig(settings).model});
   }catch(e){
-   return reply({error:String((e as Error).message||e).slice(0,300)},502);
+   return reply({error:internalError('draft',e,'AI не смог подготовить черновик. Повторите попытку позже.')},502);
   }
  }
  if(b.action==='check_proxy'){
@@ -1586,7 +1595,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       if(wr.status==='frozen')next.status='frozen';
      }catch(e){
       tgOk=false;
-      tgError=String((e as Error).message||e).slice(0,300);
+      tgError=internalError('apply_account_profiles',e,'Не удалось обновить профиль в Telegram');
      }
     }
    }
@@ -1620,7 +1629,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      results.push({id,ok:false,error:wr.error||'Ошибка фото'});
     }
    }catch(e){
-    results.push({id,ok:false,error:String((e as Error).message||e).slice(0,300)});
+    results.push({id,ok:false,error:internalError('upload_account_photos',e,'Не удалось загрузить фото')});
    }
    await new Promise(r=>setTimeout(r,1500));
   }
@@ -2587,7 +2596,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    }
    return reply({ok:true,lead:next,mode,link,messageId,rotatedAccount,accountId:sendAccountId});
   }catch(e){
-   return reply({error:String((e as Error).message||e).slice(0,500)},503);
+   return reply({error:internalError('send_lead_message',e,'Не удалось отправить сообщение. Повторите попытку.')},503);
   }
  }
  if(b.action==='rescan_groups'){
@@ -4642,11 +4651,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    // Явный opt-in + жёсткий потолок: иначе импорт ZIP зависает на минуты (прокси×ретраи×автообход).
    provision=await Promise.race([
     runAccountCheck(owner,id,{ensureUsername:true,forceUsername:true,checkRestrictions:false,rotateProxy:false}),
-    new Promise<never>((_,rej)=>setTimeout(()=>rej(new Error('Таймаут записи @username')),18_000)),
+    new Promise<never>((_,rej)=>setTimeout(()=>rej(new UserFacingError('Таймаут записи @username')),18_000)),
    ]);
   }catch(e){
-   provision={ok:false,error:String((e as Error).message||e).slice(0,300)};
+   provision={ok:false,error:internalError('provision_username',e,'Не удалось записать @username')};
   }
  }
  return reply({ok:true,id,username:provision?.profile?.username||data.username||undefined,provision});
- }catch(e){if(e instanceof z.ZodError)return reply({error:'Проверьте поля: '+e.issues.map(i=>i.path.join('.')).join(', ')},400);if(e instanceof SyntaxError)return reply({error:'Некорректный запрос'},400);return reply({error:'Не удалось выполнить действие. Данные формы сохранены — повторите попытку.'},503)}}
+ }catch(e){if(e instanceof z.ZodError)return reply({error:'Проверьте поля: '+e.issues.map(i=>i.path.join('.')).join(', ')},400);if(e instanceof SyntaxError)return reply({error:'Некорректный запрос'},400);internalError('POST',e,'');return reply({error:'Не удалось выполнить действие. Данные формы сохранены — повторите попытку.'},503)}}

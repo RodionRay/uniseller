@@ -11,7 +11,7 @@ import {
   parseOAuthState,
   type OAuthProvider,
 } from "@/lib/oauth";
-import { upsertOAuthUser } from "@/lib/users";
+import { OAuthEmailTakenError, upsertOAuthUser } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
@@ -50,6 +50,7 @@ export async function GET(
       provider,
       providerUserId: profile.providerUserId,
       email: profile.email,
+      emailVerified: profile.emailVerified,
       name: profile.name,
     });
     const token = await createSessionToken({
@@ -61,7 +62,7 @@ export async function GET(
     res.cookies.set(sessionCookieName(), token, sessionCookieOptions());
     res.cookies.set(STATE_COOKIE, "", { ...sessionCookieOptions(0), maxAge: 0 });
     return res;
-  } catch {
-    return fail("oauth");
+  } catch (e) {
+    return fail(e instanceof OAuthEmailTakenError ? "exists" : "oauth");
   }
 }

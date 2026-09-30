@@ -130,6 +130,8 @@ export function makeOAuthState(provider: string, returnTo: string) {
 export type OAuthProfile = {
   providerUserId: string;
   email: string | null;
+  /** True only when the provider asserts the email is verified (Google). */
+  emailVerified: boolean;
   name: string;
 };
 
@@ -160,12 +162,14 @@ export async function exchangeOAuthCode(
     const me = (await meRes.json()) as {
       sub?: string;
       email?: string;
+      email_verified?: boolean;
       name?: string;
     };
     if (!me.sub) throw new Error("Google не вернул профиль");
     return {
       providerUserId: me.sub,
       email: me.email || null,
+      emailVerified: me.email_verified === true,
       name: me.name || me.email || "Google",
     };
   }
@@ -195,6 +199,7 @@ export async function exchangeOAuthCode(
     return {
       providerUserId: String(me.id),
       email: me.default_email || null,
+      emailVerified: false,
       name: me.real_name || me.display_name || me.default_email || "Яндекс",
     };
   }
@@ -224,6 +229,7 @@ export async function exchangeOAuthCode(
   return {
     providerUserId: String(token.user_id),
     email: token.email || null,
+    emailVerified: false,
     name: name || `VK ${token.user_id}`,
   };
 }

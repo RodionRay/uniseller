@@ -145,17 +145,39 @@ export async function linkOAuth(
     .run();
 }
 
+export const OAUTH_EMAIL_TAKEN_MESSAGE =
+  "Аккаунт с этой почтой уже существует — войдите по паролю";
+
+/** OAuth login would attach to a password account whose owner never proved control. */
+export class OAuthEmailTakenError extends Error {
+  constructor() {
+    super(OAUTH_EMAIL_TAKEN_MESSAGE);
+    this.name = "OAuthEmailTakenError";
+  }
+}
+
+/**
+ * Finds or creates the user behind an OAuth identity.
+ * Email is trusted only when the provider asserts it is verified (Google
+ * `email_verified`); VK/Yandex/Telegram emails are never used for linking or
+ * stored, so they cannot claim an existing account or squat an address.
+ * A verified email never auto-links to an account that has a password.
+ */
 export async function upsertOAuthUser(input: {
   provider: string;
   providerUserId: string;
   email?: string | null;
+  emailVerified: boolean;
   name: string;
 }): Promise<DbUser> {
   const linked = await findOAuthUser(input.provider, input.providerUserId);
   if (linked) return linked;
-  const email = input.email?.trim().toLowerCase() || null;
+  const email = input.emailVerified
+    ? input.email?.trim().toLowerCase() || null
+    : null;
   if (email) {
     const byEmail = await findUserByEmail(email);
+    if (byEmail?.passwordHash) throw new OAuthEmailTakenError();
     if (byEmail) {
       await linkOAuth(byEmail.id, input.provider, input.providerUserId);
       return byEmail;

@@ -29,6 +29,7 @@ async function finish(req: Request, data: Record<string, string>, returnTo: stri
     provider: "telegram",
     providerUserId: profile.id,
     email: null,
+    emailVerified: false,
     name: profile.name,
   });
   const token = await createSessionToken({

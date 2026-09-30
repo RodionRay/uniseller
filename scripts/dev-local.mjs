@@ -39,14 +39,12 @@ function resolveSharedSecrets() {
   const fileEnv = readDotEnv();
   const secrets = {};
   const generated = [];
-  let allFromDotEnv = true;
   for (const key of ["TG_WORKER_TOKEN", "CRON_SECRET"]) {
     const value = process.env[key] || fileEnv[key];
     if (!process.env[key] && fileEnv[key]) {
       secrets[key] = value;
       continue;
     }
-    allFromDotEnv = false;
     if (value) {
       secrets[key] = value;
     } else {
@@ -54,7 +52,7 @@ function resolveSharedSecrets() {
       generated.push(key);
     }
   }
-  return { secrets, generated, allFromDotEnv };
+  return { secrets, generated };
 }
 
 /** SQLite files hold sealed secrets and PII; keep them owner-only (best-effort). */
@@ -150,6 +148,25 @@ function listeningPids(port) {
   }
 }
 
+/**
+ * Env for the web process. Its cron self-calls (auto-rescan) go to INTERNAL_APP_ORIGIN, else to .env APP_URL —
+ * which on a second stand (PORT=5180) points at another app on :5173, so the cron was a silent 200 no-op.
+ * Pin the origin to this web's own port; Miniflare sees it only with CLOUDFLARE_INCLUDE_PROCESS_ENV
+ * (process env overrides empty .env values; .env has no INTERNAL_APP_ORIGIN).
+ * @param {{ secrets: Record<string, string>, webPort: number, workerPort: number, internalOrigin?: string, workerUrl?: string }} opts
+ */
+export function webEnvFor({ secrets, webPort, workerPort, internalOrigin, workerUrl }) {
+  return {
+    ...secrets,
+    CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
+    // miniflare Local Explorer = raw SQL on D1 for anyone reaching the port.
+    X_LOCAL_EXPLORER: "false",
+    PORT: String(webPort),
+    INTERNAL_APP_ORIGIN: internalOrigin || `http://127.0.0.1:${webPort}`,
+    TELEGRAM_WORKER_URL: workerUrl || `http://127.0.0.1:${workerPort}`,
+  };
+}
+
 async function main() {
   const webPort = Number(process.env.PORT || 5173);
   const workerPort = Number(process.env.TG_WORKER_PORT || 8790);
@@ -157,12 +174,7 @@ async function main() {
   const workerAppUrl = (process.env.APP_URL || `http://127.0.0.1:${webPort}`).replace(/\/$/, "");
   const children = new Set();
   let shuttingDown = false;
-  const { secrets: sharedSecrets, generated: generatedSecrets, allFromDotEnv } = resolveSharedSecrets();
-  /**
-   * The web app runs in Miniflare, which sees only .env unless told to include process env
-   * (verified: wrangler getVarsForDev; process env then overrides empty .env values).
-   */
-  const webRuntimeEnv = allFromDotEnv ? {} : { CLOUDFLARE_INCLUDE_PROCESS_ENV: "true" };
+  const { secrets: sharedSecrets, generated: generatedSecrets } = resolveSharedSecrets();
 
   function spawnLogged(name, command, args, opts = {}) {
     const child = spawn(command, args, {
@@ -246,15 +258,13 @@ async function main() {
       process.execPath,
       [runner, "dev", "--hostname", "127.0.0.1", "--port", String(webPort), ...extraArgs],
       {
-        env: {
-          ...sharedSecrets,
-          ...webRuntimeEnv,
-          // miniflare Local Explorer = raw SQL on D1 for anyone reaching the port.
-          X_LOCAL_EXPLORER: "false",
-          PORT: String(webPort),
-          TELEGRAM_WORKER_URL:
-            process.env.TELEGRAM_WORKER_URL || `http://127.0.0.1:${workerPort}`,
-        },
+        env: webEnvFor({
+          secrets: sharedSecrets,
+          webPort,
+          workerPort,
+          internalOrigin: process.env.INTERNAL_APP_ORIGIN,
+          workerUrl: process.env.TELEGRAM_WORKER_URL,
+        }),
       },
     );
   }

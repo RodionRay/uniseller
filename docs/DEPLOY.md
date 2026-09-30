@@ -81,7 +81,7 @@ sudo systemctl reload caddy
 только воркер внутри сети compose; `/api/health` остаётся доступным. Автообход вызывает кабинет сам на себя
 по `INTERNAL_APP_ORIGIN=http://web:5173` (задан в `docker-compose.yml` вместе с `TG_WORKER_CRON_HTTP_HOSTS=web`;
 `lib/env.ts::internalAppOrigin`) — по сети compose, не через публичный домен. Без переменной используется `APP_URL`,
-без обеих или при недопустимом значении (http к хосту не из списка) автообход отвечает `503`. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
+без обеих или при недопустимом значении (http к хосту не из списка) автообход отвечает `503`. Локально `npm run dev` (`scripts/dev-local.mjs::webEnvFor`) ставит вебу `INTERNAL_APP_ORIGIN=http://127.0.0.1:$PORT`, чтобы второй стенд (`PORT=5180`) не звал `APP_URL` из `.env` другого приложения. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
 `https://ВАШ-ДОМЕН/api/auth/<google|yandex|vk>/callback` — приложение строит его из `APP_URL`.
 
 Лимиты по IP (вход, регистрация, форма заявки, ассистент без входа) по умолчанию выключены

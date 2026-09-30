@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import ipaddress
 import json
 import random
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import zipfile
@@ -102,6 +104,74 @@ def frozen_action_error(action: str) -> dict[str, Any]:
     }
 
 
+class ProxyHostRejected(ValueError):
+    """Proxy host resolves to an internal address (SSRF guard) or does not resolve."""
+
+
+class ArchiveRejected(ValueError):
+    """Uploaded account archive exceeds extraction limits (zip bomb guard)."""
+
+
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+MAX_ZIP_ENTRIES = 5000
+MAX_ZIP_TOTAL_BYTES = 200 * 1024 * 1024
+
+
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+    ):
+        return False
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT:
+        return False
+    return ip.is_global
+
+
+def resolve_public_host(host: str, port: int, *, resolver=socket.getaddrinfo) -> str:
+    """Resolve host; reject if ANY address is internal. Returns an IP to connect to,
+    so a second (rebinding) DNS answer cannot redirect the connection."""
+    try:
+        infos = resolver(host, port, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as e:
+        raise ProxyHostRejected("Адрес прокси не резолвится") from e
+    addrs = [str(info[4][0]).split("%", 1)[0] for info in infos]
+    if not addrs:
+        raise ProxyHostRejected("Адрес прокси не резолвится")
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError as e:
+            raise ProxyHostRejected("Недопустимый адрес прокси") from e
+        if not _is_public_ip(ip):
+            raise ProxyHostRejected("Недопустимый адрес прокси (внутренняя сеть)")
+    return addrs[0]
+
+
+def safe_extract_zip(
+    zpath: Path,
+    dest: Path,
+    *,
+    max_entries: int = MAX_ZIP_ENTRIES,
+    max_total_bytes: int = MAX_ZIP_TOTAL_BYTES,
+) -> None:
+    # zipfile caps each member's output at its declared file_size, so summing
+    # declared sizes bounds the real extraction size.
+    with zipfile.ZipFile(zpath, "r") as zf:
+        infos = zf.infolist()
+        if len(infos) > max_entries:
+            raise ArchiveRejected("Архив содержит слишком много файлов")
+        if sum(i.file_size for i in infos) > max_total_bytes:
+            raise ArchiveRejected("Архив слишком большой после распаковки")
+        zf.extractall(dest)
+
+
 def make_proxy(proxy: dict | None):
     if not proxy or not proxy.get("host"):
         return None
@@ -110,7 +180,7 @@ def make_proxy(proxy: dict | None):
     kind = socks.SOCKS5 if proxy.get("protocol", "socks5") == "socks5" else socks.HTTP
     return (
         kind,
-        proxy["host"],
+        resolve_public_host(str(proxy["host"]).strip(), int(proxy["port"])),
         int(proxy["port"]),
         True,
         proxy.get("username") or None,
@@ -176,7 +246,8 @@ def probe_telegram_via_proxy(
                     "HTTP/1.1 200"
                 ):
                     return True, f"{proto}:{dc_host}:{dc_port}"
-                last_err = (first or "HTTP CONNECT отказ")[:120]
+                code = re.match(r"HTTP/\d(?:\.\d)? (\d{3})", first)
+                last_err = f"HTTP CONNECT отказ ({code.group(1)})" if code else "HTTP CONNECT отказ"
             else:
                 sock = socks.socksocket()
                 sock.set_proxy(
@@ -191,7 +262,7 @@ def probe_telegram_via_proxy(
                 sock.connect((dc_host, dc_port))
                 return True, f"{proto}:{dc_host}:{dc_port}"
         except Exception as e:
-            last_err = str(e)[:160]
+            last_err = f"нет соединения ({type(e).__name__})"
         finally:
             if sock is not None:
                 try:
@@ -289,6 +360,10 @@ async def check_proxy_alive(payload: dict[str, Any]) -> dict[str, Any]:
     password = str(payload.get("password") or "") or None
     if not host or not (1 <= port <= 65535):
         return {"ok": False, "error": "Некорректный host/port", "latencyMs": 0}
+    try:
+        host = resolve_public_host(host, port)
+    except ProxyHostRejected as e:
+        return {"ok": False, "error": str(e), "latencyMs": 0, "telegramOk": False}
 
     started = time.time()
     # Заявленный протокол → при фейле сразу альтернатива (мобильные часто SOCKS5).
@@ -311,15 +386,21 @@ async def check_proxy_alive(payload: dict[str, Any]) -> dict[str, Any]:
                 net_err = ""
                 break
             net_err = err or net_err
-        except socks.ProxyConnectionError as e:
-            net_err = f"Не удалось подключиться к прокси: {e}"[:400]
+        except socks.ProxyConnectionError:
+            net_err = "Не удалось подключиться к прокси"
         except socks.ProxyError as e:
-            net_err = f"Ошибка прокси: {e}"[:400]
+            net_err = (
+                "Неверный логин или пароль прокси"
+                if "auth" in str(e).lower()
+                else "Ошибка прокси"
+            )
         except Exception as e:
+            # Текст исключения может содержать ответ удалённого сервера — наружу только код.
             msg = str(e)
             if "407" in msg or "authentication" in msg.lower():
-                msg = "Неверный логин или пароль прокси"
-            net_err = msg[:400]
+                net_err = "Неверный логин или пароль прокси"
+            else:
+                net_err = f"Прокси не отвечает ({type(e).__name__})"
 
     if not net_ok:
         return {
@@ -466,8 +547,7 @@ async def open_client(payload: dict[str, Any], work: Path):
     raw = base64.b64decode(zip_b64)
     zpath = work / "account.zip"
     zpath.write_bytes(raw)
-    with zipfile.ZipFile(zpath, "r") as zf:
-        zf.extractall(work / "unz")
+    safe_extract_zip(zpath, work / "unz")
 
     root = work / "unz"
     tdata = None
@@ -2258,8 +2338,20 @@ async def upload_profile_photo(client, payload: dict[str, Any]) -> dict[str, Any
         return {"ok": False, "error": str(e)[:300]}
     return {"ok": True, "hasPhoto": True}
 
+# Задаётся Node-воркером (--work-dir): он создаёт каталог 0700 и удаляет его сам,
+# даже если процесс Python убит по таймауту (иначе сессии остаются в /tmp открытым текстом).
+_WORK_DIR_OVERRIDE: Path | None = None
+
+
+def acquire_work_dir() -> Path:
+    if _WORK_DIR_OVERRIDE is not None:
+        _WORK_DIR_OVERRIDE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="job-", dir=_WORK_DIR_OVERRIDE))
+    return Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+
+
 async def run_check(payload: dict[str, Any]) -> dict[str, Any]:
-    work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+    work = acquire_work_dir()
     client = None
     try:
         client = await open_client(payload, work)
@@ -2332,7 +2424,7 @@ async def run_action(payload: dict[str, Any]) -> dict[str, Any]:
         if action == "check_proxy":
             return await check_proxy_alive(payload)
 
-        work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+        work = acquire_work_dir()
         client = None
         try:
             client = await open_client(payload, work)
@@ -2429,8 +2521,9 @@ def _emit_error(exc: BaseException) -> int:
     if isinstance(exc, asyncio.CancelledError):
         text = "Операция прервана (таймаут/отмена)"
     else:
-        msg = str(exc).strip()
-        text = f"{name}: {msg}" if msg else name
+        # Сообщение исключения может содержать пути/секреты — наружу только тип.
+        text = f"Ошибка воркера ({name})"
+    print(f"[check_account] unhandled {name}", file=sys.stderr)
     err = {
         "ok": False,
         "status": "disconnected",
@@ -2448,7 +2541,11 @@ def _emit_error(exc: BaseException) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--payload", help="JSON file or - for stdin")
+    parser.add_argument("--work-dir", help="Scratch dir owned (and removed) by the caller")
     args = parser.parse_args()
+    global _WORK_DIR_OVERRIDE
+    if args.work_dir:
+        _WORK_DIR_OVERRIDE = Path(args.work_dir)
     try:
         if args.payload == "-" or not args.payload:
             payload = json.load(sys.stdin)

@@ -1,14 +1,20 @@
 #!/usr/bin/env node
 /**
  * Локальный HTTP-воркер Telegram (check / join / scan).
- * Слушает 127.0.0.1 — только localhost.
- * Плюс круглосуточный автообход лидов → POST APP_URL/api/cron/auto-rescan
+ * Слушает 127.0.0.1 — только localhost; требует TG_WORKER_TOKEN (≥32 символов).
+ * Плюс круглосуточный автообход лидов → POST APP_URL/api/cron/auto-rescan (Bearer CRON_SECRET).
+ * Guard/runner: worker-app.mjs.
  */
-import { createServer } from "node:http";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, chmodSync } from "node:fs";
+import {
+  createPythonRunner,
+  createWorkerServer,
+  cronTargetAllowed,
+  purgeStaleWorkDirs,
+  resolveConfig,
+} from "./worker-app.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
@@ -16,8 +22,6 @@ const REPO = join(ROOT, "..");
 const PY = join(ROOT, ".venv/bin/python");
 const SCRIPT = join(__dirname, "check_account.py");
 const HOST = "127.0.0.1";
-const PORT = Number(process.env.TG_WORKER_PORT || 8790);
-const TOKEN = process.env.TG_WORKER_TOKEN || "";
 
 function loadDotEnv() {
   const path = join(REPO, ".env");
@@ -38,97 +42,48 @@ function loadDotEnv() {
       if (k && process.env[k] === undefined) process.env[k] = v;
     }
   } catch {
-    /* */
+    /* .env unreadable — fall back to process env only */
   }
 }
+
+/** SQLite files hold sealed secrets and PII; keep them owner-only (best-effort). */
+function tightenDataFilePerms() {
+  const dir = join(REPO, process.env.DATA_DIR || ".data");
+  try {
+    for (const name of readdirSync(dir)) {
+      if (/\.sqlite/.test(name)) chmodSync(join(dir, name), 0o600);
+    }
+  } catch {
+    /* no data dir yet */
+  }
+}
+
 loadDotEnv();
 
-const APP_URL = (process.env.APP_URL || "http://localhost:5173").replace(
-  /\/$/,
-  "",
-);
-const CRON_SECRET =
-  process.env.CRON_SECRET ||
-  process.env.TG_WORKER_TOKEN ||
-  process.env.SESSION_SECRET ||
-  "";
+let config;
+try {
+  config = resolveConfig(process.env);
+} catch (e) {
+  console.error(`[tg-worker] ${e instanceof Error ? e.message : e}`);
+  process.exit(1);
+}
+
+const APP_URL = (process.env.APP_URL || "http://localhost:5173").replace(/\/$/, "");
+const CRON_SECRET = process.env.CRON_SECRET || "";
 /** Как часто дергать cron (сам API режет по autoRescanMinutes на группу). */
 const AUTO_RESCAN_EVERY_MS = Math.max(
   60_000,
   Number(process.env.AUTO_RESCAN_EVERY_MS || 5 * 60_000),
 );
-
-function readBody(req, limit = 6_000_000) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on("data", (c) => {
-      size += c.length;
-      if (size > limit) {
-        reject(new Error("too large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
-function runPython(payload, timeoutMs = 120_000) {
-  return new Promise((resolve) => {
-    const child = spawn(PY, [SCRIPT, "--payload", "-"], {
-      cwd: ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
-    });
-    let out = "";
-    let err = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve({ ok: false, status: "disconnected", error: "Таймаут воркера" });
-    }, timeoutMs);
-    child.stdout.on("data", (d) => {
-      out += d.toString();
-    });
-    child.stderr.on("data", (d) => {
-      err += d.toString();
-    });
-    child.on("close", () => {
-      clearTimeout(timer);
-      try {
-        const line = out.trim().split("\n").filter(Boolean).pop() || "";
-        resolve(JSON.parse(line));
-      } catch {
-        const hint = (err || out || "Ошибка воркера")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 400);
-        resolve({
-          ok: false,
-          status: "disconnected",
-          error: hint || "Ошибка воркера (нет JSON)",
-        });
-      }
-    });
-    child.stdin.write(JSON.stringify(payload));
-    child.stdin.end();
-  });
-}
-
-function authOk(req) {
-  if (!TOKEN) return true;
-  return (req.headers.authorization || "") === `Bearer ${TOKEN}`;
-}
+/** Согласовано с cron TICK_BUDGET 210с + запас. */
+const AUTO_RESCAN_FETCH_MS = 270_000;
+const BUSY_STALE_MS = 6 * 60_000;
 
 let autoRescanBusy = false;
 let autoRescanBusyAt = 0;
 let lastAutoRescanAt = "";
 let lastAutoRescanResult = null;
 let catchUpTimer = null;
-/** Согласовано с cron TICK_BUDGET 210с + запас. */
-const AUTO_RESCAN_FETCH_MS = 270_000;
-const BUSY_STALE_MS = 6 * 60_000;
 
 function scheduleCatchUp() {
   if (catchUpTimer) return;
@@ -147,10 +102,12 @@ async function tickAutoRescan(force = false) {
     autoRescanBusy = false;
   }
   if (!CRON_SECRET) {
-    console.warn(
-      "[auto-rescan] нет CRON_SECRET / TG_WORKER_TOKEN / SESSION_SECRET — пропуск",
-    );
+    console.warn("[auto-rescan] нет CRON_SECRET — пропуск");
     return { skipped: true, reason: "no_secret" };
+  }
+  if (!cronTargetAllowed(APP_URL)) {
+    console.warn("[auto-rescan] APP_URL не https и не loopback — секрет не отправляю");
+    return { skipped: true, reason: "insecure_app_url" };
   }
   autoRescanBusy = true;
   autoRescanBusyAt = Date.now();
@@ -164,6 +121,7 @@ async function tickAutoRescan(force = false) {
         "Content-Type": "application/json",
       },
       body: "{}",
+      redirect: "error",
       signal: AbortSignal.timeout(AUTO_RESCAN_FETCH_MS),
     });
     const data = await res.json().catch(() => ({}));
@@ -172,9 +130,7 @@ async function tickAutoRescan(force = false) {
     const ms = Date.now() - t0;
     if (!res.ok) {
       console.warn("[auto-rescan] fail", res.status, data?.error || data, `${ms}ms`);
-    } else if (data.skipped) {
-      /* тихо */
-    } else {
+    } else if (!data.skipped) {
       console.log(
         `[auto-rescan] scanned=${data.scanned || 0} added=${data.added || 0} joined=${data.joined || 0} due=${data.due || 0} more=${!!data.more} ${ms}ms`,
       );
@@ -198,71 +154,29 @@ async function tickAutoRescan(force = false) {
   }
 }
 
-const server = createServer(async (req, res) => {
-  const send = (code, data) => {
-    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(data));
-  };
-  if (req.method === "GET" && req.url === "/health") {
-    return send(200, {
-      ok: true,
-      service: "uniseller-tg-worker",
-      autoRescan: {
-        everyMs: AUTO_RESCAN_EVERY_MS,
-        fetchMs: AUTO_RESCAN_FETCH_MS,
-        appUrl: APP_URL,
-        busy: autoRescanBusy,
-        lastAt: lastAutoRescanAt,
-        last: lastAutoRescanResult,
-      },
-    });
-  }
-  if (req.method === "POST" && req.url === "/auto-rescan-now") {
-    if (!authOk(req)) return send(401, { error: "Unauthorized" });
-    const data = await tickAutoRescan(true);
-    return send(200, data);
-  }
-  const routes = {
-    "/check-account": "check",
-    "/check-proxy": "check_proxy",
-    "/join-group": "join",
-    "/scan-group": "scan",
-    "/collect-audience": "collect",
-    "/invite-users": "invite",
-    "/send-message": "send",
-    "/inbox-dms": "inbox",
-    "/update-profile": "update_profile",
-    "/upload-photo": "upload_photo",
-  };
-  if (req.method === "POST" && routes[req.url]) {
-    if (!authOk(req)) return send(401, { error: "Unauthorized" });
-    try {
-      const raw = await readBody(req);
-      const payload = JSON.parse(raw.toString("utf8"));
-      payload.action = routes[req.url];
-      const long =
-        routes[req.url] === "upload_photo" ||
-        routes[req.url] === "collect" ||
-        routes[req.url] === "invite";
-      const timeoutMs =
-        routes[req.url] === "check"
-          ? 28_000
-          : routes[req.url] === "check_proxy"
-            ? 18_000
-          : long
-            ? 180_000
-            : 120_000;
-      const result = await runPython(payload, timeoutMs);
-      return send(200, result);
-    } catch (e) {
-      return send(400, { ok: false, error: String(e.message || e) });
-    }
-  }
-  send(404, { error: "not found" });
+const runPython = createPythonRunner({ python: PY, script: SCRIPT, cwd: ROOT });
+
+const server = createWorkerServer(config, {
+  runPython,
+  tickAutoRescan,
+  autoRescanStatus: () => ({
+    everyMs: AUTO_RESCAN_EVERY_MS,
+    fetchMs: AUTO_RESCAN_FETCH_MS,
+    appUrl: APP_URL,
+    busy: autoRescanBusy,
+    lastAt: lastAutoRescanAt,
+    last: lastAutoRescanResult,
+  }),
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`tg-worker http://${HOST}:${PORT}`);
+tightenDataFilePerms();
+const purged = await purgeStaleWorkDirs();
+if (purged) console.log(`[tg-worker] removed ${purged} stale work dir(s)`);
+
+server.listen(config.port, HOST, () => {
+  const addr = server.address();
+  const port = addr && typeof addr === "object" ? addr.port : config.port;
+  console.log(`tg-worker http://${HOST}:${port}`);
   console.log(
     `auto-rescan → ${APP_URL}/api/cron/auto-rescan every ${Math.round(AUTO_RESCAN_EVERY_MS / 60000)}m`,
   );

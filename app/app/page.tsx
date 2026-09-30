@@ -1767,9 +1767,9 @@ function WorkspaceHome(){
       if(added.length){
         toast.success(`В стоп-слова AI: ${added.slice(0,6).join(', ')}${added.length>6?'…':''}`);
       }else if(Number(r.minusSkippedAsProduct)>0){
-        toast.message('Лид скрыт. В стоп-слова ничего не добавлено — слова пересекаются с продуктом и плюс-словами.');
+        toast.message('Лид скрыт. В стоп-слова ничего не добавлено — слова общие или пересекаются с продуктом и плюс-словами.');
       }else{
-        toast.message('Лид скрыт. Новых стоп-слов не вышло (уже были в минусе).');
+        toast.message('Лид скрыт. Новых стоп-слов нет.');
       }
       setDetail(null);
     }catch(e){toast.error((e as Error).message)}

@@ -1112,6 +1112,24 @@ class MinusMatcher:
     combined: re.Pattern[str] | None
 
 
+# Closed junk words matched by stem ("крипта" also stops "криптовалюту"); mirrors
+# lib/lead-filter.ts::MINUS_JUNK_STEMS. Only these: a stem of an arbitrary word would over-match.
+MINUS_JUNK_STEMS: dict[str, str] = {
+    "крипта": "крипт",
+    "криптовалюта": "криптовалют",
+    "накрутка": "накрутк",
+    "вакансия": "ваканси",
+    "гадание": "гадани",
+    "эзотерика": "эзотерик",
+}
+
+
+def _minus_word_pattern(word: str) -> str:
+    stem = MINUS_JUNK_STEMS.get(word)
+    # A stem inside a phrase must swallow its ending before the next word.
+    return re.escape(stem) + r"[^\W_]*" if stem else re.escape(word)
+
+
 def _normalize_minus_text(text: str) -> str:
     return (text or "").lower().replace("ё", "е")
 
@@ -1129,7 +1147,7 @@ def compile_minus_terms(terms: list[str]) -> MinusMatcher:
     for term in head:
         if not MIN_MINUS_TERM_LENGTH <= len(term) <= MAX_MINUS_TERM_LENGTH:
             continue
-        phrase = r"\s+".join(re.escape(w) for w in term.split())
+        phrase = r"\s+".join(_minus_word_pattern(w) for w in term.split())
         # (?<![^\W_]) = not preceded by a letter/digit (underscore does not count, as in the TS core)
         compiled.append((term, re.compile(r"(?<![^\W_])" + phrase)))
         alternatives.append(phrase)
@@ -1157,6 +1175,60 @@ AD_MARKERS = compile_minus_terms([
     "вам срочное сообщение", "каталоге решений", "нельзя пропустить",
     "гайд для продавцов", "подписывайтесь",
 ])
+
+
+# Seller-question gate. Mirrors lib/lead-question-gate.ts (shared fixture tests/fixtures/lead-question-gate.json).
+QUESTION_STEMS = ("подскаж", "посоветуй", "порекомендуй")
+QUESTION_WORDS = (
+    "кто-нибудь", "кто нибудь", "кто знает", "кто в курсе", "кто пользуется", "кто пользовался",
+    "кто сталкивался", "кто работает", "кто работал", "у кого есть", "у кого-нибудь", "у кого-то",
+    "может кто", "может кто-то", "как вы", "как у вас", "чем вы", "где взять", "где найти", "есть ли",
+    "как правильно", "как лучше", "какой", "какая", "какое", "какие", "какую", "каким", "какими",
+)
+TOPIC_STEMS = (
+    "wildberries", "вайлдберр", "ozon", "озон", "яндекс маркет", "яндекс.маркет", "маркетплейс",
+    "мегамаркет", "селлер", "кабинет", "остатк", "остаток", "поставк", "заказ", "отзыв", "карточк",
+    "артикул", "мойсклад", "мой склад", "выгрузк", "выгруж", "синхрониз", "интеграц", "учет",
+    "ценообраз", "ценник", "складск", "фулфилмент",
+)
+TOPIC_WORDS = (
+    "wb", "вб", "1с", "1c", "api", "апи", "fbs", "fbo", "rfbs", "фбс", "фбо", "рфбс", "crm", "срм", "лк",
+    "склад", "склада", "складе", "складу", "складом", "склады", "складов", "складам", "складами", "складах",
+    "цен", "цена", "цены", "цену", "цене", "ценой", "ценам", "ценами", "ценах",
+)
+
+
+def _compile_gate_terms(stems: tuple[str, ...], words: tuple[str, ...]) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    """Stems match at a word start; words also need a word end (no letter, digit or hyphen after)."""
+
+    def body(term: str) -> str:
+        return r"\s+".join(re.escape(w) for w in term.split())
+
+    start = r"(?<![^\W_])"
+    return tuple(
+        [(t, re.compile(start + body(t))) for t in stems]
+        + [(t, re.compile(start + body(t) + r"(?![^\W_]|-)")) for t in words]
+    )
+
+
+_QUESTION_TERMS = _compile_gate_terms(QUESTION_STEMS, QUESTION_WORDS)
+_TOPIC_TERMS = _compile_gate_terms(TOPIC_STEMS, TOPIC_WORDS)
+
+
+def has_question(text: str) -> bool:
+    low = _normalize_minus_text(text)
+    return "?" in low or "？" in low or any(p.search(low) for _, p in _QUESTION_TERMS)
+
+
+def seller_topic_hits(text: str) -> list[str]:
+    """Seller-topic terms in the text, in vocabulary order (stems first, then words)."""
+    low = _normalize_minus_text(text)
+    return [t for t, p in _TOPIC_TERMS if p.search(low)]
+
+
+def is_seller_question(text: str) -> bool:
+    """A question or soft ask about marketplace operations: a lead candidate without a plus keyword."""
+    return has_question(text) and bool(seller_topic_hits(text))
 
 
 async def scan_group(
@@ -1217,21 +1289,32 @@ async def scan_group(
     discussion_id = ""
     discussion_title = ""
 
+    def counters() -> dict[str, object]:
+        """Worker funnel for the scan log: read, too old, dropped by stop-list, no keyword, not a person,
+        plus the fetched date span and the stop terms that fired."""
+        return {
+            "fetched": fetched,
+            "skippedOld": skipped_old,
+            "skippedMinus": skipped_minus,
+            "skippedKw": skipped_kw,
+            "skippedNotUser": skipped_not_user,
+            "minusHits": [
+                [term, n] for term, n in sorted(minus_hits.items(), key=lambda kv: -kv[1])[:MINUS_HITS_REPORTED]
+            ],
+            "newestAt": newest_at.isoformat() if newest_at else "",
+            "oldestAt": oldest_at.isoformat() if oldest_at else "",
+        }
+
     def passes_kw(text: str) -> bool:
+        """Plus keyword, explicit intent, or a seller question (вопрос + тема маркетплейсов)."""
         nonlocal skipped_kw
         low = text.lower()
-        if kws:
-            hit = any(k in low for k in kws if len(k) >= 2)
-            intentish = any(x in low for x in intent_markers)
-            if not hit and not intentish:
-                skipped_kw += 1
-                return False
-        else:
-            # без плюс-слов из настроек — только явный intent
-            if not any(x in low for x in intent_markers):
-                skipped_kw += 1
-                return False
-        return True
+        hit = any(k in low for k in kws if len(k) >= 2)
+        intentish = any(x in low for x in intent_markers)
+        if hit or intentish or is_seller_question(text):
+            return True
+        skipped_kw += 1
+        return False
 
     async def add_msg(m, *, kind: str, peer_entity) -> None:
         nonlocal fetched, skipped_minus, skipped_not_user, skipped_old, newest_at, oldest_at
@@ -1316,6 +1399,7 @@ async def scan_group(
                     "error": "Сначала вступите в группу по инвайту",
                     "messages": [],
                     "member": False,
+                    **counters(),
                 }
             entity = invite.chat
         else:
@@ -1328,6 +1412,7 @@ async def scan_group(
                     "error": str(resolve_err.get("error") or "Не удалось найти группу")[:400],
                     "messages": [],
                     "member": False,
+                    **counters(),
                     "usernameMissing": bool(resolve_err.get("usernameMissing")),
                     "title": "",
                 }
@@ -1339,6 +1424,7 @@ async def scan_group(
                     "error": f"Слот не видит @{ref.get('value')}",
                     "messages": [],
                     "member": False,
+                    **counters(),
                     "usernameMissing": True,
                 }
             if not await member_of(entity):
@@ -1349,6 +1435,7 @@ async def scan_group(
                     "error": "Аккаунт не в группе — сначала нажмите «Вступить»",
                     "messages": [],
                     "member": False,
+                    **counters(),
                     "title": getattr(entity, "title", None)
                     or getattr(entity, "username", "")
                     or url,
@@ -1394,6 +1481,7 @@ async def scan_group(
                             "title": title,
                             "scanMode": scan_mode,
                             "needDiscussionJoin": True,
+                            **counters(),
                         }
                 async for m in client.iter_messages(linked, limit=fetch_limit):
                     await add_msg(m, kind="discussion", peer_entity=linked)
@@ -1433,7 +1521,7 @@ async def scan_group(
 
     except RPCError as e:
         if is_frozen_rpc(e):
-            return frozen_action_error("скан сообщений")
+            return {**frozen_action_error("скан сообщений"), **counters()}
         raise
 
     return {
@@ -1443,16 +1531,7 @@ async def scan_group(
         "messages": out[: max(limit, 40)],
         "error": "",
         "member": True,
-        "fetched": fetched,
-        "skippedMinus": skipped_minus,
-        "skippedKw": skipped_kw,
-        "skippedNotUser": skipped_not_user,
-        "skippedOld": skipped_old,
-        "minusHits": [
-            [term, n] for term, n in sorted(minus_hits.items(), key=lambda kv: -kv[1])[:MINUS_HITS_REPORTED]
-        ],
-        "newestAt": newest_at.isoformat() if newest_at else "",
-        "oldestAt": oldest_at.isoformat() if oldest_at else "",
+        **counters(),
         "scanMode": scan_mode,
         "discussionId": discussion_id,
         "discussionTitle": discussion_title,

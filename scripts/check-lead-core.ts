@@ -130,6 +130,22 @@ const cases: Case[] = [
     expectTemp: "warm",
   },
   {
+    name: "seller question: stock across cabinets",
+    msg: "Как вы грузите остатки на три кабинета?",
+    expectPass: true,
+    expectTemp: "warm",
+  },
+  {
+    name: "seller question: marketplace name only",
+    msg: "СПП летит в космос, ещё вб кошелёк 3%, как у вас заказы на вб?",
+    expectPass: false,
+  },
+  {
+    name: "question without seller topic",
+    msg: "Нашёл пачку сигарет, нужны кому то??",
+    expectPass: false,
+  },
+  {
     name: "weak plus alone",
     msg: "Цены на товары сегодня странные, срок поставки гуляет",
     expectPass: false,
@@ -154,6 +170,11 @@ const nicheCases: { name: string; msg: string; expectPass: boolean }[] = [
   {
     name: "dental: reject marketplace stock",
     msg: "Ищу сервис для синхронизации остатков WB и МойСклад, готовы на демо",
+    expectPass: false,
+  },
+  {
+    name: "dental: reject marketplace seller question",
+    msg: "Как вы грузите остатки на три кабинета?",
     expectPass: false,
   },
 ];

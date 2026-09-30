@@ -1,10 +1,10 @@
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
-import {LEAD_ID,OWNER,SETTINGS_ID,addRecord,login,postRequest,resetWorkspace,testDb} from './helpers/workspace-harness';
+import {LEAD_ID,OWNER,SETTINGS_ID,addRecord,login,postRequest,resetWorkspace,testDb} from './helpers/workspace-api-harness';
 
-vi.mock('cloudflare:workers',async()=>(await import('./helpers/workspace-harness')).cfModule);
+vi.mock('cloudflare:workers',async()=>(await import('./helpers/workspace-api-harness')).cfModule);
 vi.mock('@/lib/auth',async(importOriginal)=>({
   ...await importOriginal<typeof import('@/lib/auth')>(),
-  getSessionUser:async()=>(await import('./helpers/workspace-harness')).authState.user,
+  getSessionUser:async()=>(await import('./helpers/workspace-api-harness')).authState.user,
 }));
 
 import {POST} from '@/app/api/workspace/route';
@@ -51,6 +51,9 @@ function stubAi(content:Record<string,unknown>){
 const POLLUTED_MINUS='вакансия, казино, остатков, озон, селлер, склад, подскажите, нал, бот, синхронизации';
 
 const NOISY='Здравствуйте! Подскажите бот склад остатков озон селлерам маркетплейсов синхронизации, казино рулетка казино рулетка';
+
+/** Ordinary chat of a rejected lead: every word is generic, a date or a shard — nothing to learn. */
+const CHATTER='Здравствуйте, ребята! Пишите в личку, скину список карточек и фото. Почему решили, что корова способна? Тариф лучше с сентября 2026 года';
 
 describe('workspace API: auto-learning keeps product words out of stop-lists',()=>{
   beforeEach(()=>{
@@ -118,6 +121,38 @@ describe('workspace API: auto-learning keeps product words out of stop-lists',()
     const body=await res.json() as {minusAdded:string[];minusSkippedAsProduct:number};
     expect(body.minusAdded).toEqual([]);
     expect(body.minusSkippedAsProduct).toBeGreaterThan(0);
+  });
+
+  it('reject_lead_stopwords learns no generic chat words, shards or message clips',async()=>{
+    testDb().sqlite.prepare('UPDATE records SET data=? WHERE id=?').run(JSON.stringify({name:'L',message:CHATTER,status:'new'}),LEAD_ID);
+
+    const res=await POST(postRequest({action:'reject_lead_stopwords',id:LEAD_ID}));
+
+    const body=await res.json() as {minusAdded:string[]};
+    expect(body.minusAdded).toEqual([]);
+    expect(storedSettings().minusKeywords).toBe('вакансия');
+  });
+
+  it('reject_lead_stopwords keeps only off-topic words and phrases from the AI answer',async()=>{
+    testDb().sqlite.prepare('UPDATE records SET data=? WHERE id=?').run(JSON.stringify({name:'L',message:CHATTER,status:'new'}),LEAD_ID);
+    stubAi({minus:['список','личку','почему решили','корова способна','2026 года','крипта','разведение коров']});
+
+    const res=await POST(postRequest({action:'reject_lead_stopwords',id:LEAD_ID}));
+
+    const body=await res.json() as {minusAdded:string[]};
+    expect(body.minusAdded).toEqual(['крипта','разведение коров']);
+    expect(storedSettings().minusKeywords).toBe('крипта, разведение коров, вакансия');
+  });
+
+  it('train_from_ignored learns no frequent generic words',async()=>{
+    for(let i=0;i<4;i++){
+      addRecord(`88888888-8888-4888-8888-88888888888${i}`,'lead',{name:'L',message:CHATTER,status:'new',excludeFromTraining:true});
+    }
+
+    const res=await POST(postRequest({action:'train_from_ignored'}));
+
+    expect(res.status).toBe(200);
+    expect(storedSettings().minusKeywords).toBe('вакансия');
   });
 
   it('preview_lead_core sanitizes a polluted stop-list at read time',async()=>{

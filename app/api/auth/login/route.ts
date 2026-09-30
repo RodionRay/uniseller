@@ -75,7 +75,7 @@ export async function POST(req: Request) {
     if (!email || !password) return reply({ error: BAD_CREDENTIALS }, 401);
 
     const limit = await consumeRateLimits([
-      [RATE_LIMITS.loginPerIp, trustedClientIp(req) ?? "unknown"],
+      [RATE_LIMITS.loginPerIp, trustedClientIp(req)],
       [RATE_LIMITS.loginPerEmail, email],
     ]);
     if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);

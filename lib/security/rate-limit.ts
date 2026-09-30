@@ -87,13 +87,18 @@ export async function consumeRateLimit(
   return { allowed: count <= rule.limit, retryAfterSec: Math.max(1, expires - nowSec) };
 }
 
-/** First rule that is exceeded wins; all rules are counted. */
+/**
+ * First rule that is exceeded wins; all rules are counted. A null subject
+ * (e.g. no trusted client IP) skips that rule: one shared bucket for every
+ * unidentified client would let a single abuser lock everyone out.
+ */
 export async function consumeRateLimits(
-  checks: ReadonlyArray<readonly [RateLimitRule, string]>,
+  checks: ReadonlyArray<readonly [RateLimitRule, string | null]>,
   nowMs = Date.now(),
 ): Promise<RateLimitResult> {
   let blocked: RateLimitResult | null = null;
   for (const [rule, subject] of checks) {
+    if (subject === null) continue;
     const result = await consumeRateLimit(rule, subject, nowMs);
     if (!result.allowed && !blocked) blocked = result;
   }

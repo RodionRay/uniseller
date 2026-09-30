@@ -89,7 +89,7 @@ export async function POST(req: Request) {
       if (!owner) {
         const quota = await consumeRateLimits([
           [RATE_LIMITS.assistantAnonGlobal, "all"],
-          [RATE_LIMITS.assistantAnonPerIp, trustedClientIp(req) ?? "unknown"],
+          [RATE_LIMITS.assistantAnonPerIp, trustedClientIp(req)],
         ]);
         if (!quota.allowed) return tooManyRequests(quota.retryAfterSec);
       }

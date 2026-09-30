@@ -134,6 +134,40 @@ describe("login and register rate limits", () => {
     expect(res.status).toBe(429);
   });
 
+  it("does not lump clients without a trusted IP into one shared bucket", async () => {
+    const statuses: number[] = [];
+    for (let i = 0; i < 25; i++) {
+      const res = await login(
+        new Request("https://app.test/api/auth/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ email: `noip-${i}@example.com`, password: "x" }),
+        }),
+      );
+      statuses.push(res.status);
+    }
+    expect(statuses.every((s) => s === 401)).toBe(true);
+  });
+
+  it("ignores cf-connecting-ip when TRUSTED_IP_HEADER=none", async () => {
+    vi.stubEnv("TRUSTED_IP_HEADER", "none");
+    try {
+      const statuses: number[] = [];
+      for (let i = 0; i < 25; i++) {
+        const res = await post(
+          login,
+          "/api/auth/login",
+          { email: `spoof-${i}@example.com`, password: "x" },
+          "203.0.113.77",
+        );
+        statuses.push(res.status);
+      }
+      expect(statuses.every((s) => s === 401)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("limits registrations per IP", async () => {
     const ip = "203.0.113.50";
     const statuses: number[] = [];

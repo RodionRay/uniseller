@@ -192,6 +192,62 @@ describe("per-account lease (REQ-B1)", () => {
   });
 });
 
+describe("scan_group worker funnel", () => {
+  it("echoes the worker skip counters so a 0-lead scan shows which filter dropped everything", async () => {
+    mockWorker(() => ({
+      ok: true,
+      messages: [],
+      fetched: 197,
+      skippedMinus: 150,
+      skippedKw: 40,
+      skippedNotUser: 7,
+      skippedOld: 3,
+      newestAt: "2026-06-01T10:00:00+00:00",
+      oldestAt: "2026-05-01T10:00:00+00:00",
+      minusHits: [["штраф", 90], ["карточки", 60]],
+    }));
+    await seedAccount(sqlite());
+    insertRecord(sqlite(), {
+      id: GROUP_ID,
+      owner: OWNER,
+      kind: "group",
+      data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "joined" },
+    });
+    const res = await POST(post({ action: "scan_group", id: GROUP_ID, force: true }));
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      ok: true,
+      fetched: 197,
+      skippedMinus: 150,
+      skippedKw: 40,
+      skippedNotUser: 7,
+      skippedOld: 3,
+      newestAt: "2026-06-01T10:00:00+00:00",
+      oldestAt: "2026-05-01T10:00:00+00:00",
+      minusHits: [["штраф", 90], ["карточки", 60]],
+      funnel: { fetched: 197, skippedOld: 3, skippedMinus: 150, skippedKw: 40, skippedNotUser: 7, worker: 0 },
+    });
+    const log = (readData(sqlite(), GROUP_ID)!.scanLog as { text: string }[]).at(-1)!.text;
+    expect(log).toContain("старые 3 · минус 150");
+  });
+
+  it("reports zero counters when an older worker omits them", async () => {
+    mockWorker(() => ({ ok: true, messages: [] }));
+    await seedAccount(sqlite());
+    insertRecord(sqlite(), {
+      id: GROUP_ID,
+      owner: OWNER,
+      kind: "group",
+      data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "joined" },
+    });
+    const body = (await (await POST(post({ action: "scan_group", id: GROUP_ID, force: true }))).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(body).toMatchObject({ skippedOld: 0, skippedMinus: 0, skippedKw: 0, skippedNotUser: 0, newestAt: "", minusHits: [] });
+  });
+});
+
 describe("worker check contract (refreshedSession / flood)", () => {
   it("re-seals refreshed session material for the owner and sends accountId", async () => {
     const bodies: Record<string, unknown>[] = [];

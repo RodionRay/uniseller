@@ -1101,6 +1101,7 @@ async def join_group(client, url: str, peer_hint: dict | None = None) -> dict[st
 MIN_MINUS_TERM_LENGTH = 3
 MAX_MINUS_TERM_LENGTH = 100
 MAX_MINUS_TERMS = 120
+MINUS_HITS_REPORTED = 15
 
 
 @dataclass(frozen=True)
@@ -1205,6 +1206,12 @@ async def scan_group(
     skipped_minus = 0
     skipped_kw = 0
     skipped_not_user = 0
+    skipped_old = 0
+    # Date span of fetched messages: shows a dead chat when every message falls behind the depth cutoff.
+    newest_at: datetime | None = None
+    oldest_at: datetime | None = None
+    # Which stop term dropped how many messages: an over-broad minus word shows up at the top.
+    minus_hits: dict[str, int] = {}
     seen_msg: set[str] = set()
     scan_mode = "group"
     discussion_id = ""
@@ -1227,7 +1234,7 @@ async def scan_group(
         return True
 
     async def add_msg(m, *, kind: str, peer_entity) -> None:
-        nonlocal fetched, skipped_minus, skipped_not_user
+        nonlocal fetched, skipped_minus, skipped_not_user, skipped_old, newest_at, oldest_at
         text = (getattr(m, "message", None) or "").strip()
         if len(text) < 3:
             return
@@ -1235,14 +1242,19 @@ async def scan_group(
         if mid and mid in seen_msg:
             return
         fetched += 1
-        if cutoff and getattr(m, "date", None):
+        if getattr(m, "date", None):
             md = m.date
             if md.tzinfo is None:
                 md = md.replace(tzinfo=timezone.utc)
-            if md < cutoff:
+            newest_at = md if newest_at is None or md > newest_at else newest_at
+            oldest_at = md if oldest_at is None or md < oldest_at else oldest_at
+            if cutoff and md < cutoff:
+                skipped_old += 1
                 return
-        if find_minus_hit(text, minus) or find_minus_hit(text, AD_MARKERS):
+        minus_hit = find_minus_hit(text, minus) or find_minus_hit(text, AD_MARKERS)
+        if minus_hit:
             skipped_minus += 1
+            minus_hits[minus_hit] = minus_hits.get(minus_hit, 0) + 1
             return
         if not passes_kw(text):
             return
@@ -1435,6 +1447,12 @@ async def scan_group(
         "skippedMinus": skipped_minus,
         "skippedKw": skipped_kw,
         "skippedNotUser": skipped_not_user,
+        "skippedOld": skipped_old,
+        "minusHits": [
+            [term, n] for term, n in sorted(minus_hits.items(), key=lambda kv: -kv[1])[:MINUS_HITS_REPORTED]
+        ],
+        "newestAt": newest_at.isoformat() if newest_at else "",
+        "oldestAt": oldest_at.isoformat() if oldest_at else "",
         "scanMode": scan_mode,
         "discussionId": discussion_id,
         "discussionTitle": discussion_title,

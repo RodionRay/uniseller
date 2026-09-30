@@ -2539,6 +2539,16 @@ export async function POST(req:Request){const session=await getSessionUser();con
    }
    const cutoff=Date.now()-scanDepthDays*24*60*60*1000;
    const workerRaw=Array.isArray(result.messages)?result.messages.length:0;
+   // Worker-side drops (check_account.py::scan_group): without them a 0-lead scan cannot tell minus from keywords.
+   const fetched=Number(result.fetched)||workerRaw;
+   const skippedMinus=Number(result.skippedMinus)||0;
+   const skippedKw=Number(result.skippedKw)||0;
+   const skippedNotUser=Number(result.skippedNotUser)||0;
+   const skippedOld=Number(result.skippedOld)||0;
+   const newestAt=String(result.newestAt||'');
+   const oldestAt=String(result.oldestAt||'');
+   const minusHits=Array.isArray(result.minusHits)?result.minusHits.slice(0,15).map((h:any)=>[String(h?.[0]||'').slice(0,100),Number(h?.[1])||0]):[];
+   const workerSkips=`старые ${skippedOld} · минус ${skippedMinus} · ключи ${skippedKw} · не люди ${skippedNotUser}`;
    let candidates=(result.messages||[]).filter((msg:any)=>{
     if(msg.date){
      const t=Date.parse(msg.date);
@@ -2713,8 +2723,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
      gdata.scanLog,
      added?'ok':'info',
      added
-      ?`Переобход · +${added} · ${String(result.scanMode||'chat')} · worker ${workerRaw} → ядро ${prefilterCount} → AI/match ${candidates.length}${aiUsed?' · AI':''}`
-      :`Переобход · 0 · ${String(result.scanMode||'chat')} · worker ${workerRaw} → ядро ${prefilterCount} → AI/match ${candidates.length}${aiUsed?' · AI':''}`,
+      ?`Переобход · +${added} · ${String(result.scanMode||'chat')} · fetch ${fetched} (${workerSkips}) → worker ${workerRaw} → ядро ${prefilterCount} → AI/match ${candidates.length}${aiUsed?' · AI':''}`
+      :`Переобход · 0 · ${String(result.scanMode||'chat')} · fetch ${fetched} (${workerSkips}) → worker ${workerRaw} → ядро ${prefilterCount} → AI/match ${candidates.length}${aiUsed?' · AI':''}`,
      50,
     ),
    };
@@ -2727,14 +2737,21 @@ export async function POST(req:Request){const session=await getSessionUser();con
    return reply({
     ok:true,
     scanned:(result.messages||[]).length,
-    fetched:Number(result.fetched)||(result.messages||[]).length,
+    fetched,
+    skippedOld,
+    skippedMinus,
+    skippedKw,
+    skippedNotUser,
+    newestAt,
+    oldestAt,
+    minusHits,
     workerRaw,
     prefilter:prefilterCount,
     matched:candidates.length,
     added,
     addedByTemp,
     aiUsed,
-    funnel:{worker:workerRaw,core:prefilterCount,matched:candidates.length,added},
+    funnel:{fetched,skippedOld,skippedMinus,skippedKw,skippedNotUser,worker:workerRaw,core:prefilterCount,matched:candidates.length,added},
     title:result.title||gdata.name,
     metrics:{leadsTotal,leadsHot:counts.hot,leadsWarm:counts.warm,leadsCold:counts.cold,rating,lastScanned:groupNext.lastScanned},
     taskLog:groupNext.scanLog,

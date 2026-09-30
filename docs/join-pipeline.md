@@ -108,3 +108,13 @@ clean list (`blindDeferPatch`), never marked dead — a really blind farm must n
 already in the tried list the group is marked dead at once (small farms); when untried accounts exist but
 are capped/paused the group is deferred (`409 {deferred:true}`, retried in 30 min) — never reported as a
 farm-wide limit.
+
+## Scan funnel diagnostics
+
+`telegram-worker/src/check_account.py::scan_group` counts every fetched message it drops: `skippedOld` (older than
+`scanDepthDays`), `skippedMinus` (stop terms + `AD_MARKERS`), `skippedKw` (no plus word / intent marker),
+`skippedNotUser` (channel / bot authors), plus `newestAt` / `oldestAt` of the fetched span and `minusHits` (top
+`MINUS_HITS_REPORTED` = 15 stop terms with their drop counts). `app/api/workspace/route.ts` `scan_group` echoes them
+in the reply and in `funnel`, and writes `fetch N (старые · минус · ключи · не люди)` into the group scan log, so a
+0-lead scan names the filter that emptied it (e2e 2026-09-30: @wbofficialchat — newest message 2025-09-10, all 197
+`skippedOld`; «Ozon | Чат поставщиков» — `личку` alone dropped 68 of 93 fresh messages).

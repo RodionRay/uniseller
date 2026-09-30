@@ -217,6 +217,44 @@ describe("worker check contract (refreshedSession / flood)", () => {
     });
   });
 
+  describe("logged-out session", () => {
+    const PROXY_A = "66666666-6666-4666-8666-666666666666";
+    const PROXY_B = "77777777-7777-4777-8777-777777777777";
+    const DEAD_SESSION_TEXT = "Сессия недействительна — tdata разлогинена, нужен свежий аккаунт";
+
+    beforeEach(async () => {
+      for (const [id, host] of [
+        [PROXY_A, "1.2.3.4"],
+        [PROXY_B, "5.6.7.8"],
+      ]) {
+        insertRecord(sqlite(), {
+          id,
+          owner: OWNER,
+          kind: "proxy",
+          data: { host, port: 1080, protocol: "socks5", status: "active", telegramOk: true },
+        });
+      }
+      await seedAccount(sqlite(), ACCOUNT_ID, { proxyId: PROXY_A });
+    });
+
+    it.each([
+      ["unauthorized status", { ok: false, status: "unauthorized", error: "Сессия больше не действительна" }],
+      [
+        "older worker crash on TDesktopUnauthorized",
+        { ok: false, status: "disconnected", error: "Ошибка воркера (TDesktopUnauthorized)" },
+      ],
+    ])("%s: no proxy rotation, account marked unauthorized", async (_label, answer) => {
+      const calls = mockWorker(() => answer);
+      const res = await POST(post({ action: "check_account", id: ACCOUNT_ID }));
+
+      expect(calls).toEqual(["/check-account"]);
+      expect(await res.json()).toMatchObject({ result: { ok: false, status: "unauthorized" } });
+      const data = readData(sqlite(), ACCOUNT_ID)!;
+      expect(data).toMatchObject({ status: "unauthorized", proxyId: PROXY_A });
+      expect(String(data.error)).toContain(DEAD_SESSION_TEXT);
+    });
+  });
+
   it("flood sets cooldownUntil and does not mark the account dead", async () => {
     mockWorker(() => ({ ok: false, status: "flood", waitSec: 120, error: "FloodWait 120" }));
     await seedAccount(sqlite());

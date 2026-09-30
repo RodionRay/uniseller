@@ -1,22 +1,32 @@
 import { NextResponse } from "next/server";
-import { sessionCookieName, sessionCookieOptions } from "@/lib/auth";
+import {
+  safeRelativeReturnPath,
+  sessionCookieName,
+  sessionCookieOptions,
+} from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
-function safeReturnTo(value: string | null): string {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "/";
-  return value;
-}
-
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const returnTo = safeReturnTo(url.searchParams.get("return_to"));
-  const response = NextResponse.redirect(new URL(returnTo, url.origin), 302);
+function clearSession(response: NextResponse): NextResponse {
   response.cookies.set(sessionCookieName(), "", {
     ...sessionCookieOptions(0),
     maxAge: 0,
   });
   return response;
+}
+
+/**
+ * GET stays because the cabinet header logs out via a plain link
+ * (app/app/page.tsx). The target is always an on-site relative path.
+ */
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const returnTo = safeRelativeReturnPath(
+    url.searchParams.get("return_to") || "/",
+  );
+  return clearSession(
+    NextResponse.redirect(new URL(returnTo, url.origin), 302),
+  );
 }
 
 export async function POST(req: Request) {
@@ -28,13 +38,7 @@ export async function POST(req: Request) {
       { status: 403 },
     );
   }
-  const response = NextResponse.json(
-    { ok: true },
-    { headers: { "Cache-Control": "no-store" } },
+  return clearSession(
+    NextResponse.json({ ok: true }, { headers: { "Cache-Control": "no-store" } }),
   );
-  response.cookies.set(sessionCookieName(), "", {
-    ...sessionCookieOptions(0),
-    maxAge: 0,
-  });
-  return response;
 }

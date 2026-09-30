@@ -7,11 +7,14 @@ import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { UniLabLogo } from "@/components/marketing/logo";
+import { safeRelativeReturnPath } from "@/lib/security/return-path";
 
 function safeReturnTo(value: string | null): string {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "/app";
-  if (value.startsWith("/login") || value.startsWith("/register")) return "/app";
-  return value;
+  const safe = safeRelativeReturnPath(value || "/app");
+  if (safe === "/" || safe.startsWith("/login") || safe.startsWith("/register")) {
+    return "/app";
+  }
+  return safe;
 }
 
 const ERRORS: Record<string, string> = {

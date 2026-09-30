@@ -1,5 +1,8 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { safeRelativeReturnPath } from "@/lib/security/return-path";
+
+export { safeRelativeReturnPath };
 
 export type SessionUser = {
   userId: string;
@@ -182,27 +185,6 @@ export async function verifyPasswordHash(
   const actual = Buffer.from(await deriveKey(password, salt, iterations));
   if (expected.length !== actual.length) return false;
   return timingSafeEqualBytes(expected, actual);
-}
-
-export function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
-  try {
-    const url = new URL(value, "https://app.local");
-    if (url.origin !== "https://app.local") return "/";
-    if (
-      url.pathname === LOGIN_PATH ||
-      url.pathname === "/register" ||
-      url.pathname === LOGOUT_PATH ||
-      url.pathname === "/signin-with-chatgpt" ||
-      url.pathname === "/signout-with-chatgpt" ||
-      url.pathname === "/callback"
-    ) {
-      return "/app";
-    }
-    return `${url.pathname}${url.search}${url.hash}`;
-  } catch {
-    return "/";
-  }
 }
 
 async function sign(payload: string): Promise<string> {

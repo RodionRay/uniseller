@@ -1,20 +1,16 @@
 #!/usr/bin/env npx tsx
-/** Заливает verified GROUP_CATALOG в .data/uniseller.sqlite (owner=local_seedy). */
+/**
+ * Заливает verified GROUP_CATALOG в локальную D1 (owner=SEED_OWNER, по умолчанию local_seedy).
+ * Usage: npm run db:migrate && npm run seed:tgstat-catalog   (D1_PERSIST_DIR, по умолчанию .wrangler/state)
+ */
 import Database from 'better-sqlite3';
 import {randomUUID} from 'node:crypto';
-import {join} from 'node:path';
 import {GROUP_CATALOG, catalogStats} from '../lib/group-catalog';
+import {locateD1File} from './wrangler-local.mjs';
 
-const dbPath = join(process.env.DATA_DIR?.trim() || join(process.cwd(), '.data'), 'uniseller.sqlite');
-const db = new Database(dbPath);
-db.exec(`CREATE TABLE IF NOT EXISTS records (
-  id text PRIMARY KEY NOT NULL,
-  owner text NOT NULL,
-  kind text NOT NULL,
-  data text NOT NULL,
-  secret text,
-  created text NOT NULL
-)`);
+// The records table comes from drizzle migrations (npm run db:migrate), not from this script.
+const dbPath: string = locateD1File();
+const db = new Database(dbPath, {fileMustExist: true});
 
 const owner = process.env.SEED_OWNER?.trim() || 'local_seedy';
 const existing = db.prepare("SELECT data FROM records WHERE owner=? AND kind='group'").all(owner) as {data: string}[];

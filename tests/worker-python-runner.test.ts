@@ -3,9 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  ACCOUNT_MAX_OUTPUT_BYTES,
+  COLLECT_MAX_OUTPUT_BYTES,
+  DEFAULT_MAX_OUTPUT_BYTES,
   accountKey,
+  childEnv,
   createProcessLimiter,
   startPython,
+  stdoutCapFor,
   sweepStaleWorkDirs,
 } from "../telegram-worker/src/python-runner.mjs";
 import { writeFakePython } from "./worker-fake-python";
@@ -56,7 +61,10 @@ describe("startPython", () => {
 
   it("survives a child that exits before reading a large stdin (EPIPE)", async () => {
     process.env.FAKE_PY_CRASH = "1";
-    const h = run({ mode: "echo", blob: "a".repeat(4 * 1024 * 1024) });
+    const h = run(
+      { mode: "echo", blob: "a".repeat(4 * 1024 * 1024) },
+      { envPassthrough: ["FAKE_PY_CRASH"] },
+    );
     const result = await h.result;
     await h.exited;
     expect(result.ok).toBe(false);
@@ -95,6 +103,64 @@ describe("startPython", () => {
   });
 });
 
+describe("startPython cancel", () => {
+  it("answers at once, stops the child and removes the work dir", async () => {
+    const h = run({ mode: "hang" }, { killGraceMs: 300 });
+    await new Promise((r) => setTimeout(r, 100));
+    h.cancel();
+    expect(await h.result).toMatchObject({ ok: false, error: "Запрос отменён клиентом" });
+    await h.exited;
+    expect(readdirSync(tempRoot)).toEqual([]);
+  });
+});
+
+describe("childEnv", () => {
+  const source = {
+    PATH: "/bin",
+    HOME: "/home/w",
+    LC_ALL: "C.UTF-8",
+    PYTHONPATH: "/opt/lib",
+    SESSION_SECRET: "s",
+    ENCRYPTION_KEY: "e",
+    TG_WORKER_TOKEN: "t",
+    CRON_SECRET: "c",
+    GITHUB_CLIENT_SECRET: "g",
+    ADMIN_PASSWORD_HASH: "h",
+    CUSTOM: "x",
+  };
+
+  it("keeps only the interpreter allowlist plus the work dir", () => {
+    expect(childEnv(source, "/tmp/w")).toEqual({
+      PATH: "/bin",
+      HOME: "/home/w",
+      LC_ALL: "C.UTF-8",
+      PYTHONPATH: "/opt/lib",
+      PYTHONUNBUFFERED: "1",
+      UNISELLER_WORK_DIR: "/tmp/w",
+    });
+  });
+
+  it("adds explicitly passed-through names only", () => {
+    expect(childEnv(source, "/tmp/w", ["CUSTOM"])).toHaveProperty("CUSTOM", "x");
+  });
+});
+
+describe("stdoutCapFor", () => {
+  it("keeps the configured cap for check_proxy", () => {
+    expect(stdoutCapFor("check_proxy", {}, DEFAULT_MAX_OUTPUT_BYTES)).toBe(DEFAULT_MAX_OUTPUT_BYTES);
+  });
+
+  it("allows a re-packed session archive on account actions", () => {
+    expect(stdoutCapFor("send", {}, DEFAULT_MAX_OUTPUT_BYTES)).toBe(ACCOUNT_MAX_OUTPUT_BYTES);
+    const zipBase64 = "A".repeat(6 * 1024 * 1024);
+    expect(stdoutCapFor("check", { zipBase64 })).toBeGreaterThan(2 * zipBase64.length);
+  });
+
+  it("gives collect the audience cap", () => {
+    expect(stdoutCapFor("collect", {})).toBe(COLLECT_MAX_OUTPUT_BYTES);
+  });
+});
+
 describe("createProcessLimiter", () => {
   function sleeper(trackDir: string, accountId: string, ms = 250) {
     return () => run({ mode: "sleep", trackDir, accountId, ms });
@@ -129,6 +195,34 @@ describe("createProcessLimiter", () => {
     expect((await first).ok).toBe(true);
     expect(await second).toMatchObject({ ok: false, error: "Запрос отменён до запуска" });
   });
+});
+
+describe("createProcessLimiter abort of a started process", () => {
+  it("kills it with killOnAbort and runs the next request of the account", async () => {
+    const limiter = createProcessLimiter(1);
+    const abort = new AbortController();
+    const first = limiter.run("id:a", () => run({ mode: "hang" }, { killGraceMs: 300 }), abort.signal, {
+      killOnAbort: true,
+    });
+    const second = limiter.run("id:a", () => run({ mode: "echo", action: "scan" }));
+    await new Promise((r) => setTimeout(r, 100));
+    abort.abort();
+    expect(await first).toMatchObject({ ok: false, error: "Запрос отменён клиентом" });
+    expect(await second).toMatchObject({ ok: true, action: "scan" });
+  });
+
+  it("leaves a started process running without killOnAbort", async () => {
+    const limiter = createProcessLimiter(1);
+    const abort = new AbortController();
+    const first = limiter.run("id:a", sleeperEcho(), abort.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    abort.abort();
+    expect(await first).toMatchObject({ ok: true });
+  });
+
+  function sleeperEcho() {
+    return () => run({ mode: "sleep", trackDir: join(tempRoot, "s"), accountId: "a", ms: 200 });
+  }
 });
 
 describe("accountKey", () => {

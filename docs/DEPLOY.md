@@ -35,11 +35,23 @@ openssl rand -hex 32        # → CRON_SECRET
 **`ENCRYPTION_KEY` сохранить отдельно от сервера** (менеджер паролей). Бэкап базы без ключа бесполезен:
 пароли прокси, ключи и сессии в ней зашифрованы.
 
-`TELEGRAM_WORKER_URL`, `HOST`, `D1_PERSIST_DIR` и `APP_URL` воркера задаются в `docker-compose.yml`
-и перекрывают `.env`. Переменные воркера (необязательные): `TG_WORKER_CONCURRENCY` (4),
-`TG_WORKER_KILL_GRACE_MS`, `TG_WORKER_MAX_OUTPUT_BYTES`, `TG_WORKER_PYTHON`, `TG_WORKER_SCRIPT`,
-`AUTO_RESCAN_EVERY_MS`. `TG_WORKER_ALLOW_NO_TOKEN=1` в продакшене не ставить: без `TG_WORKER_TOKEN`
-воркер не запустится.
+`TELEGRAM_WORKER_URL`, `HOST`, `D1_PERSIST_DIR` задаются в `docker-compose.yml` и перекрывают `.env`.
+
+`web` читает весь `.env`. **Воркер `.env` целиком не получает** (он разбирает чужие `tdata`): compose
+передаёт ему только `TG_WORKER_TOKEN`, `CRON_SECRET` (без них `docker compose` откажется стартовать),
+`APP_URL=http://web:5173` (cron ходит по сети compose, не через публичный домен) и необязательные
+`TG_WORKER_CONCURRENCY` (4), `AUTO_RESCAN_EVERY_MS` (300000), `TG_WORKER_KILL_GRACE_MS`,
+`TG_WORKER_MAX_OUTPUT_BYTES`, `TG_WORKER_TIMEOUT_MS`. Новую переменную для воркера нужно добавить в
+`environment:` сервиса `worker`. Python-процесс получает ещё меньше: только окружение интерпретатора
+(`PATH`, `HOME`, `LANG`/`LC_*`, `TMPDIR`, `PYTHON*`, `SSL_CERT_*`) и каталог сессии; дополнительные имена —
+через `TG_WORKER_PYTHON_ENV=ИМЯ1,ИМЯ2` (`telegram-worker/src/python-runner.mjs::childEnv`).
+`TG_WORKER_ALLOW_NO_TOKEN=1` в продакшене не ставить: без `TG_WORKER_TOKEN` воркер не запустится.
+
+Лимиты воркера (`telegram-worker/src/python-runner.mjs`): не больше `TG_WORKER_CONCURRENCY` Python-процессов,
+запросы одного аккаунта идут по очереди; stdout — 1 МиБ для проверки прокси, для действий с аккаунтом —
+не меньше 8 МиБ (ответ может содержать перепакованный архив сессии), для сбора аудитории — 32 МиБ.
+Если приложение оборвало запрос, воркер убивает уже запущенный процесс только для чтения (проверка,
+скан, сбор аудитории, входящие); отправка, инвайт и вступление доживают до своего таймаута.
 
 ## 3. Запуск
 ```sh
@@ -61,7 +73,8 @@ sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
 sudo sed -i 's/leads.example.com/ВАШ-ДОМЕН/' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
-Сертификат выпускается автоматически. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
+Сертификат выпускается автоматически. `Caddyfile` отвечает `404` на `/api/cron/*` снаружи: cron вызывает
+только воркер внутри сети compose; `/api/health` остаётся доступным. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
 `https://ВАШ-ДОМЕН/api/auth/<google|yandex|vk>/callback` — приложение строит его из `APP_URL`.
 
 ## 5. Бэкап и восстановление
@@ -106,5 +119,10 @@ docker compose logs --since 1h worker
 docker compose exec web node scripts/d1-migrate.mjs      # повторно применить миграции
 journalctl -u caddy -f
 ```
+Служебные скрипты работают с тем же sqlite-файлом D1 (`scripts/wrangler-local.mjs::locateD1File`,
+учитывают `D1_PERSIST_DIR`): `npm run heal:joinstate` — разовая починка битых `joinStateError` в группах,
+`npm run seed:tgstat-catalog` — залить проверенный каталог групп владельцу `SEED_OWNER` (только локально,
+после `npm run db:migrate`). В контейнере: `docker compose exec web npm run heal:joinstate`.
+
 Перенос существующей локальной базы на сервер: `npm run build && node scripts/d1-backup.mjs` локально
 (после `npm run db:baseline && npm run db:migrate`, см. README), затем восстановление (раздел 5) с этим файлом.

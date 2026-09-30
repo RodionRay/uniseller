@@ -1,7 +1,7 @@
 // Shared runner for the local-D1 wrangler commands (start, migrate, baseline, backup).
 // D1 lives in a persist dir: `.wrangler/state` for local dev, `/data/wrangler` in Docker.
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +11,26 @@ const wranglerBin = path.join(projectRoot, "node_modules/wrangler/bin/wrangler.j
 
 export function persistDir() {
   return path.resolve(projectRoot, process.env.D1_PERSIST_DIR?.trim() || ".wrangler/state");
+}
+
+/** Directory where miniflare keeps the D1 sqlite (file name = hash of database_id). */
+export function d1SqliteDir(root = persistDir()) {
+  return path.join(root, "v3/d1/miniflare-D1DatabaseObject");
+}
+
+/** The one D1 sqlite file under the persist dir; throws when missing or ambiguous. */
+export function locateD1File(root = persistDir()) {
+  const dir = d1SqliteDir(root);
+  let files;
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".sqlite") && f !== "metadata.sqlite");
+  } catch {
+    files = [];
+  }
+  if (files.length !== 1) {
+    throw new Error(`Expected exactly one D1 sqlite file in ${dir}, found: ${files.sort().join(", ") || "none"}`);
+  }
+  return path.join(dir, files[0]);
 }
 
 export function assertBuilt() {

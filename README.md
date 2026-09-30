@@ -10,7 +10,11 @@
 - **Группы и лиды**: вступление в группы (`lib/processes/join-flow.ts`), сканирование сообщений и отбор
   лидов (`lib/processes/scan-flow.ts`, `lib/lead-*.ts`), AI-черновики ответов и отправка после подтверждения.
 - **Рассылки и инвайты**: `lib/processes/mailing-tick.ts`, `lib/processes/invite-tick.ts`, сбор аудитории.
-- **Автообход**: воркер каждые 5 минут вызывает `POST /api/cron/auto-rescan` (Bearer `CRON_SECRET`).
+- **Автообход**: воркер каждые 5 минут вызывает `POST /api/cron/auto-rescan` (Bearer `CRON_SECRET`);
+  в продакшене — по сети compose, снаружи Caddy закрывает `/api/cron/*`.
+- **Воркер**: один Python-процесс на запрос, лимит параллельных процессов, очередь на аккаунт, таймауты
+  SIGTERM → SIGKILL; Python получает только окружение интерпретатора, без секретов приложения;
+  FloodWait возвращается как `status: "flood"` + `waitSec` (инвайт пока — `status: "floodwait"` + `flood`).
 - **Вход**: email + пароль, Google / Яндекс / VK OAuth, Telegram Login; администратор из env.
   Самостоятельная регистрация закрыта, пока `REGISTRATION_OPEN` не равен `true`
   (это касается и новых пользователей через OAuth/Telegram). Вход ограничен: 10 неудачных попыток на пару
@@ -48,8 +52,12 @@ npm run db:migrate                 # применит оставшиеся (0002
 Резервную копию перед этим — `node scripts/d1-backup.mjs` (см. `docs/DEPLOY.md`).
 
 ## Проверки
-`npm run lint` · `npx tsc --noEmit` · `npx vitest run` · `npm run build` · `npm audit --audit-level=high`
-— то же выполняет CI (`.github/workflows/ci.yml`).
+`npm run lint` · `npx tsc --noEmit` · `npx vitest run` ·
+`python3 -m unittest discover -s telegram-worker/tests` (без Telethon) · `npm run build` ·
+`npm audit --audit-level=high` — то же выполняет CI (`.github/workflows/ci.yml`).
+
+Служебные скрипты локальной D1 (`D1_PERSIST_DIR`, по умолчанию `.wrangler/state`):
+`node scripts/d1-backup.mjs`, `npm run heal:joinstate`, `npm run seed:tgstat-catalog` (см. `docs/DEPLOY.md`).
 
 ## Развёртывание
 Один Linux VPS, `docker compose` (web + worker), Caddy для HTTPS, ежедневный бэкап D1:

@@ -103,6 +103,52 @@ class ClassifyErrorTest(unittest.TestCase):
         self.assertEqual(out, {"ok": False, "status": "disconnected", "error": "boom", "messages": []})
 
 
+class FloodResultTest(unittest.TestCase):
+    def test_flood_result_has_status_wait_and_legacy_field(self) -> None:
+        out = ca.flood_result(FloodWaitError(45), join="flood")
+        self.assertEqual(out["status"], "flood")
+        self.assertEqual(out["waitSec"], 45)
+        self.assertEqual(out["floodWait"], 45)
+        self.assertEqual(out["join"], "flood")
+        self.assertFalse(out["ok"])
+
+    def test_invite_flood_keeps_legacy_status_and_adds_flood_flag(self) -> None:
+        out = ca.invite_flood_result(FloodWaitError(90), results=[{"ok": True}], title="G")
+        self.assertEqual(out["status"], "floodwait")
+        self.assertTrue(out["flood"])
+        self.assertEqual(out["waitSec"], 90)
+        self.assertEqual(out["floodWait"], 90)
+        self.assertEqual(out["results"], [{"ok": True}])
+        self.assertEqual(out["title"], "G")
+
+
+class SendRpcErrorResultTest(unittest.TestCase):
+    def test_flood_wait_class_is_flood_with_wait(self) -> None:
+        out = ca.send_rpc_error_result(FloodWaitError(30))
+        self.assertEqual((out["status"], out["waitSec"]), ("flood", 30))
+
+    def test_rpc_text_mentioning_flood_is_not_a_flood_wait(self) -> None:
+        out = ca.send_rpc_error_result(BadRequestError("CHAT_FLOOD_PROTECTION_ENABLED"))
+        self.assertNotEqual(out.get("status"), "flood")
+        self.assertNotIn("waitSec", out)
+
+    def test_peer_flood_is_spamblock(self) -> None:
+        out = ca.send_rpc_error_result(PeerFloodError("PEER_FLOOD"))
+        self.assertEqual(out["status"], "spamblock")
+        self.assertIn("PEER_FLOOD", out["error"])
+        self.assertNotIn("waitSec", out)
+
+    def test_frozen_method_is_frozen(self) -> None:
+        self.assertEqual(ca.send_rpc_error_result(FloodError("FROZEN_METHOD_INVALID"))["status"], "frozen")
+
+    def test_write_forbidden_is_spamblock(self) -> None:
+        self.assertEqual(ca.send_rpc_error_result(BadRequestError("CHAT_WRITE_FORBIDDEN"))["status"], "spamblock")
+
+    def test_other_rpc_error_has_no_status(self) -> None:
+        out = ca.send_rpc_error_result(BadRequestError("MESSAGE_EMPTY"))
+        self.assertEqual(out, {"ok": False, "error": "MESSAGE_EMPTY (caused by SomeRequest)"})
+
+
 def _zip_b64(files: dict[str, bytes]) -> str:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:

@@ -5,7 +5,8 @@ import { join } from "node:path";
 /**
  * Фейковый «python» для тестов воркера: node-скрипт с тем же контрактом
  * (payload JSON в stdin, последняя строка stdout — JSON-ответ).
- * Режим — payload.mode; FAKE_PY_CRASH=1 — выход до чтения stdin.
+ * Режим — payload.mode; FAKE_PY_CRASH=1 — выход до чтения stdin
+ * (воркер пропускает его в дочерний env только через TG_WORKER_PYTHON_ENV).
  */
 const FAKE_SOURCE = String.raw`
 import { writeFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
@@ -35,6 +36,15 @@ process.stdin.on("end", async () => {
   } else if (mode === "no-json") {
     process.stderr.write("Traceback: kaboom\n");
     process.exit(1);
+  } else if (mode === "refreshed") {
+    const zipBase64 = "A".repeat(p.size || 0);
+    console.log(JSON.stringify({ ok: true, sessionRefreshed: true, refreshedSession: { zipBase64 } }));
+  } else if (mode === "env") {
+    console.log(JSON.stringify({ ok: true, env: process.env }));
+  } else if (mode === "hang-track") {
+    mkdirSync(p.trackDir, { recursive: true });
+    writeFileSync(join(p.trackDir, "pid"), String(process.pid));
+    setInterval(() => {}, 1000);
   } else if (mode === "sleep") {
     const dir = p.trackDir;
     mkdirSync(dir, { recursive: true });

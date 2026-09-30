@@ -14,6 +14,7 @@ import {
   createProcessLimiter,
   DEFAULT_MAX_OUTPUT_BYTES,
   startPython,
+  stdoutCapFor,
   sweepStaleWorkDirs,
 } from "./python-runner.mjs";
 import { nextCatchUpDelayMs } from "./auto-rescan-policy.mjs";
@@ -60,8 +61,11 @@ const CONCURRENCY = Number(process.env.TG_WORKER_CONCURRENCY || 4);
 const MAX_STDOUT_BYTES = Number(
   process.env.TG_WORKER_MAX_OUTPUT_BYTES || DEFAULT_MAX_OUTPUT_BYTES,
 );
-/** Сбор аудитории отдаёт список участников — у больших групп это мегабайты. */
-const MAX_COLLECT_STDOUT_BYTES = Math.max(MAX_STDOUT_BYTES, 32 * 1_048_576);
+/** Доп. имена переменных для Python-процесса (кроме базового allowlist в python-runner). */
+const PYTHON_ENV_PASSTHROUGH = (process.env.TG_WORKER_PYTHON_ENV || "")
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
 const KILL_GRACE_MS = Number(process.env.TG_WORKER_KILL_GRACE_MS || 5_000);
 const SWEEP_EVERY_MS = 5 * 60_000;
 
@@ -211,6 +215,12 @@ const ROUTES = {
   "/upload-photo": "upload_photo",
 };
 
+/**
+ * Только чтение: если приложение ушло, процесс можно убить. Отправку/инвайт/вступление
+ * не прерываем — Telegram мог уже выполнить действие; слот освободит их таймаут.
+ */
+const KILL_ON_ABORT = new Set(["check", "check_proxy", "scan", "collect", "inbox"]);
+
 function timeoutFor(action) {
   if (process.env.TG_WORKER_TIMEOUT_MS) return Number(process.env.TG_WORKER_TIMEOUT_MS);
   if (action === "check") return 28_000;
@@ -231,9 +241,11 @@ function runAction(payload, signal) {
         payload,
         timeoutMs: timeoutFor(action),
         killGraceMs: KILL_GRACE_MS,
-        maxStdoutBytes: action === "collect" ? MAX_COLLECT_STDOUT_BYTES : MAX_STDOUT_BYTES,
+        maxStdoutBytes: stdoutCapFor(action, payload, MAX_STDOUT_BYTES),
+        envPassthrough: PYTHON_ENV_PASSTHROUGH,
       }),
     signal,
+    { killOnAbort: KILL_ON_ABORT.has(action) },
   );
 }
 

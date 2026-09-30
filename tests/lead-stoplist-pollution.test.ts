@@ -1,6 +1,6 @@
 import {describe,expect,it} from 'vitest';
 import {findMinusHit} from '@/lib/lead-filter';
-import {MAX_LEARNED_MINUS_TERMS,learnableMinusTerms,scanStopTerms,type StopListSettings} from '@/lib/lead-stopwords';
+import {MAX_LEARNED_MINUS_TERMS,learnableMinusTerms,sanitizeMinusTerms,scanStopTerms,type StopListSettings} from '@/lib/lead-stopwords';
 
 const SETTINGS:StopListSettings={
   keywords:'остатки, синхронизация, МойСклад, несколько кабинетов',
@@ -58,8 +58,8 @@ describe('learnableMinusTerms: auto-learning adds only phrases and clearly off-t
   });
 
   it('learns off-topic single words and topic phrases',()=>{
-    expect(learnableMinusTerms(['крипта','USDT','казино','вакансии','ставки на спорт','продажа коров'],SETTINGS))
-      .toEqual(['крипта','USDT','казино','вакансии','ставки на спорт','продажа коров']);
+    expect(learnableMinusTerms(['крипта','USDT','казино','вакансии','ставки на спорт','разведение коров'],SETTINGS))
+      .toEqual(['крипта','USDT','казино','вакансии','ставки на спорт','разведение коров']);
   });
 
   it('keeps product words out even as phrases',()=>{
@@ -102,5 +102,61 @@ describe('default junk survives product-text overlap',()=>{
 
   it('learning keeps them',()=>{
     expect(learnableMinusTerms(DEFAULT_JUNK,overlapping)).toEqual(DEFAULT_JUNK);
+  });
+});
+
+describe('seller-operations and pain vocabulary is never a stop term (uncapped)',()=>{
+  const OPS=[
+    'поставки','контроль','вручную','excel','ошибка','проблема','приемка','считать прибыль','устал считать',
+    'чистая прибыль по артикулу','остаток','заказы','склад','прибыль','выручка','себестоимость','отчет',
+  ];
+
+  it.each([['empty settings',{}],['product settings',SETTINGS]] as const)('scanStopTerms drops them with %s',(_label,settings)=>{
+    expect(scanStopTerms({...settings,minusKeywords:OPS.join(', ')})).toEqual([]);
+  });
+
+  it('sanitizer drops them before the 120 cap, so cleanup scripts remove them too',()=>{
+    const filler=Array.from({length:150},(_,i)=>`казино${i}`);
+    expect(sanitizeMinusTerms([...filler,...OPS],{})).toEqual(filler);
+  });
+
+  it('auto-learning rejects them',()=>{
+    expect(learnableMinusTerms(OPS,{})).toEqual([]);
+  });
+});
+
+describe('sub-phrases of buyer requests are not stop terms',()=>{
+  const SHARDS=['пользуется mpstats','пользуетесь сервисом','посоветуйте программу','какой тариф','тариф брать'];
+
+  it('read time drops them',()=>{
+    expect(scanStopTerms({minusKeywords:SHARDS.join(', ')})).toEqual([]);
+  });
+
+  it('the request they came from passes the list',()=>{
+    const list=scanStopTerms({minusKeywords:[...SHARDS,'usdt'].join(', ')});
+    expect(findMinusHit('Кто пользуется MPstats подскажите какой тариф лучше брать',list)).toBe('');
+  });
+});
+
+describe('generic single words are dropped',()=>{
+  it.each(['решили','будут','существуют','лично','сеть'])('%s',(word)=>{
+    expect(scanStopTerms({minusKeywords:word})).toEqual([]);
+  });
+});
+
+describe('verb-form shards from the 2026-09-30 replay',()=>{
+  it.each(['базовый взять','брать смысл','клиент интересовался','выплат меняли','года направлять','кормить доить','поменять','проверяете'])('drops "%s"',(term)=>{
+    expect(scanStopTerms({minusKeywords:term})).toEqual([]);
+  });
+
+  it('keeps nouns that only look like past tense and real junk phrases',()=>{
+    expect(scanStopTerms({minusKeywords:'канал казино, персонал, ищу водителей, куплю usdt'}))
+      .toEqual(['канал казино','персонал','ищу водителей','куплю usdt']);
+  });
+
+  it('the MPstats request passes the cleaned list',()=>{
+    const list=scanStopTerms({minusKeywords:'брать смысл, смысл базовый, базовый взять, пользуется mpstats, usdt'});
+    expect(list).toEqual(['смысл базовый','usdt']);
+    expect(findMinusHit('Кто пользуется MPstats подскажите какой тариф лучше брать, есть ли смысл просто Базовый взять тариф',list)).toBe('');
   });
 });

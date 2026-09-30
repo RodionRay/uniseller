@@ -72,8 +72,22 @@ const GENERIC_WORDS = new Set([
   "новости", "новость", "клиент", "клиента", "клиенту", "клиенты", "клиентов", "человек", "люди",
   "сообщение", "сообщения", "ссылка", "ссылку", "группа", "группе", "чат", "чате", "канал", "тема",
   "теме", "вопросы", "ответ", "ответы", "оставлять", "оставить", "оставьте", "сегодня", "завтра",
-  "вчера", "сейчас",
+  "вчера", "сейчас", "существует", "существуют", "лично", "личный", "сеть", "сети", "дорого", "дешево", "пока",
 ]);
+
+/**
+ * Seller operations and pain vocabulary (word starts): the words our leads describe their problem
+ * with ("поставки", "вручную", "устал считать прибыль"). A stop term containing one kills leads.
+ */
+const SELLER_OPS_WORD_RE =
+  /^(?:поставк|приемк|остат|склад|заказ|прибыл|выручк|марж|себестоим|артикул|excel|эксел|вручную|ручн|ошибк|проблем|контрол|учет|счит|посчит|подсчет|устал|отчет|выгрузк|синхрон|кабинет|аналитик|продаж|штраф|комисси)/u;
+
+/**
+ * Words of buyer requests: a stop term with one is a shard of a request ("пользуется mpstats" out
+ * of "кто пользуется MPstats, какой тариф брать"), so it drops exactly the leads we look for.
+ */
+const REQUEST_WORD_RE =
+  /^(?:пользу|пользов|посовет|порекоменд|тариф|сервис|crm|срм|программ|инструмент|интеграц|автоматиз)/u;
 
 /**
  * Sentence glue: question words, comparatives, short adjectives, auxiliaries, pronouns. A phrase that
@@ -154,8 +168,20 @@ function protectedVocabulary(settings: StopListSettings): ProtectedVocabulary {
   return { terms, words, stems: new Set([...words].map(stemOf)) };
 }
 
+/**
+ * Verb forms (infinitive, past tense, 2nd person): "брать", "интересовался", "меняли", "проверяете".
+ * Alone they are chatter; inside a two-word term they mark a sentence shard ("базовый взять").
+ */
+// Masculine past ("взял") is left out: it collides with nouns ("канал", "материал", "персонал").
+const VERB_FORM_RE = /(?:[аяеиоу]ть(?:ся)?|[аяеиу]л(?:и|а|ся|ась|ись)|[аяеи]ете)$/u;
+const MIN_VERB_FORM_LENGTH = 4;
+
+function isGlueWord(word: string): boolean {
+  return GLUE_WORDS.has(word) || (word.length >= MIN_VERB_FORM_LENGTH && VERB_FORM_RE.test(word));
+}
+
 function isContentWord(word: string): boolean {
-  if (word.length < MIN_CONTENT_WORD_LENGTH || GENERIC_WORDS.has(word)) return false;
+  if (word.length < MIN_CONTENT_WORD_LENGTH || GENERIC_WORDS.has(word) || isGlueWord(word)) return false;
   return !DATE_WORDS.has(word) && !/^\d+$/u.test(word);
 }
 
@@ -186,8 +212,9 @@ function isKnownJunk(candidate: string, words: readonly string[]): boolean {
 }
 
 /** A request our leads are made of ("ищу crm", "выгрузка остатков") must never become a stop term. */
-function looksLikeLeadRequest(candidate: string): boolean {
-  return hasBuyerIntent(candidate) || hasSoftAsk(candidate) || hasProductFit(candidate);
+function looksLikeLeadRequest(candidate: string, words: readonly string[]): boolean {
+  if (hasBuyerIntent(candidate) || hasSoftAsk(candidate) || hasProductFit(candidate)) return true;
+  return words.some((w) => SELLER_OPS_WORD_RE.test(w) || REQUEST_WORD_RE.test(w));
 }
 
 function rejectsCandidate(candidate: string, vocab: ProtectedVocabulary): boolean {
@@ -197,8 +224,8 @@ function rejectsCandidate(candidate: string, vocab: ProtectedVocabulary): boolea
   // An explicit positive term wins even over known junk.
   if (vocab.terms.some((p) => p.includes(candidate))) return true;
   if (isKnownJunk(candidate, words)) return false;
-  if (looksLikeLeadRequest(candidate)) return true;
-  if (words.length > 1 && words.some((w) => GLUE_WORDS.has(w))) return true;
+  if (looksLikeLeadRequest(candidate, words)) return true;
+  if (words.length > 1 && words.some(isGlueWord)) return true;
   const content = words.filter(isContentWord);
   if (!content.length) return true;
   if (content.length === 1) {

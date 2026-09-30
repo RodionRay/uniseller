@@ -135,13 +135,13 @@ describe('workspace API: auto-learning keeps product words out of stop-lists',()
 
   it('reject_lead_stopwords keeps only off-topic words and phrases from the AI answer',async()=>{
     testDb().sqlite.prepare('UPDATE records SET data=? WHERE id=?').run(JSON.stringify({name:'L',message:CHATTER,status:'new'}),LEAD_ID);
-    stubAi({minus:['список','личку','почему решили','корова способна','2026 года','крипта','продажа коров']});
+    stubAi({minus:['список','личку','почему решили','корова способна','2026 года','крипта','разведение коров']});
 
     const res=await POST(postRequest({action:'reject_lead_stopwords',id:LEAD_ID}));
 
     const body=await res.json() as {minusAdded:string[]};
-    expect(body.minusAdded).toEqual(['крипта','продажа коров']);
-    expect(storedSettings().minusKeywords).toBe('крипта, продажа коров, вакансия');
+    expect(body.minusAdded).toEqual(['крипта','разведение коров']);
+    expect(storedSettings().minusKeywords).toBe('крипта, разведение коров, вакансия');
   });
 
   it('train_from_ignored learns no frequent generic words',async()=>{

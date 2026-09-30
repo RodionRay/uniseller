@@ -82,7 +82,7 @@ import {
 } from '@/lib/audience-invite';
 import {useTableSort} from '@/hooks/useTableSort';
 import type {SortValueType} from '@/lib/table-sort';
-import {ApiError,requestJson,timeoutForAction} from './api-client';
+import {ApiError,busyWaitSec,isForbidden,requestJson,timeoutForAction,waitLabel} from './api-client';
 import {createPollGate} from './poll-gate';
 
 // Разделы и формы задач грузятся отдельными чанками: главный бандл кабинета был ~730 kB.
@@ -578,6 +578,8 @@ function WorkspaceHome(){
   /** Задачи, которые пользователь только что поставил на паузу — poller не трогает до play */
   const pausedTasksRef=useRef(new Set<string>());
   const lastInboxPollAt=useRef(0);
+  /** 403 на set_group_join_state — больше не шлём (UI-состояние остаётся локальным). */
+  const joinStateForbiddenRef=useRef(false);
 
   const refreshStaff=useCallback(async()=>{
     try{
@@ -647,7 +649,9 @@ function WorkspaceHome(){
     const joinStateAt=joinState?new Date().toISOString():'';
     const err=String(joinStateError||'').slice(0,500);
     patchGroupLocal(id,{joinState,joinStateAt,joinStateError:err});
-    try{await api({action:'set_group_join_state',id,joinState,joinStateError:err})}catch{/* сеть — UI уже обновлён */}
+    if(joinStateForbiddenRef.current)return;
+    try{await api({action:'set_group_join_state',id,joinState,joinStateError:err})}
+    catch(e){if(isForbidden(e))joinStateForbiddenRef.current=true/* сеть — UI уже обновлён */}
   }
 
   function setJoinQueueSync(updater:(prev:JoinQItem[])=>JoinQItem[]){
@@ -821,7 +825,12 @@ function WorkspaceHome(){
     // Не наслаиваем тики, притормаживаем в скрытой вкладке и отступаем при сбоях сети/сервера.
     const gate=createPollGate({baseBackoffMs:10_000,maxBackoffMs:120_000,hiddenMinIntervalMs:30_000});
     let failed=false;
-    const track=(e:unknown)=>{if(isTransportFailure(e))failed=true};
+    // 403 (нет доступа к разделу) — тихо прекращаем опрашивать это действие.
+    const forbidden=new Set<string>();
+    const track=(action:string,e:unknown)=>{
+      if(isForbidden(e))forbidden.add(action);
+      else if(isTransportFailure(e))failed=true;
+    };
     const tick=async()=>{
       if(taskPollLock.current||busyRef.current||joinRunnerLock.current||autoRescanLock.current)return;
       if(!gate.tryEnter(Date.now(),document.hidden))return;
@@ -833,22 +842,25 @@ function WorkspaceHome(){
       taskPollLock.current=true;
       try{
         if(runningAudience.length||runningInvite.length||runningMailing.length){
-        for(const t of runningAudience){
+        for(const t of forbidden.has('tick_audience')?[]:runningAudience){
           try{
             const r=await api({action:'tick_audience',id:t.id});
+            // busy/skipped — «попробуйте позже», не затираем задачу устаревшим снимком
+            if(r.skipped||r.busy)continue;
             applyTickTask(t.id,r.task);
             if(r.joined)toast.message(`${displayTgHandle(t.data.url||'')}: вступили в источник`);
             if(r.task?.status==='completed')toast.success(`Сбор завершён: ${displayTgHandle(t.data.url||'')} · ${r.task.collected||0}`);
-          }catch(e){track(e)}
+          }catch(e){track('tick_audience',e)}
         }
-        for(const t of runningInvite){
+        for(const t of forbidden.has('tick_invite')?[]:runningInvite){
           try{
             const r=await api({action:'tick_invite',id:t.id});
+            if(r.skipped||r.busy)continue;
             applyTickTask(t.id,r.task);
             if(r.completed)toast.success(`Инвайт завершён: ${displayTgHandle(t.data.targetUrl||'')}`);
-          }catch(e){track(e)}
+          }catch(e){track('tick_invite',e)}
         }
-        for(const t of runningMailing){
+        for(const t of forbidden.has('tick_mailing')?[]:runningMailing){
           try{
             const r=await api({action:'tick_mailing',id:t.id});
             // skipped/busy — не затираем локальный running устаревшим paused
@@ -859,12 +871,12 @@ function WorkspaceHome(){
             }else if(r.completed){
               toast.success(`Рассылка завершена: ${t.data.name||''} · ${r.task?.sentTotal||0}`);
             }
-          }catch(e){track(e)}
+          }catch(e){track('tick_mailing',e)}
         }
         }
         try{
           // В скрытой вкладке входящие собирает серверный cron — не дублируем.
-          if(!document.hidden&&Date.now()-lastInboxPollAt.current>15_000){
+          if(!forbidden.has('poll_dm_replies')&&!document.hidden&&Date.now()-lastInboxPollAt.current>15_000){
             lastInboxPollAt.current=Date.now();
             const inbox=await api({action:'poll_dm_replies'});
             if(inbox?.opened>0){
@@ -872,7 +884,7 @@ function WorkspaceHome(){
               await refresh();
             }
           }
-        }catch(e){track(e)}
+        }catch(e){track('poll_dm_replies',e)}
       }finally{
         taskPollLock.current=false;
         gate.leave(Date.now(),!failed);
@@ -892,7 +904,7 @@ function WorkspaceHome(){
       const started=await api({action:'start_audience',id});
       if(started.task)replaceTaskData(id,started.task);
       toast.success('Сбор аудитории запущен');
-      void api({action:'tick_audience',id}).then(r=>{applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
+      void api({action:'tick_audience',id}).then(r=>{if(!r.busy&&!r.skipped)applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
   async function pauseAudienceTask(id:string){
@@ -933,7 +945,7 @@ function WorkspaceHome(){
       const started=await api({action:'start_invite',id});
       if(started.task)replaceTaskData(id,started.task);
       toast.success(started.already?'Инвайтинг уже запущен':'Инвайтинг запущен');
-      void api({action:'tick_invite',id}).then(r=>{applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
+      void api({action:'tick_invite',id}).then(r=>{if(!r.busy&&!r.skipped)applyTickTask(id,r.task)}).catch(()=>{/* poller повторит */});
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
   async function pauseInviteTask(id:string){
@@ -968,19 +980,22 @@ function WorkspaceHome(){
       toast.success(started.already?'Рассылка уже запущена':'Рассылка запущена');
       try{
         const r=await api({action:'tick_mailing',id});
-        applyTickTask(id,r.task);
-        if(r.stopped){
-          toast.error(r.task?.error||'Рассылка остановлена — откройте лог');
-          setTaskLog({title:r.task?.name||'Рассылка',log:r.task?.log||[],taskId:id});
-        }else if(r.needAi){
-          toast.message('Ждём AI-тексты для рассылки…');
-        }else if(r.sent){
-          toast.success(`Отправлено: ${r.sent}`);
-        }else if(r.completed){
-          toast.success('Рассылка завершена');
+        // busy/skipped — сервер уже тикает эту задачу, poller подхватит
+        if(!r.busy&&!r.skipped){
+          applyTickTask(id,r.task);
+          if(r.stopped){
+            toast.error(r.task?.error||'Рассылка остановлена — откройте лог');
+            setTaskLog({title:r.task?.name||'Рассылка',log:r.task?.log||[],taskId:id});
+          }else if(r.needAi){
+            toast.message('Ждём AI-тексты для рассылки…');
+          }else if(r.sent){
+            toast.success(`Отправлено: ${r.sent}`);
+          }else if(r.completed){
+            toast.success('Рассылка завершена');
+          }
         }
       }catch(e){
-        toast.error(`Тик рассылки: ${(e as Error).message}`);
+        if(busyWaitSec(e)===null)toast.error(`Тик рассылки: ${(e as Error).message}`);
       }
     }catch(e){toast.error((e as Error).message)}finally{setBusy(false);busyRef.current=false}
   }
@@ -1008,7 +1023,9 @@ function WorkspaceHome(){
       if(attempt>0)await sleep(Math.min(4+attempt*3,12)*1000);
       try{
         const scan=await api({action:'scan_group',id,force:true});
-        return scan;
+        if(!scan?.busy)return scan;
+        // Группу уже сканирует другой процесс: ждём и повторяем; soft → вызывающий оставит membership.
+        lastErr=Object.assign(new Error(`${name}: скан уже идёт`),{data:{soft:true}});
       }catch(e){
         lastErr=e as Error & {data?:any;status?:number};
         const data=(lastErr as any)?.data;
@@ -1048,7 +1065,7 @@ function WorkspaceHome(){
         if(err.data?.farmExhausted||err.data?.limitReached)throw err;
         const wait=Number(err.data?.waitSec||0);
         if(wait>0&&(err.data?.pace||err.data?.flood||err.status===429)){
-          toast.message(`Холд ${Math.ceil(wait/60)} мин — антибан`);
+          toast.message(`Холд ${waitLabel(wait)} — антибан`);
           await holdJoin(Math.min(wait,JOIN_GAP_DEFAULT_SEC+120),id,name||'Группа');
           continue;
         }
@@ -1316,9 +1333,10 @@ function WorkspaceHome(){
   useEffect(()=>{
     if(!telegramConnected||loading)return;
     let cancelled=false;
+    let stopped=false;
     const gate=createPollGate({baseBackoffMs:5*60_000,maxBackoffMs:30*60_000,hiddenMinIntervalMs:15*60_000});
     const heal=async()=>{
-      if(joinRunnerLock.current||busyRef.current)return;
+      if(stopped||joinRunnerLock.current||busyRef.current)return;
       if(!gate.tryEnter(Date.now(),document.hidden))return;
       let ok=true;
       try{
@@ -1332,7 +1350,11 @@ function WorkspaceHome(){
           await refresh();
           void startBackgroundJoins(r.items.map((i:{id:string;name?:string})=>({id:i.id,name:i.name||'Группа'})));
         }
-      }catch(e){ok=!isTransportFailure(e)}
+      }catch(e){
+        // 403: нет доступа к разделу — тихо выключаем автопочинку до перезагрузки.
+        if(isForbidden(e))stopped=true;
+        ok=!isTransportFailure(e);
+      }
       finally{gate.leave(Date.now(),ok)}
     };
     const first=window.setTimeout(()=>{void heal()},8_000);
@@ -1457,11 +1479,18 @@ function WorkspaceHome(){
           void (async()=>{
             try{
               const r=await api({action:'check_account',id:newAccountId,forceUsername:true,ensureUsername:true,rotateProxy:true});
+              if(busyWaitSec(r)!==null||busyWaitSec(r.result)!==null){
+                toast.message('Аккаунт занят другой операцией — ник запишем при следующей проверке');
+                return;
+              }
               const nick=String(r.result?.profile?.username||desiredNick||'').replace(/^@/,'');
               await refresh();
               if(r.result?.ok&&nick)toast.success(`@${nick} записан в Telegram`);
               else if(r.result?.error)toast.error(`Ник не записался: ${String(r.result.error).slice(0,160)}`);
-            }catch(e){toast.error(`Ник не записался: ${(e as Error).message.slice(0,160)}`)}
+            }catch(e){
+              if(busyWaitSec(e)!==null)toast.message('Аккаунт занят другой операцией — ник запишем при следующей проверке');
+              else toast.error(`Ник не записался: ${(e as Error).message.slice(0,160)}`);
+            }
           })();
         }else toast.success(modal.item?.hasSecret?'Аккаунт сохранён в кабинете':'Аккаунт сохранён');
       }else if(modal.kind==='audience_task'){
@@ -1548,7 +1577,9 @@ function WorkspaceHome(){
       );
       setChatText('');
     }catch(e){
-      toast.error((e as Error).message);
+      const wait=busyWaitSec(e);
+      if(wait!==null)toast.message(`Аккаунт занят отправкой — повторите через ${waitLabel(wait)}`);
+      else toast.error((e as Error).message);
       await refresh();
     }finally{setBusy(false)}
   }
@@ -1577,7 +1608,7 @@ function WorkspaceHome(){
       if(!opts?.force&&(busyRef.current||joinRunnerLock.current))break;
       try{
         const r=await api({action:'scan_group',id,force:!!opts?.force});
-        if(r.skipped)continue;
+        if(r.skipped||r.busy)continue;
         if(r.rejoinItem?.id){
           if(r.soft||r.preserved)continue;
           rejoin.push({id:r.rejoinItem.id,name:r.rejoinItem.name||'Группа'});
@@ -2149,12 +2180,23 @@ function WorkspaceHome(){
     }
   }
 
+  function restoreAccountStatus(item:RecordItem){
+    setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,status:item.data.status,error:item.data.error||'',checkingAt:''}}:r));
+  }
+
   async function checkOneAccount(item:RecordItem,opts?:{silent?:boolean;deep?:boolean}){
     if(!opts?.silent)setBusy(true);
     setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,status:'checking',error:'',checkingAt:new Date().toISOString()}}:r));
     try{
       const res=await api({action:'check_account',id:item.id,deep:!!opts?.deep,rotateProxy:true});
-      const result=res.result;
+      const result=res.result??res;
+      const busyWait=busyWaitSec(result)??busyWaitSec(res);
+      if(busyWait!==null){
+        // Аккаунт держит другая операция — это не «отключён»: возвращаем прежний статус.
+        restoreAccountStatus(item);
+        if(!opts?.silent)toast.message(`Аккаунт занят другой операцией — проверьте через ${waitLabel(busyWait)}`);
+        return {ok:false,status:String(item.data.status||''),busy:true};
+      }
       setRecords(prev=>prev.map(r=>{
         if(r.id!==item.id)return r;
         return {...r,data:{
@@ -2172,7 +2214,8 @@ function WorkspaceHome(){
       if(!opts?.silent){
         const st=result?.status||'disconnected';
         const proxyNote=result?.proxyRotated?' · прокси сменён':'';
-        if(st==='active')toast.success(`Активен · ${result?.profile?.username? '@'+result.profile.username : item.data.phone}${proxyNote}${result?.sessionRefreshed?' · сессия обновлена':''}`);
+        if(st==='active'&&result?.flood)toast.message(`Активен, но Telegram просит паузу ${waitLabel(Number(result?.waitSec)||0)} — действия после отлёжки${proxyNote}`);
+        else if(st==='active')toast.success(`Активен · ${result?.profile?.username? '@'+result.profile.username : item.data.phone}${proxyNote}${result?.sessionRefreshed?' · сессия обновлена':''}`);
         else if(st==='cooldown')toast.message(`Отлёжка по лимиту / спамблоку${proxyNote}`);
         else if(st==='disconnected'||st==='proxy_error')toast.error(`Не удалось подключить${proxyNote}. Проверьте прокси и сессию.`);
         else if(st==='unauthorized')toast.error(`Сессия недействительна — загрузите свежий tdata/session${proxyNote}`);
@@ -2180,6 +2223,12 @@ function WorkspaceHome(){
       }
       return result;
     }catch(e){
+      const wait=busyWaitSec(e);
+      if(wait!==null){
+        restoreAccountStatus(item);
+        if(!opts?.silent)toast.message(`Аккаунт занят другой операцией — проверьте через ${waitLabel(wait)}`);
+        return {ok:false,status:String(item.data.status||''),busy:true};
+      }
       setRecords(prev=>prev.map(r=>r.id===item.id?{...r,data:{...r.data,status:'disconnected',error:(e as Error).message,checkingAt:''}}:r));
       if(!opts?.silent)toast.error((e as Error).message);
       return {ok:false,status:'disconnected',error:(e as Error).message};
@@ -2343,6 +2392,11 @@ function WorkspaceHome(){
       if(res.funnel)setLastLeadFunnel(res.funnel);
       else if(res.workerRaw!=null||res.prefilter!=null){
         setLastLeadFunnel({worker:res.workerRaw,core:res.prefilter,matched:res.matched,added:res.added});
+      }
+      const scanWait=busyWaitSec(res);
+      if(scanWait!==null){
+        toast.message(`Скан этой группы уже идёт — повторите через ${waitLabel(scanWait)}`);
+        return;
       }
       if(res.skipped){
         toast.message(res.message||`Скан по настройкам: раз в ${settings?.data.autoRescanMinutes||30} мин`);

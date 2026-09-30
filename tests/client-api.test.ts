@@ -3,8 +3,12 @@ import {
   ApiError,
   DEFAULT_TIMEOUT_MS,
   LONG_TIMEOUT_MS,
+  POLL_DM_TIMEOUT_MS,
+  busyWaitSec,
+  isForbidden,
   requestJson,
   timeoutForAction,
+  waitLabel,
 } from "@/app/app/api-client";
 import { createPollGate } from "@/app/app/poll-gate";
 
@@ -76,10 +80,47 @@ describe("requestJson", () => {
   });
 });
 
+describe("busy / forbidden contract", () => {
+  it("shows a busy 429 without server text as a wait notice", async () => {
+    const err = await catchError(
+      requestJson("/x", {}, { fetchImpl: respond('{"busy":true,"pace":true,"waitSec":30}', 429) }),
+    );
+    expect(err.message).toBe("Аккаунт занят — повторите через 30 с");
+    expect(busyWaitSec(err)).toBe(30);
+  });
+
+  it("reads busy from a 2xx payload (scan_group / tick_*)", () => {
+    expect(busyWaitSec({ ok: true, busy: true, skipped: true, waitSec: 15 })).toBe(15);
+    expect(busyWaitSec({ ok: true, task: {} })).toBeNull();
+    expect(busyWaitSec(null)).toBeNull();
+  });
+
+  it("does not treat a 500 as busy", () => {
+    expect(busyWaitSec(new ApiError("x", "http", 500))).toBeNull();
+  });
+
+  it("detects 403 forbidden", async () => {
+    const err = await catchError(requestJson("/x", {}, { fetchImpl: respond('{"forbidden":true}', 403) }));
+    expect(isForbidden(err)).toBe(true);
+    expect(isForbidden(new ApiError("x", "network"))).toBe(false);
+  });
+
+  it("formats waits in seconds or minutes", () => {
+    expect(waitLabel(0)).toBe("немного");
+    expect(waitLabel(30)).toBe("30 с");
+    expect(waitLabel(125)).toBe("3 мин");
+  });
+});
+
 describe("timeoutForAction", () => {
   it("gives worker-backed actions the long timeout", () => {
     expect(timeoutForAction("scan_group")).toBe(LONG_TIMEOUT_MS);
-    expect(timeoutForAction("poll_dm_replies")).toBe(LONG_TIMEOUT_MS);
+    expect(timeoutForAction("tick_mailing")).toBe(LONG_TIMEOUT_MS);
+  });
+
+  it("gives poll_dm_replies ~100 s to cover the server budget", () => {
+    expect(timeoutForAction("poll_dm_replies")).toBe(POLL_DM_TIMEOUT_MS);
+    expect(POLL_DM_TIMEOUT_MS).toBeGreaterThanOrEqual(95_000);
   });
 
   it("gives CRUD and GET the default timeout", () => {

@@ -54,11 +54,47 @@ const LONG_ACTIONS = new Set([
   'export_audience',
 ]);
 
+/** poll_dm_replies: server budget is up to 90 s per call (2 accounts max). */
+export const POLL_DM_TIMEOUT_MS = 100_000;
+
 export function timeoutForAction(action: unknown): number {
+  if (action === 'poll_dm_replies') return POLL_DM_TIMEOUT_MS;
   return typeof action === 'string' && LONG_ACTIONS.has(action) ? LONG_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 }
 
-function statusMessage(status: number): string {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+/**
+ * "Busy, try later" contract of the workspace API: a 2xx payload with `busy: true`,
+ * or a 409/429 error (account lease, pace, flood). Returns the suggested wait or null.
+ */
+export function busyWaitSec(source: unknown): number | null {
+  if (source instanceof ApiError) {
+    const busy = source.data.busy === true || source.status === 409 || source.status === 429;
+    return busy ? Math.max(0, Number(source.data.waitSec) || 0) : null;
+  }
+  const data = asRecord(source);
+  if (!data || data.busy !== true) return null;
+  return Math.max(0, Number(data.waitSec) || 0);
+}
+
+export function isForbidden(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 403;
+}
+
+/** Human wait label: "30 с" / "2 мин"; empty wait → "немного". */
+export function waitLabel(sec: number): string {
+  if (!sec) return 'немного';
+  return sec < 60 ? `${Math.ceil(sec)} с` : `${Math.ceil(sec / 60)} мин`;
+}
+
+function statusMessage(status: number, data: Record<string, unknown>): string {
+  const wait = Number(data.waitSec) || 0;
+  if (data.busy === true || ((status === 409 || status === 429) && wait > 0)) {
+    return `Аккаунт занят — повторите через ${waitLabel(wait)}`;
+  }
   if (status === 409) return 'Операция уже выполняется — попробуйте чуть позже';
   if (status === 429) return 'Слишком много запросов — подождите немного';
   if (status === 401) return 'Сессия истекла — войдите снова';
@@ -106,7 +142,7 @@ export async function requestJson<T = Record<string, unknown>>(
   const data = parseBody(text);
   if (!res.ok) {
     const serverMessage = data && typeof data.error === 'string' && data.error ? data.error : '';
-    throw new ApiError(serverMessage || statusMessage(res.status), 'http', res.status, data ?? {});
+    throw new ApiError(serverMessage || statusMessage(res.status, data ?? {}), 'http', res.status, data ?? {});
   }
   if (data === null) {
     throw new ApiError('Сервер вернул некорректный ответ — повторите через минуту', 'parse', res.status);

@@ -1,19 +1,14 @@
 /**
- * Fixed-window throttling backed by the D1 `rate_limits` table (drizzle/0003).
- * Fail-open by design: a missing table or D1 error is logged and never blocks
- * login/contact — availability of sign-in beats the throttle (REQ-C3).
+ * Fixed-window counter store backed by the D1 `rate_limits` table (drizzle/0003).
+ * The store itself is fail-open: a missing table or D1 error is logged and `hit`
+ * answers 0. Policy (rules, subjects, fail-closed handling) lives in
+ * lib/security/rate-limit.ts, the only production caller.
  */
 import type { D1LikeDatabase } from "@/lib/db";
 
 export type RateRule = { max: number; windowMs: number };
 
-/** 10 failed logins per IP+email per 15 minutes, then 429 until the window ends. */
-export const LOGIN_FAILURE_RULE: RateRule = { max: 10, windowMs: 15 * 60_000 };
-/** 30 login attempts per email per hour from any IP: caps password guessing via IP rotation. */
-export const LOGIN_EMAIL_RULE: RateRule = { max: 30, windowMs: 60 * 60_000 };
-/** 5 contact-form submissions per IP per 10 minutes. */
-export const CONTACT_SUBMIT_RULE: RateRule = { max: 5, windowMs: 10 * 60_000 };
-
+/** Rows older than the longest rule window (1 day) are abandoned and safe to drop. */
 const STALE_ROW_MS = 24 * 60 * 60_000;
 
 export type RateLimiter = {
@@ -43,6 +38,15 @@ export function createRateLimiter(
     return row;
   }
 
+  /** Housekeeping only: the attempt is already counted, so a failure must not fail `hit`. */
+  async function dropStaleRows(at: number) {
+    try {
+      await db.prepare("DELETE FROM rate_limits WHERE window_start < ?").bind(at - STALE_ROW_MS).run();
+    } catch (error) {
+      console.error("[rate-limit] stale-row cleanup failed:", (error as Error)?.message ?? error);
+    }
+  }
+
   return {
     async hit(key, rule) {
       const at = now();
@@ -60,13 +64,8 @@ export function createRateLimiter(
           .bind(key, at, expired, expired)
           .first<{ count: number }>();
         const count = row?.count ?? 1;
-        if (count === 1) {
-          // A new window is rare enough to carry the cleanup of abandoned keys.
-          await db
-            .prepare("DELETE FROM rate_limits WHERE window_start < ?")
-            .bind(at - STALE_ROW_MS)
-            .run();
-        }
+        // A new window is rare enough to carry the cleanup of abandoned keys.
+        if (count === 1) await dropStaleRows(at);
         return count;
       } catch (error) {
         logFailure("hit", error);
@@ -100,19 +99,4 @@ export function createRateLimiter(
       }
     },
   };
-}
-
-/**
- * Client IP as seen by the reverse proxy. Caddy replaces X-Forwarded-For with the
- * real peer (it trusts no upstream proxies by default); the app port is bound to
- * 127.0.0.1, so the header cannot be forged by bypassing Caddy.
- */
-export function clientIp(req: Request): string {
-  const forwarded = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  return (
-    forwarded ||
-    req.headers.get("x-real-ip")?.trim() ||
-    req.headers.get("cf-connecting-ip")?.trim() ||
-    "unknown"
-  );
 }

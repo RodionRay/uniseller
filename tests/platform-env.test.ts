@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   appOrigin,
+  internalAppOrigin,
   isSameOriginRequest,
   registrationOpen,
   validateEnv,
@@ -11,8 +12,8 @@ import { cookieSecure } from "@/lib/auth";
 const VALID: Record<string, string> = {
   ENCRYPTION_KEY: "a".repeat(64),
   SESSION_SECRET: "s".repeat(32),
-  TG_WORKER_TOKEN: "worker-token",
-  CRON_SECRET: "cron-secret",
+  TG_WORKER_TOKEN: "worker-token-".padEnd(40, "w"),
+  CRON_SECRET: "cron-secret-".padEnd(40, "c"),
   APP_URL: "https://leads.example.com",
 };
 
@@ -42,6 +43,11 @@ describe("validateEnv", () => {
       }),
     );
     expect(report.invalid.sort()).toEqual(["APP_URL", "ENCRYPTION_KEY", "SESSION_SECRET"]);
+  });
+
+  it("flags TG_WORKER_TOKEN and CRON_SECRET shorter than 32 characters", () => {
+    const report = validateEnv(reader({ ...VALID, TG_WORKER_TOKEN: "t".repeat(31), CRON_SECRET: "short" }));
+    expect(report.invalid.sort()).toEqual(["CRON_SECRET", "TG_WORKER_TOKEN"]);
   });
 
   it("never echoes values", () => {
@@ -75,6 +81,32 @@ describe("origin helpers", () => {
       headers: { origin: "https://evil.example" },
     });
     expect(isSameOriginRequest(req, reader({ APP_URL: "https://leads.example.com" }))).toBe(false);
+  });
+});
+
+describe("internalAppOrigin", () => {
+  const PUBLIC = { APP_URL: "https://leads.example.com" };
+
+  it("uses INTERNAL_APP_ORIGIN over APP_URL", () => {
+    const read = reader({ ...PUBLIC, INTERNAL_APP_ORIGIN: "http://web:5173/", TG_WORKER_CRON_HTTP_HOSTS: "worker, WEB" });
+    expect(internalAppOrigin(read)).toBe("http://web:5173");
+  });
+
+  it("allows plain http only for loopback or TG_WORKER_CRON_HTTP_HOSTS", () => {
+    expect(internalAppOrigin(reader({ INTERNAL_APP_ORIGIN: "http://127.0.0.1:5173" }))).toBe("http://127.0.0.1:5173");
+    expect(internalAppOrigin(reader({ INTERNAL_APP_ORIGIN: "http://localhost:5173" }))).toBe("http://localhost:5173");
+    expect(internalAppOrigin(reader({ INTERNAL_APP_ORIGIN: "https://app.internal" }))).toBe("https://app.internal");
+    expect(internalAppOrigin(reader({ ...PUBLIC, INTERNAL_APP_ORIGIN: "http://web:5173" }))).toBeNull();
+  });
+
+  it("fails closed on a malformed value instead of falling back", () => {
+    expect(internalAppOrigin(reader({ ...PUBLIC, INTERNAL_APP_ORIGIN: "ftp://web" }))).toBeNull();
+    expect(internalAppOrigin(reader({ ...PUBLIC, INTERNAL_APP_ORIGIN: "not a url" }))).toBeNull();
+  });
+
+  it("falls back to APP_URL when unset, null when neither is set", () => {
+    expect(internalAppOrigin(reader(PUBLIC))).toBe("https://leads.example.com");
+    expect(internalAppOrigin(reader({}))).toBeNull();
   });
 });
 

@@ -31,6 +31,8 @@ const { verifyTelegramAuth } = await import("@/lib/oauth");
 const { POST: cronPost } = await import("@/app/api/cron/auto-rescan/route");
 
 const BOT_TOKEN = "123456:test-bot-token";
+/** The cron route refuses secrets shorter than 32 characters as misconfigured (503). */
+const CRON_SECRET = "cron-secret-value".padEnd(40, "v");
 
 function signTelegram(data: Record<string, string>): string {
   const check = Object.keys(data)
@@ -54,7 +56,7 @@ beforeEach(() => {
   resetHarness();
   compareSpy.calls = 0;
   vi.stubEnv("TELEGRAM_BOT_TOKEN", BOT_TOKEN);
-  vi.stubEnv("CRON_SECRET", "cron-secret-value");
+  vi.stubEnv("CRON_SECRET", CRON_SECRET);
   vi.stubEnv("NODE_ENV", "production");
 });
 afterEach(() => {
@@ -92,10 +94,10 @@ function cronRequest(authorization: string | null) {
 describe("cron bearer compare", () => {
   it.each([
     ["missing header", null],
-    ["wrong secret of equal length", "Bearer cron-secret-valuX"],
+    ["wrong secret of equal length", `Bearer ${CRON_SECRET.slice(0, -1)}X`],
     ["shorter secret", "Bearer cron"],
-    ["longer secret", "Bearer cron-secret-value-and-more"],
-    ["wrong scheme", "Basic cron-secret-value"],
+    ["longer secret", `Bearer ${CRON_SECRET}-and-more`],
+    ["wrong scheme", `Basic ${CRON_SECRET}`],
   ])("rejects %s with 401", async (_label, header) => {
     const res = await cronPost(cronRequest(header));
     expect(res.status).toBe(401);
@@ -104,11 +106,11 @@ describe("cron bearer compare", () => {
   it("rejects everything when no secret is configured", async () => {
     vi.stubEnv("CRON_SECRET", "");
     const res = await cronPost(cronRequest("Bearer "));
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(503);
   });
 
   it("lets the right secret past the auth gate", async () => {
-    const res = await cronPost(cronRequest("Bearer cron-secret-value"));
+    const res = await cronPost(cronRequest(`Bearer ${CRON_SECRET}`));
     expect(res.status).not.toBe(401);
   });
 });

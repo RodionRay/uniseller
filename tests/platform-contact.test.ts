@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestD1 } from "./platform-d1";
-import { CONTACT_SUBMIT_RULE } from "@/lib/rate-limit";
+import { RATE_LIMITS } from "@/lib/security/rate-limit";
 
 const state = vi.hoisted(() => ({ d1: null as unknown }));
 
@@ -22,13 +22,14 @@ const validForm = {
 function contactRequest(body: unknown, ip = "203.0.113.7") {
   return new Request("http://127.0.0.1:5173/api/contact", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-forwarded-for": `${ip}, 10.0.0.1` },
+    headers: { "content-type": "application/json", "x-real-ip": ip },
     body: JSON.stringify(body),
   });
 }
 
 beforeEach(() => {
   vi.stubEnv("APP_URL", "http://127.0.0.1:5173");
+  vi.stubEnv("TRUSTED_IP_HEADER", "x-real-ip");
   vi.stubEnv("CONTACT_BOT_TOKEN", "");
   vi.stubEnv("CONTACT_CHAT_ID", "");
   state.d1 = createTestD1().d1;
@@ -40,11 +41,22 @@ afterEach(() => {
 
 describe("POST /api/contact rate limit", () => {
   it("answers 429 after the per-IP limit and keeps other IPs working", async () => {
-    for (let i = 0; i < CONTACT_SUBMIT_RULE.max; i++) {
+    for (let i = 0; i < RATE_LIMITS.contactPerIp.limit; i++) {
       expect((await submit(contactRequest(validForm))).status).toBe(200);
     }
     expect((await submit(contactRequest(validForm))).status).toBe(429);
     expect((await submit(contactRequest(validForm, "198.51.100.9"))).status).toBe(200);
+  });
+
+  // Without a trusted IP the per-IP rule is skipped; the global ceiling must still hold.
+  it.each([undefined, "none"])("throttles globally when TRUSTED_IP_HEADER=%j", async (value) => {
+    vi.stubEnv("TRUSTED_IP_HEADER", value);
+    for (let i = 0; i < RATE_LIMITS.contactGlobal.limit; i++) {
+      expect((await submit(contactRequest(validForm, `203.0.113.${i % 250}`))).status).toBe(200);
+    }
+    const blocked = await submit(contactRequest(validForm, "198.51.100.9"));
+    expect(blocked.status).toBe(429);
+    expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
   });
 });
 

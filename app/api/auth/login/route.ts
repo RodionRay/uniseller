@@ -9,19 +9,53 @@ import {
   sessionCookieOptions,
   verifyAdminPassword,
   verifyPasswordHash,
+  type SessionPayload,
 } from "@/lib/auth";
+import { trustedClientIp } from "@/lib/security/client-ip";
+import {
+  RATE_LIMITS,
+  consumeRateLimits,
+  resetRateLimit,
+  tooManyRequests,
+} from "@/lib/security/rate-limit";
 import { findUserByEmail } from "@/lib/users";
-import { getDatabase } from "@/lib/db";
 import { isSameOriginRequest } from "@/lib/env";
-import { LOGIN_EMAIL_RULE, LOGIN_FAILURE_RULE, clientIp, createRateLimiter } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
+
+const BAD_CREDENTIALS = "Неверный email или пароль";
 
 function reply(data: unknown, status = 200) {
   return NextResponse.json(data, {
     status,
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+async function signedIn(req: Request, user: SessionPayload) {
+  const response = reply({ ok: true });
+  response.cookies.set(
+    sessionCookieName(),
+    await createSessionToken(user),
+    sessionCookieOptions(undefined, req.url),
+  );
+  return response;
+}
+
+/**
+ * The admin email is resolved against env credentials only, before any DB
+ * lookup, so a DB row with the same email can never shadow the admin.
+ */
+async function resolveUser(email: string, password: string): Promise<SessionPayload | null> {
+  const adminEmail = getAdminEmail();
+  if (adminEmail && email === adminEmail) {
+    if (!adminAuthConfigured() || !(await verifyAdminPassword(password))) return null;
+    return { userId: ADMIN_USER_ID, email: adminEmail, displayName: "Администратор" };
+  }
+  const dbUser = await findUserByEmail(email);
+  if (!dbUser?.passwordHash) return null;
+  if (!(await verifyPasswordHash(password, dbUser.passwordHash))) return null;
+  return { userId: dbUser.id, email: dbUser.email || email, displayName: dbUser.name };
 }
 
 export async function POST(req: Request) {
@@ -39,70 +73,22 @@ export async function POST(req: Request) {
       .trim()
       .toLowerCase();
     const password = String(body.password ?? "");
-    if (!email || !password) {
-      return reply({ error: "Неверный email или пароль" }, 401);
-    }
+    if (!email || !password) return reply({ error: BAD_CREDENTIALS }, 401);
 
-    // Count the attempt atomically BEFORE the slow PBKDF2: a check-then-hit let parallel
-    // requests all pass the check while the first verification was still running.
-    const limiter = createRateLimiter(getDatabase());
-    const throttleKey = `login:${clientIp(req)}:${email}`;
-    const emailKey = `login-email:${email}`;
-    const attempts = await limiter.hit(throttleKey, LOGIN_FAILURE_RULE);
-    const emailAttempts = await limiter.hit(emailKey, LOGIN_EMAIL_RULE);
-    const blocked =
-      attempts > LOGIN_FAILURE_RULE.max
-        ? { key: throttleKey, rule: LOGIN_FAILURE_RULE }
-        : emailAttempts > LOGIN_EMAIL_RULE.max
-          ? { key: emailKey, rule: LOGIN_EMAIL_RULE }
-          : null;
-    if (blocked) {
-      const retryAfter = await limiter.retryAfterSec(blocked.key, blocked.rule);
-      return NextResponse.json(
-        { error: "Слишком много попыток входа. Попробуйте позже." },
-        {
-          status: 429,
-          headers: { "Cache-Control": "no-store", "Retry-After": String(Math.max(1, retryAfter)) },
-        },
-      );
-    }
-    const rejectCredentials = () => reply({ error: "Неверный email или пароль" }, 401);
+    // Counted before the slow password check so parallel guesses cannot race past.
+    const ip = trustedClientIp(req);
+    const guessSubject = ip ? `${email}|${ip}` : email;
+    const limit = await consumeRateLimits([
+      [RATE_LIMITS.loginPerIp, ip],
+      [RATE_LIMITS.loginPerEmailIp, guessSubject],
+      [RATE_LIMITS.loginPerEmail, email],
+    ]);
+    if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
 
-    const dbUser = await findUserByEmail(email);
-    if (dbUser?.passwordHash) {
-      if (!(await verifyPasswordHash(password, dbUser.passwordHash))) {
-        return rejectCredentials();
-      }
-      await limiter.reset(throttleKey);
-      const token = await createSessionToken({
-        userId: dbUser.id,
-        email: dbUser.email || email,
-        displayName: dbUser.name,
-      });
-      const response = reply({ ok: true });
-      response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-      return response;
-    }
-
-    const expected = getAdminEmail();
-    if (
-      adminAuthConfigured() &&
-      expected &&
-      email === expected &&
-      (await verifyAdminPassword(password))
-    ) {
-      const token = await createSessionToken({
-        userId: ADMIN_USER_ID,
-        email: expected,
-        displayName: "Администратор",
-      });
-      await limiter.reset(throttleKey);
-      const response = reply({ ok: true });
-      response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-      return response;
-    }
-
-    return rejectCredentials();
+    const user = await resolveUser(email, password);
+    if (!user) return reply({ error: BAD_CREDENTIALS }, 401);
+    await resetRateLimit(RATE_LIMITS.loginPerEmailIp, guessSubject);
+    return signedIn(req, user);
   } catch {
     return reply({ error: "Не удалось выполнить вход" }, 503);
   }

@@ -1,9 +1,13 @@
 import { NextResponse } from "next/server";
 import { database } from "@/lib/server-store";
-import { getDatabase } from "@/lib/db";
 import { isSameOriginRequest, readEnv } from "@/lib/env";
-import { CONTACT_SUBMIT_RULE, clientIp, createRateLimiter } from "@/lib/rate-limit";
 import { contactTasks } from "@/components/marketing/content";
+import { trustedClientIp } from "@/lib/security/client-ip";
+import {
+  RATE_LIMITS,
+  consumeRateLimits,
+  tooManyRequests,
+} from "@/lib/security/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -39,11 +43,12 @@ export async function POST(req: Request) {
   if (!isSameOriginRequest(req)) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
   }
-  const limiter = createRateLimiter(getDatabase());
-  if ((await limiter.hit(`contact:${clientIp(req)}`, CONTACT_SUBMIT_RULE)) > CONTACT_SUBMIT_RULE.max) {
-    return reply({ error: "Слишком много заявок. Попробуйте через несколько минут." }, 429);
-  }
   try {
+    const limit = await consumeRateLimits([
+      [RATE_LIMITS.contactPerIp, trustedClientIp(req)],
+      [RATE_LIMITS.contactGlobal, "all"],
+    ]);
+    if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
     const body = (await req.json()) as Record<string, string>;
     const name = String(body.name ?? "").trim().slice(0, 80);
     const email = String(body.email ?? "").trim().toLowerCase().slice(0, 120);

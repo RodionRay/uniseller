@@ -355,6 +355,9 @@ export async function clearAllStaff(workspaceOwnerId: string): Promise<{
   };
 }
 
+const ALREADY_IN_OTHER_WORKSPACE =
+  "Вы уже состоите в другом кабинете. Сначала выйдите из него.";
+
 export async function acceptInvite(input: {
   token: string;
   userId: string;
@@ -376,47 +379,73 @@ export async function acceptInvite(input: {
     )
     .bind(invite.workspaceOwnerId, input.userId)
     .first();
-  if (existing) {
-    await database()
-      .prepare(
-        "UPDATE workspace_invites SET accepted_by=?, accepted_at=? WHERE id=?",
-      )
-      .bind(input.userId, new Date().toISOString(), invite.id)
-      .run();
-    return { ok: true, ownerId: invite.workspaceOwnerId };
+  if (!existing) {
+    const other = await database()
+      .prepare("SELECT id FROM workspace_members WHERE user_id=? LIMIT 1")
+      .bind(input.userId)
+      .first();
+    if (other) return { ok: false, error: ALREADY_IN_OTHER_WORKSPACE };
   }
 
-  const other = await database()
-    .prepare("SELECT id FROM workspace_members WHERE user_id=? LIMIT 1")
-    .bind(input.userId)
-    .first();
-  if (other)
-    return {
-      ok: false,
-      error: "Вы уже состоите в другом кабинете. Сначала выйдите из него.",
-    };
-
+  // Claim the invite atomically before creating the membership: of two concurrent
+  // accepts only one UPDATE can see accepted_by IS NULL.
   const now = new Date().toISOString();
-  await database()
-    .prepare(
-      `INSERT INTO workspace_members
-       (id,workspace_owner_id,user_id,role,access,created)
-       VALUES (?,?,?,?,?,?)`,
-    )
-    .bind(
-      crypto.randomUUID(),
-      invite.workspaceOwnerId,
-      input.userId,
-      invite.role,
-      JSON.stringify(invite.access),
-      now,
-    )
-    .run();
-  await database()
-    .prepare(
-      "UPDATE workspace_invites SET accepted_by=?, accepted_at=? WHERE id=?",
-    )
-    .bind(input.userId, now, invite.id)
-    .run();
+  if (!(await claimInvite(invite.id, input.userId, now)))
+    return { ok: false, error: "Приглашение уже использовано" };
+  if (existing) return { ok: true, ownerId: invite.workspaceOwnerId };
+
+  // The pre-check above is advisory: two accepts into different workspaces can both
+  // pass it. The guarded INSERT is one statement, so only one membership can land.
+  let inserted: boolean;
+  try {
+    const r = await database()
+      .prepare(
+        `INSERT INTO workspace_members
+         (id,workspace_owner_id,user_id,role,access,created)
+         SELECT ?,?,?,?,?,?
+         WHERE NOT EXISTS (SELECT 1 FROM workspace_members WHERE user_id=?)`,
+      )
+      .bind(
+        crypto.randomUUID(),
+        invite.workspaceOwnerId,
+        input.userId,
+        invite.role,
+        JSON.stringify(invite.access),
+        now,
+        input.userId,
+      )
+      .run();
+    inserted = (r.meta?.changes || 0) > 0;
+  } catch (error) {
+    await releaseInvite(invite.id, input.userId);
+    throw error;
+  }
+  if (!inserted) {
+    await releaseInvite(invite.id, input.userId);
+    return { ok: false, error: ALREADY_IN_OTHER_WORKSPACE };
+  }
   return { ok: true, ownerId: invite.workspaceOwnerId };
+}
+
+async function claimInvite(
+  inviteId: string,
+  userId: string,
+  acceptedAt: string,
+): Promise<boolean> {
+  const r = await database()
+    .prepare(
+      "UPDATE workspace_invites SET accepted_by=?, accepted_at=? WHERE id=? AND accepted_by IS NULL",
+    )
+    .bind(userId, acceptedAt, inviteId)
+    .run();
+  return (r.meta?.changes || 0) > 0;
+}
+
+async function releaseInvite(inviteId: string, userId: string): Promise<void> {
+  await database()
+    .prepare(
+      "UPDATE workspace_invites SET accepted_by=NULL, accepted_at=NULL WHERE id=? AND accepted_by=?",
+    )
+    .bind(inviteId, userId)
+    .run();
 }

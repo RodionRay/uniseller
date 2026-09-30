@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestD1 } from "./platform-d1";
-import { LOGIN_EMAIL_RULE, LOGIN_FAILURE_RULE, createRateLimiter } from "@/lib/rate-limit";
+import { createRateLimiter } from "@/lib/rate-limit";
+import { RATE_LIMITS } from "@/lib/security/rate-limit";
+
+vi.mock("cloudflare:workers", () => ({ env: {} }));
+/** Tight guess limit per email + client IP, and the per-email ceiling against IP rotation. */
+const LOGIN_FAILURE_RULE = { max: RATE_LIMITS.loginPerEmailIp.limit };
+const LOGIN_EMAIL_RULE = { max: RATE_LIMITS.loginPerEmail.limit };
 
 const state = vi.hoisted(() => ({
   d1: null as unknown,
@@ -23,7 +29,8 @@ const { hashPassword } = await import("@/lib/auth");
 function jsonRequest(path: string, body: unknown, ip = "203.0.113.7") {
   return new Request(`http://127.0.0.1:5173${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-forwarded-for": `${ip}, 10.0.0.1` },
+    // The proxy in front overwrites X-Real-IP; X-Forwarded-For is client-controlled and ignored.
+    headers: { "content-type": "application/json", "x-real-ip": ip, "x-forwarded-for": `198.18.0.1, 10.0.0.1` },
     body: JSON.stringify(body),
   });
 }
@@ -31,6 +38,7 @@ function jsonRequest(path: string, body: unknown, ip = "203.0.113.7") {
 beforeEach(async () => {
   vi.stubEnv("SESSION_SECRET", "s".repeat(40));
   vi.stubEnv("APP_URL", "http://127.0.0.1:5173");
+  vi.stubEnv("TRUSTED_IP_HEADER", "x-real-ip");
   state.d1 = createTestD1().d1;
   state.users.clear();
   state.users.set("owner@example.com", {
@@ -54,6 +62,20 @@ describe("POST /api/auth/register", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("set-cookie")).toContain("uniseller_session=");
   });
+
+  // Without a trusted IP the per-IP rule is skipped; the global ceiling must still hold.
+  it.each([undefined, "none"])("throttles sign-ups globally when TRUSTED_IP_HEADER=%j", async (value) => {
+    vi.stubEnv("REGISTRATION_OPEN", "true");
+    vi.stubEnv("TRUSTED_IP_HEADER", value);
+    const signUp = (i: number) =>
+      register(jsonRequest("/api/auth/register", { email: `u${i}@b.co`, password: "12345678" }, `203.0.113.${i % 250}`));
+    for (let i = 0; i < RATE_LIMITS.registerGlobal.limit; i++) {
+      expect((await signUp(i)).status).toBe(200);
+    }
+    const blocked = await signUp(RATE_LIMITS.registerGlobal.limit);
+    expect(blocked.status).toBe(429);
+    expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
+  }, 60_000);
 });
 
 describe("POST /api/auth/login throttle", () => {
@@ -106,18 +128,19 @@ describe("POST /api/auth/login throttle", () => {
     expect(blocked.status).toBe(429);
     const otherEmail = await login(jsonRequest("/api/auth/login", { ...wrong, email: "x@example.com" }, "192.0.2.1"));
     expect(otherEmail.status).toBe(401);
-  });
+  }, 60_000);
 });
 
 describe("rate limiter window", () => {
+  const RULE = { max: 10, windowMs: 15 * 60_000 };
   it("opens again once the window has passed", async () => {
     let now = 1_000_000;
     const limiter = createRateLimiter(createTestD1().d1, () => now);
-    for (let i = 0; i < LOGIN_FAILURE_RULE.max; i++) await limiter.hit("k", LOGIN_FAILURE_RULE);
-    expect(await limiter.isLimited("k", LOGIN_FAILURE_RULE)).toBe(true);
-    now += LOGIN_FAILURE_RULE.windowMs + 1;
-    expect(await limiter.isLimited("k", LOGIN_FAILURE_RULE)).toBe(false);
-    expect(await limiter.hit("k", LOGIN_FAILURE_RULE)).toBe(1);
+    for (let i = 0; i < RULE.max; i++) await limiter.hit("k", RULE);
+    expect(await limiter.isLimited("k", RULE)).toBe(true);
+    now += RULE.windowMs + 1;
+    expect(await limiter.isLimited("k", RULE)).toBe(false);
+    expect(await limiter.hit("k", RULE)).toBe(1);
   });
 
   it("fails open when the table is missing", async () => {
@@ -125,8 +148,8 @@ describe("rate limiter window", () => {
     sqlite.exec("DROP TABLE rate_limits");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const limiter = createRateLimiter(d1);
-    expect(await limiter.hit("k", LOGIN_FAILURE_RULE)).toBe(0);
-    expect(await limiter.isLimited("k", LOGIN_FAILURE_RULE)).toBe(false);
+    expect(await limiter.hit("k", RULE)).toBe(0);
+    expect(await limiter.isLimited("k", RULE)).toBe(false);
     expect(warn).toHaveBeenCalled();
   });
 });

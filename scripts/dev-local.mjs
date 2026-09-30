@@ -9,11 +9,65 @@ import { spawn, execFileSync } from "node:child_process";
 import { createServer } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, chmodSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { computeWorkerVersion } from "../telegram-worker/src/version.mjs";
+import { workerReuseVerdict } from "./dev-worker-reuse.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKER_SERVICE = "uniseller-tg-worker";
+
+/** Values from .env (not exported to process.env — the apps read .env themselves). */
+function readDotEnv() {
+  const path = join(root, ".env");
+  const out = {};
+  if (!existsSync(path)) return out;
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#") || !t.includes("=")) continue;
+    const i = t.indexOf("=");
+    out[t.slice(0, i).trim()] = t.slice(i + 1).trim().replace(/^(["'])(.*)\1$/, "$2");
+  }
+  return out;
+}
+
+/**
+ * The worker refuses to start without TG_WORKER_TOKEN and cron needs CRON_SECRET.
+ * Missing ones get a random per-run value shared by web and worker (never written to .env).
+ */
+function resolveSharedSecrets() {
+  const fileEnv = readDotEnv();
+  const secrets = {};
+  const generated = [];
+  let allFromDotEnv = true;
+  for (const key of ["TG_WORKER_TOKEN", "CRON_SECRET"]) {
+    const value = process.env[key] || fileEnv[key];
+    if (!process.env[key] && fileEnv[key]) {
+      secrets[key] = value;
+      continue;
+    }
+    allFromDotEnv = false;
+    if (value) {
+      secrets[key] = value;
+    } else {
+      secrets[key] = randomBytes(32).toString("hex");
+      generated.push(key);
+    }
+  }
+  return { secrets, generated, allFromDotEnv };
+}
+
+/** SQLite files hold sealed secrets and PII; keep them owner-only (best-effort). */
+function tightenDataFilePerms() {
+  const dir = join(root, process.env.DATA_DIR || readDotEnv().DATA_DIR || ".data");
+  try {
+    for (const name of readdirSync(dir)) {
+      if (/\.sqlite/.test(name)) chmodSync(join(dir, name), 0o600);
+    }
+  } catch {
+    /* no data dir yet */
+  }
+}
 
 export const STABLE_UPTIME_MS = 60_000;
 export const MAX_FAST_FAILURES = 10;
@@ -73,9 +127,10 @@ async function waitPortFree(port, label, tries = 40) {
   return false;
 }
 
-async function fetchHealth(port) {
+async function fetchHealth(port, token) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(1200),
     });
     return res.ok ? await res.json() : null;
@@ -102,6 +157,12 @@ async function main() {
   const workerAppUrl = (process.env.APP_URL || `http://127.0.0.1:${webPort}`).replace(/\/$/, "");
   const children = new Set();
   let shuttingDown = false;
+  const { secrets: sharedSecrets, generated: generatedSecrets, allFromDotEnv } = resolveSharedSecrets();
+  /**
+   * The web app runs in Miniflare, which sees only .env unless told to include process env
+   * (verified: wrangler getVarsForDev; process env then overrides empty .env values).
+   */
+  const webRuntimeEnv = allFromDotEnv ? {} : { CLOUDFLARE_INCLUDE_PROCESS_ENV: "true" };
 
   function spawnLogged(name, command, args, opts = {}) {
     const child = spawn(command, args, {
@@ -147,7 +208,7 @@ async function main() {
           onGiveUp();
           return;
         }
-        if (label === "воркер" && code === 0 && (await fetchHealth(workerPort))?.service === WORKER_SERVICE) {
+        if (label === "воркер" && code === 0 && (await fetchHealth(workerPort, sharedSecrets.TG_WORKER_TOKEN))?.service === WORKER_SERVICE) {
           log(`воркер: порт ${workerPort} уже занят другим нашим воркером — переиспользую его`);
           return;
         }
@@ -173,7 +234,7 @@ async function main() {
     }
     log(`Telegram-воркер → http://127.0.0.1:${workerPort}`);
     return spawnLogged("tg", process.execPath, [script], {
-      env: { TG_WORKER_PORT: String(workerPort), APP_URL: workerAppUrl },
+      env: { ...sharedSecrets, TG_WORKER_PORT: String(workerPort), APP_URL: workerAppUrl },
     });
   }
 
@@ -183,9 +244,13 @@ async function main() {
     return spawnLogged(
       "web",
       process.execPath,
-      [runner, "dev", "--host", "127.0.0.1", "--port", String(webPort), ...extraArgs],
+      [runner, "dev", "--hostname", "127.0.0.1", "--port", String(webPort), ...extraArgs],
       {
         env: {
+          ...sharedSecrets,
+          ...webRuntimeEnv,
+          // miniflare Local Explorer = raw SQL on D1 for anyone reaching the port.
+          X_LOCAL_EXPLORER: "false",
           PORT: String(webPort),
           TELEGRAM_WORKER_URL:
             process.env.TELEGRAM_WORKER_URL || `http://127.0.0.1:${workerPort}`,
@@ -216,14 +281,17 @@ async function main() {
       version: computeWorkerVersion(join(root, "telegram-worker/src")),
       appUrl: workerAppUrl,
     };
-    const check = workerHealthMatches(await fetchHealth(workerPort), expected);
-    if (check.ours && check.matches) {
+    const health = await fetchHealth(workerPort, sharedSecrets.TG_WORKER_TOKEN);
+    const check = workerHealthMatches(health, expected);
+    // Only an authorised /health carries autoRescan: without it the worker holds another token.
+    const probe = !check.ours ? "foreign" : health?.autoRescan ? "ours" : "stale";
+    if (check.matches && workerReuseVerdict(probe, generatedSecrets) === "reuse") {
       log(`Telegram-воркер уже на :${workerPort} (версия ${check.version}) — переиспользую`);
       return true;
     }
     if (check.ours) {
       log(
-        `воркер на :${workerPort} устарел (версия ${check.version || "?"} ≠ ${expected.version} или appUrl ${check.appUrl || "?"} ≠ ${expected.appUrl}) — перезапускаю`,
+        `воркер на :${workerPort} устарел (версия ${check.version || "?"} ≠ ${expected.version} или appUrl ${check.appUrl || "?"} ≠ ${expected.appUrl}, или с другими TG_WORKER_TOKEN/CRON_SECRET) — перезапускаю`,
       );
       for (const pid of listeningPids(workerPort)) {
         try {
@@ -246,6 +314,10 @@ async function main() {
     process.exit(1);
   }
 
+  if (generatedSecrets.length) {
+    log(`${generatedSecrets.join(", ")} нет в .env — сгенерированы на этот запуск`);
+  }
+  tightenDataFilePerms();
   if (!reuseWorker) supervise("воркер", startWorker, () => {});
   supervise("кабинет", startWeb, () => shutdown(1));
   log(

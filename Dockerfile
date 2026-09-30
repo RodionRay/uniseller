@@ -22,6 +22,11 @@ ENV NODE_ENV=production \
     D1_PERSIST_DIR=/data/wrangler \
     BACKUP_DIR=/data/backups \
     WRANGLER_SEND_METRICS=false
+# wrangler dev --local passes client-supplied IP headers through, so none is trusted (also the
+# app default when unset; explicit here); see README "Client IP and rate limits".
+ENV TRUSTED_IP_HEADER=none
+# Wrangler 4.92 enables miniflare's Local Explorer (/cdn-cgi/explorer: raw SQL on D1) by default.
+ENV X_LOCAL_EXPLORER=false
 # wrangler (the server) is a devDependency, so node_modules is kept whole.
 COPY --from=web-build --chown=node:node /app /app
 RUN mkdir -p /data && chown node:node /data

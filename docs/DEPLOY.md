@@ -35,20 +35,24 @@ openssl rand -hex 32        # → CRON_SECRET
 **`ENCRYPTION_KEY` сохранить отдельно от сервера** (менеджер паролей). Бэкап базы без ключа бесполезен:
 пароли прокси, ключи и сессии в ней зашифрованы.
 
-`TELEGRAM_WORKER_URL`, `HOST`, `D1_PERSIST_DIR` задаются в `docker-compose.yml` и перекрывают `.env`.
+`TELEGRAM_WORKER_URL`, `INTERNAL_APP_ORIGIN`, `HOST`, `D1_PERSIST_DIR` задаются в `docker-compose.yml` и перекрывают `.env`.
 
 `web` читает весь `.env`. **Воркер `.env` целиком не получает** (он разбирает чужие `tdata`): compose
 передаёт ему только `TG_WORKER_TOKEN`, `CRON_SECRET` (без них `docker compose` откажется стартовать),
-`APP_URL=http://web:5173` (cron ходит по сети compose, не через публичный домен) и необязательные
-`TG_WORKER_CONCURRENCY` (4), `AUTO_RESCAN_EVERY_MS` (300000), `TG_WORKER_KILL_GRACE_MS`,
+`APP_URL=http://web:5173` (cron ходит по сети compose, не через публичный домен; `TG_WORKER_CRON_HTTP_HOSTS=web`
+разрешает слать `CRON_SECRET` по http только этому хосту), `TG_WORKER_ALLOWED_HOSTS=worker:8790` (воркер
+отвечает 403 на чужой заголовок Host) и необязательные
+`TG_WORKER_MAX_CONCURRENCY` (4; старое имя `TG_WORKER_CONCURRENCY` тоже читается), `TG_WORKER_MAX_QUEUE` (64),
+`AUTO_RESCAN_EVERY_MS` (300000), `TG_WORKER_KILL_GRACE_MS`,
 `TG_WORKER_MAX_OUTPUT_BYTES`, `TG_WORKER_TIMEOUT_MS`. Новую переменную для воркера нужно добавить в
 `environment:` сервиса `worker`. Python-процесс получает ещё меньше: только окружение интерпретатора
 (`PATH`, `HOME`, `LANG`/`LC_*`, `TMPDIR`, `PYTHON*`, `SSL_CERT_*`) и каталог сессии; дополнительные имена —
 через `TG_WORKER_PYTHON_ENV=ИМЯ1,ИМЯ2` (`telegram-worker/src/python-runner.mjs::childEnv`).
-`TG_WORKER_ALLOW_NO_TOKEN=1` в продакшене не ставить: без `TG_WORKER_TOKEN` воркер не запустится.
+Без `TG_WORKER_TOKEN` (не короче 32 символов) воркер не запускается нигде; `CRON_SECRET` тоже не короче 32 символов.
 
-Лимиты воркера (`telegram-worker/src/python-runner.mjs`): не больше `TG_WORKER_CONCURRENCY` Python-процессов,
-запросы одного аккаунта идут по очереди; stdout — 1 МиБ для проверки прокси, для действий с аккаунтом —
+Лимиты воркера (`telegram-worker/src/worker-app.mjs`, `telegram-worker/src/python-runner.mjs`): не больше
+`TG_WORKER_MAX_CONCURRENCY` Python-процессов, сверх них до `TG_WORKER_MAX_QUEUE` запросов ждут в очереди, дальше — `429`;
+запросы одного аккаунта идут по очереди; тело запроса — до `TG_WORKER_MAX_BODY_BYTES` (6000000, дальше `413`); stdout — 1 МиБ для проверки прокси, для действий с аккаунтом —
 не меньше 8 МиБ (ответ может содержать перепакованный архив сессии), для сбора аудитории — 32 МиБ.
 Если приложение оборвало запрос, воркер убивает уже запущенный процесс только для чтения (проверка,
 скан, сбор аудитории, входящие); отправка, инвайт и вступление доживают до своего таймаута.
@@ -74,8 +78,18 @@ sudo sed -i 's/leads.example.com/ВАШ-ДОМЕН/' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 Сертификат выпускается автоматически. `Caddyfile` отвечает `404` на `/api/cron/*` снаружи: cron вызывает
-только воркер внутри сети compose; `/api/health` остаётся доступным. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
+только воркер внутри сети compose; `/api/health` остаётся доступным. Автообход вызывает кабинет сам на себя
+по `INTERNAL_APP_ORIGIN=http://web:5173` (задан в `docker-compose.yml` вместе с `TG_WORKER_CRON_HTTP_HOSTS=web`;
+`lib/env.ts::internalAppOrigin`) — по сети compose, не через публичный домен. Без переменной используется `APP_URL`,
+без обеих или при недопустимом значении (http к хосту не из списка) автообход отвечает `503`. Для OAuth в консолях Google/Яндекс/VK указать redirect URI
 `https://ВАШ-ДОМЕН/api/auth/<google|yandex|vk>/callback` — приложение строит его из `APP_URL`.
+
+Лимиты по IP (вход, регистрация, форма заявки, ассистент без входа) по умолчанию выключены
+(`TRUSTED_IP_HEADER=none`): без прокси, который перезаписывает заголовок, IP подделывается клиентом.
+`Caddyfile` перезаписывает `X-Real-IP` адресом клиента — с этим Caddy впереди включите их строкой
+`TRUSTED_IP_HEADER=x-real-ip` в `.env` и `docker compose up -d`. Всегда, независимо от IP, работают лимиты
+по email (вход), по пользователю (ассистент) и общие на весь сервис: регистрация — 50 в час, форма заявки — 100 в сутки,
+ассистент без входа — 500 в сутки.
 
 ## 5. Бэкап и восстановление
 Ручной бэкап: `./deploy/backup.sh` — онлайн-копия sqlite-файла D1 (SQLite backup API, `integrity_check`)

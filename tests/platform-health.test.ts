@@ -8,8 +8,8 @@ const { GET } = await import("@/app/api/health/route");
 const VALID_ENV: Record<string, string> = {
   ENCRYPTION_KEY: "b".repeat(64),
   SESSION_SECRET: "s".repeat(32),
-  TG_WORKER_TOKEN: "worker-token",
-  CRON_SECRET: "cron-secret",
+  TG_WORKER_TOKEN: "worker-token-".padEnd(40, "w"),
+  CRON_SECRET: "cron-secret-".padEnd(40, "c"),
   APP_URL: "https://leads.example.com",
   TELEGRAM_WORKER_URL: "http://worker:8790",
 };

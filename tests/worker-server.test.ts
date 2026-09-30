@@ -8,6 +8,8 @@ import { computeWorkerVersion } from "../telegram-worker/src/version.mjs";
 import { writeFakePython } from "./worker-fake-python";
 
 const SERVER = join(__dirname, "../telegram-worker/src/server.mjs");
+/** The worker refuses to start without a token of at least 32 characters. */
+const TOKEN = "t".repeat(64);
 const running: ChildProcess[] = [];
 const foreign: Server[] = [];
 
@@ -41,6 +43,7 @@ async function startWorker(env: Record<string, string> = {}, port?: number): Pro
     TG_WORKER_AUTO_RESCAN: "0",
     TG_WORKER_PYTHON: process.execPath,
     TG_WORKER_SCRIPT: fake.script,
+    TG_WORKER_TOKEN: TOKEN,
     ...env,
   } as unknown as NodeJS.ProcessEnv;
   const child = spawn(process.execPath, [SERVER], { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
@@ -49,10 +52,11 @@ async function startWorker(env: Record<string, string> = {}, port?: number): Pro
   return { port: p, tmp, child, exit };
 }
 
-async function waitHealthy(port: number): Promise<Record<string, unknown>> {
+async function waitHealthy(port: number, token?: string): Promise<Record<string, unknown>> {
+  const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
   for (let i = 0; i < 60; i++) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      const res = await fetch(`http://127.0.0.1:${port}/health`, { headers });
       if (res.ok) return (await res.json()) as Record<string, unknown>;
     } catch {
       /* ещё не слушает */
@@ -62,7 +66,7 @@ async function waitHealthy(port: number): Promise<Record<string, unknown>> {
   throw new Error("worker did not become healthy");
 }
 
-async function post(port: number, path: string, body: unknown, token?: string) {
+async function post(port: number, path: string, body: unknown, token: string | null = TOKEN) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -142,7 +146,7 @@ describe("tg-worker server", () => {
     const secrets = {
       SESSION_SECRET: "session-secret-value",
       ENCRYPTION_KEY: "encryption-key-value",
-      TG_WORKER_TOKEN: "worker-token-value",
+      TG_WORKER_TOKEN: `worker-token-value-${"x".repeat(32)}`,
       CRON_SECRET: "cron-secret-value",
       GOOGLE_CLIENT_SECRET: "oauth-secret-value",
       ADMIN_PASSWORD_HASH: "admin-hash-value",
@@ -158,7 +162,7 @@ describe("tg-worker server", () => {
 
   it("exposes the version dev-local computes and appUrl in /health", async () => {
     const w = await startWorker({ APP_URL: "http://app.test/" });
-    const h = await waitHealthy(w.port);
+    const h = await waitHealthy(w.port, TOKEN);
     expect(h).toMatchObject({ service: "uniseller-tg-worker", appUrl: "http://app.test" });
     expect(h.version).toBe(computeWorkerVersion(join(__dirname, "../telegram-worker/src")));
   });
@@ -184,28 +188,33 @@ describe("tg-worker port conflicts", () => {
 
 describe("tg-worker auth", () => {
   it("refuses to start in production without a token", async () => {
-    const w = await startWorker({ NODE_ENV: "production" });
+    const w = await startWorker({ NODE_ENV: "production", TG_WORKER_TOKEN: "" });
     expect(await w.exit).toBe(1);
   });
 
-  it("starts in production without a token only with TG_WORKER_ALLOW_NO_TOKEN=1", async () => {
-    const w = await startWorker({ NODE_ENV: "production", TG_WORKER_ALLOW_NO_TOKEN: "1" });
-    await waitHealthy(w.port);
-    expect((await post(w.port, "/scan-group", { mode: "echo" })).status).toBe(200);
+  // Stricter than the old dev-only escape hatch: an unauthenticated worker never starts.
+  it("refuses to start without a token even with TG_WORKER_ALLOW_NO_TOKEN=1", async () => {
+    const w = await startWorker({ NODE_ENV: "production", TG_WORKER_ALLOW_NO_TOKEN: "1", TG_WORKER_TOKEN: "" });
+    expect(await w.exit).toBe(1);
   });
 
-  it("requires the bearer token when one is set", async () => {
+  it("refuses to start without a token outside production too", async () => {
+    const w = await startWorker({ TG_WORKER_TOKEN: "" });
+    expect(await w.exit).toBe(1);
+  });
+
+  it("refuses a token shorter than 32 characters", async () => {
     const w = await startWorker({ TG_WORKER_TOKEN: "s3cret" });
-    await waitHealthy(w.port);
-    expect((await post(w.port, "/scan-group", { mode: "echo" })).status).toBe(401);
-    expect((await post(w.port, "/scan-group", { mode: "echo" }, "wrong")).status).toBe(401);
-    expect((await post(w.port, "/scan-group", { mode: "echo" }, "s3cret")).status).toBe(200);
+    expect(await w.exit).toBe(1);
   });
 
-  it("allows unauthenticated calls outside production when no token is set", async () => {
-    const w = await startWorker();
+  it("requires the bearer token", async () => {
+    const token = "s3cret".repeat(8);
+    const w = await startWorker({ TG_WORKER_TOKEN: token });
     await waitHealthy(w.port);
-    expect((await post(w.port, "/scan-group", { mode: "echo" })).status).toBe(200);
+    expect((await post(w.port, "/scan-group", { mode: "echo" }, null)).status).toBe(401);
+    expect((await post(w.port, "/scan-group", { mode: "echo" }, "wrong")).status).toBe(401);
+    expect((await post(w.port, "/scan-group", { mode: "echo" }, token)).status).toBe(200);
   });
 });
 
@@ -232,7 +241,7 @@ async function abortHungRequest(port: number, path: string, trackDir: string): P
   const abort = new AbortController();
   const pending = fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
     body: JSON.stringify({ mode: "hang-track", trackDir, accountId: "acc" }),
     signal: abort.signal,
   }).catch(() => null);

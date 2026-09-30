@@ -14,6 +14,7 @@ import {
   signInOAuthUser,
   type OAuthProvider,
 } from "@/lib/oauth";
+import { OAuthEmailTakenError } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
@@ -62,10 +63,11 @@ export async function GET(
       displayName: user.name,
     });
     const res = NextResponse.redirect(new URL(parsed.returnTo, origin));
-    res.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-    res.cookies.set(STATE_COOKIE, "", { ...sessionCookieOptions(0), maxAge: 0 });
+    res.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
+    res.cookies.set(STATE_COOKIE, "", { ...sessionCookieOptions(0, req.url), maxAge: 0 });
     return res;
   } catch (error) {
-    return fail(error instanceof RegistrationClosedError ? "closed" : "oauth");
+    if (error instanceof RegistrationClosedError) return fail("closed");
+    return fail(error instanceof OAuthEmailTakenError ? "exists" : "oauth");
   }
 }

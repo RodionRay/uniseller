@@ -24,6 +24,8 @@ type Rule = (value: string) => boolean;
 
 const HEX_64 = /^[0-9a-fA-F]{64}$/;
 const MIN_SESSION_SECRET_LENGTH = 32;
+/** The worker refuses a shorter TG_WORKER_TOKEN and the cron route a shorter CRON_SECRET. */
+const MIN_SHARED_SECRET_LENGTH = 32;
 
 function isHttpUrl(value: string): boolean {
   try {
@@ -38,8 +40,8 @@ function isHttpUrl(value: string): boolean {
 export const REQUIRED_ENV: Readonly<Record<string, Rule>> = {
   ENCRYPTION_KEY: (v) => HEX_64.test(v),
   SESSION_SECRET: (v) => v.length >= MIN_SESSION_SECRET_LENGTH,
-  TG_WORKER_TOKEN: (v) => v.length > 0,
-  CRON_SECRET: (v) => v.length > 0,
+  TG_WORKER_TOKEN: (v) => v.length >= MIN_SHARED_SECRET_LENGTH,
+  CRON_SECRET: (v) => v.length >= MIN_SHARED_SECRET_LENGTH,
   APP_URL: isHttpUrl,
 };
 
@@ -73,6 +75,29 @@ export function appOrigin(read: EnvReader = readEnv): string | null {
   const raw = read("APP_URL");
   if (!raw || !isHttpUrl(raw)) return null;
   return new URL(raw).origin;
+}
+
+const LOOPBACK_HOSTNAME = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])$/;
+
+/**
+ * Origin for the app's calls to itself (cron self-calls carrying minted sessions):
+ * fixed config, never derived from a request. `INTERNAL_APP_ORIGIN` keeps them on a
+ * private network (Docker: http://web:5173); plain http only to loopback or a host
+ * in `TG_WORKER_CRON_HTTP_HOSTS`, the same allowlist the worker uses for CRON_SECRET.
+ * Unset → APP_URL; set but invalid → null (fail closed, no silent fallback).
+ */
+export function internalAppOrigin(read: EnvReader = readEnv): string | null {
+  const raw = read("INTERNAL_APP_ORIGIN");
+  if (!raw) return appOrigin(read);
+  if (!isHttpUrl(raw)) return null;
+  const url = new URL(raw);
+  if (url.protocol === "https:") return url.origin;
+  const httpHosts = (read("TG_WORKER_CRON_HTTP_HOSTS") ?? "")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+  const allowed = LOOPBACK_HOSTNAME.test(url.hostname) || httpHosts.includes(url.hostname);
+  return allowed ? url.origin : null;
 }
 
 /** Origin to trust for same-origin checks and absolute redirects. */

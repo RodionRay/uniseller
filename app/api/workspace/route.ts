@@ -6,7 +6,7 @@ import {patchRecordData,writeRecordDiff} from '@/lib/processes/record-patch';
 import {canRunWorkspaceAction} from '@/lib/processes/workspace-access';
 import {advanceCursor,rotateFrom} from '@/lib/processes/round-robin';
 import {mergeRefreshedSession,stripSessionMaterial} from '@/lib/processes/session-refresh';
-import {appTimeoutForWorker} from '@/lib/processes/worker-timeouts';
+import {appTimeoutForWorker,proxyCheckTimeoutMs,workerSlots} from '@/lib/processes/worker-timeouts';
 import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
 import {JOIN_SUCCESS_PATCH,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,isAccountBlindResult,isAccountResolveBlind,joinFailurePatch,planGroupHeal,sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
@@ -47,6 +47,8 @@ import {
  type MailingLeadFilter,
  type MailingSourceKind,
 } from '@/lib/mailing';
+import {checkProxyTarget} from '@/lib/security/net-guard';
+import {authorizeWorkspaceAction,keepOwnerSecretsOnSave,visibleRecordsFor,type WorkspaceActor,type WorkspaceRecordView} from '@/lib/security/workspace-authz';
 import {env} from 'cloudflare:workers';
 import {z} from 'zod';
 export const dynamic='force-dynamic';
@@ -171,7 +173,7 @@ const schemas={
  }),
  proxy:z.object({
   name:short,
-  host:z.string().trim().regex(/^[a-zA-Z0-9.-]+$/).max(253),
+  host:z.string().trim().regex(/^[a-zA-Z0-9.-]+$/).max(253).refine(h=>checkProxyTarget(h,1).ok,{message:'forbidden_host'}),
   port:z.coerce.number().int().min(1).max(65535),
   protocol:z.enum(['socks5','http']),
   username:z.string().max(200).default(''),
@@ -365,6 +367,14 @@ const schemas={
  }),
 };
 function reply(data:unknown,status=200){return Response.json(data,{status,headers:{'Cache-Control':'no-store'}})}
+/** Messages safe to show the user verbatim; any other error text stays in server logs. */
+class UserFacingError extends Error{}
+
+function internalError(context:string,e:unknown,publicMessage:string){
+ if(e instanceof UserFacingError)return e.message;
+ console.error(`[workspace] ${context}:`,String((e as Error)?.message||e).slice(0,500));
+ return publicMessage;
+}
 
 function errorStack(e:unknown){
  return e instanceof Error?(e.stack||e.message):String(e);
@@ -408,11 +418,18 @@ function workerToken(){
  return (env as unknown as {TG_WORKER_TOKEN?:string}).TG_WORKER_TOKEN||process.env.TG_WORKER_TOKEN||'';
 }
 
-async function runProxyCheck(owner:string,id:string){
+/** @param batchSize checks sent to the worker at the same time (they queue beyond its slots) */
+async function runProxyCheck(owner:string,id:string,batchSize=1){
  const db=database();
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'proxy').first();
  if(!row)return {id,ok:false as const,error:'Прокси не найден',latencyMs:0,status:'inactive' as const};
  const data=JSON.parse(row.data);
+ const target=checkProxyTarget(String(data.host||''),Number(data.port));
+ if(!target.ok){
+  const failed={...data,status:'inactive',lastChecked:new Date().toISOString(),checkError:target.reason,exitIp:'',telegramOk:false,checkingAt:''};
+  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(failed),owner,id,'proxy').run();
+  return {id,ok:false as const,error:target.reason,latencyMs:0,status:'inactive' as const};
+ }
  const checkingAt=new Date().toISOString();
  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...data,status:'checking',checkError:'',checkingAt}),owner,id,'proxy').run();
  if(!row.secret){
@@ -429,8 +446,10 @@ async function runProxyCheck(owner:string,id:string){
  const input={host:data.host,port:Number(data.port),protocol:data.protocol==='http'?'http':'socks5' as const,username:data.username||'',password};
  // Только через tg-worker: в vinext/CF исходящий TCP к прокси даёт jsg.Error
  let result:{ok:boolean;latencyMs:number;exitIp?:string;error?:string;telegramOk?:boolean;protocol?:string;warning?:string};
+ // Worker busy/down/timeout says nothing about the proxy: keep its previous status.
+ let inconclusive=false;
  try{
-  const wr=await workerPost('/check-proxy',input);
+  const wr=await workerPost('/check-proxy',input,proxyCheckTimeoutMs(batchSize,workerSlots(process.env.TG_WORKER_MAX_CONCURRENCY||process.env.TG_WORKER_CONCURRENCY)));
   result={
    ok:!!wr.ok,
    latencyMs:Number(wr.latencyMs)||0,
@@ -442,11 +461,15 @@ async function runProxyCheck(owner:string,id:string){
   };
  }catch(e){
   const msg=String((e as Error).message||e);
-  const workerDown=/ECONNREFUSED|fetch failed|AbortError|timeout|воркер/i.test(msg);
+  const busy=e instanceof WorkerBusyError;
+  const workerDown=!busy&&/ECONNREFUSED|fetch failed|AbortError|timeout|воркер/i.test(msg);
+  inconclusive=busy||workerDown;
   result={
    ok:false,
    latencyMs:0,
-   error:workerDown
+   error:busy
+    ?'Telegram-воркер занят другими проверками. Повторите через несколько секунд.'
+    :workerDown
     ?(/AbortError|timeout/i.test(msg)
       ?'Таймаут проверки прокси. Повторите или смените прокси.'
       :'Telegram-воркер недоступен для проверки прокси. Запустите: npm run dev')
@@ -460,18 +483,20 @@ async function runProxyCheck(owner:string,id:string){
    error:'Сбой проверки в среде кабинета. Нужен Telegram-воркер (он стартует с npm run dev) и верный логин/пароль прокси.',
   };
  }
- const next={
-  ...data,
-  status:result.ok?'active':'inactive',
-  protocol:result.protocol||data.protocol||'socks5',
-  exitIp:result.exitIp||data.exitIp||'',
-  lastChecked:new Date().toISOString(),
-  checkError:result.ok
-   ?(result.telegramOk===false?(result.warning||result.error||'').slice(0,500):'')
-   :(result.error||'Ошибка проверки').slice(0,500),
-  telegramOk:result.ok?result.telegramOk!==false:false,
-  checkingAt:'',
- };
+ const next=inconclusive
+  ?{...data,checkError:(result.error||'Проверка не выполнена').slice(0,500),checkingAt:''}
+  :{
+   ...data,
+   status:result.ok?'active':'inactive',
+   protocol:result.protocol||data.protocol||'socks5',
+   exitIp:result.exitIp||data.exitIp||'',
+   lastChecked:new Date().toISOString(),
+   checkError:result.ok
+    ?(result.telegramOk===false?(result.warning||result.error||'').slice(0,500):'')
+    :(result.error||'Ошибка проверки').slice(0,500),
+   telegramOk:result.ok?result.telegramOk!==false:false,
+   checkingAt:'',
+  };
  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'proxy').run();
  return {id,ok:result.ok,exitIp:next.exitIp,latencyMs:result.latencyMs,error:result.error||result.warning,telegramOk:next.telegramOk,protocol:next.protocol,status:next.status as string};
 }
@@ -514,8 +539,8 @@ async function healStuckProxyChecks(owner:string,maxAgeMs=45_000){
 async function loadAccountSessionPayload(owner:string,accountId:string){
  const db=database();
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
- if(!row)throw new Error('Аккаунт не найден');
- if(!row.secret)throw new Error('У аккаунта нет сессии');
+ if(!row)throw new UserFacingError('Аккаунт не найден');
+ if(!row.secret)throw new UserFacingError('У аккаунта нет сессии');
  const data=JSON.parse(row.data);
  const secretRaw=await unseal(row.secret,owner);
  const session=JSON.parse(secretRaw);
@@ -524,6 +549,8 @@ async function loadAccountSessionPayload(owner:string,accountId:string){
   const prow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,data.proxyId,'proxy').first();
   if(prow){
    const pdata=JSON.parse(prow.data);
+   const target=checkProxyTarget(String(pdata.host||''),Number(pdata.port));
+   if(!target.ok)throw new UserFacingError(target.reason);
    let password='';
    if(prow.secret){try{password=await unseal(prow.secret,owner)}catch(e){logSideEffectError('proxy_password_unseal',owner,String(data.proxyId),e)}}
    proxyPayload={host:pdata.host,port:Number(pdata.port),protocol:pdata.protocol||'socks5',username:pdata.username||'',password};
@@ -542,12 +569,16 @@ async function loadAccountSessionPayload(owner:string,accountId:string){
  };
 }
 
+/** The worker answered 429: its queue is full. Says nothing about the proxy or account. */
+class WorkerBusyError extends Error{}
+
 async function workerPost(path:string,body:unknown,timeoutMs=appTimeoutForWorker(path)){
  const headers:Record<string,string>={'Content-Type':'application/json'};
  const token=workerToken();
  if(token)headers.Authorization=`Bearer ${token}`;
  const res=await fetch(workerUrl()+path,{method:'POST',headers,body:JSON.stringify(body),signal:AbortSignal.timeout(timeoutMs)});
  const data:any=await res.json().catch(()=>({}));
+ if(res.status===429)throw new WorkerBusyError(data?.error||'Воркер занят');
  if(!res.ok&&!data?.ok&&!data?.status)throw new Error(data?.error||`Воркер ${res.status}`);
  return data;
 }
@@ -1568,6 +1599,7 @@ export async function GET(){const session=await getSessionUser();if(!session?.us
  const owner=ctx.ownerId;
  const workspace:{ownerId:string;isOwner:boolean;role:string;access:Record<string,boolean>}={ownerId:ctx.ownerId,isOwner:ctx.isOwner,role:ctx.role,access:{...ctx.access}};
  for(const k of CRM_ACCESS_KEYS){if(workspace.access[k]==null)workspace.access[k]=ctx.isOwner}
+ const actor:WorkspaceActor=ctx;
  try{
  // Снять залипшие «Проверяется», чтобы UI не блокировался
  await runHealPass(owner,'heal_account_checks',()=>healStuckAccountChecks(owner,180_000));
@@ -1579,14 +1611,14 @@ export async function GET(){const session=await getSessionUser();if(!session?.us
  try{const h=await fetch(workerUrl()+'/health',{signal:AbortSignal.timeout(1500)});telegramConnected=h.ok}catch{telegramConnected=false}
  const envKey=!!envAiApiKey();
  return reply({
-  records:parseRecordRows(owner,result.results,envKey),
+  records:visibleRecordsFor(actor,parseRecordRows(owner,result.results,envKey) as WorkspaceRecordView[]),
   telegramConnected,
   ai:{provider:process.env.AI_PROVIDER||'deepseek',hasEnvKey:envKey},
   workspace,
   me:{userId:session.userId,email:session.email,name:session.displayName},
  });
 }catch(e){logActionError('GET',owner,e);return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
-export async function POST(req:Request){const session=await getSessionUser();const lookup=await lookupWorkspace(session?.userId);if(lookup.kind==='anonymous')return reply({error:'Войдите в рабочее пространство'},401);if(lookup.kind==='unavailable')return reply({error:WORKSPACE_UNAVAILABLE},503);const ctx=lookup.ctx;const owner=ctx.ownerId;if(!isSameOriginRequest(req))return reply({error:'Недопустимый источник запроса'},403);let action='';try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'Некорректный запрос'},400);action=String(b.action||'');if(!canRunWorkspaceAction(ctx,b))return reply({error:'Недостаточно прав для этого действия. Обратитесь к владельцу кабинета.',forbidden:true},403);const db=database();
+export async function POST(req:Request){const session=await getSessionUser();const lookup=await lookupWorkspace(session?.userId);if(lookup.kind==='anonymous')return reply({error:'Войдите в рабочее пространство'},401);if(lookup.kind==='unavailable')return reply({error:WORKSPACE_UNAVAILABLE},503);const ctx=lookup.ctx;const owner=ctx.ownerId;if(!isSameOriginRequest(req))return reply({error:'Недопустимый источник запроса'},403);let action='';try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'Некорректный запрос'},400);action=String(b.action||'');if(!canRunWorkspaceAction(ctx,b))return reply({error:'Недостаточно прав для этого действия. Обратитесь к владельцу кабинета.',forbidden:true},403);const actor:WorkspaceActor=ctx;const authz=authorizeWorkspaceAction(actor,b.action,b.kind);if(!authz.ok)return reply({error:authz.error,forbidden:true},403);const db=database();
  if(b.action==='draft'){
   const id=z.string().uuid().parse(b.id);
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();
@@ -1618,7 +1650,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    if(!update.meta.changes)return reply({error:'Сообщение изменено или лид удалён во время подготовки. Откройте актуальную карточку.'},409);
    return reply({ok:true,draft,model:resolveAiConfig(settings).model});
   }catch(e){
-   return reply({error:String((e as Error).message||e).slice(0,300)},502);
+   return reply({error:internalError('draft',e,'AI не смог подготовить черновик. Повторите попытку позже.')},502);
   }
  }
  if(b.action==='check_proxy'){
@@ -1639,7 +1671,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   const results:Awaited<ReturnType<typeof runProxyCheck>>[]=[];
   for(let i=0;i<ids.length;i+=concurrency){
    const batch=ids.slice(i,i+concurrency);
-   const part=await Promise.all(batch.map(id=>runProxyCheck(owner,id)));
+   const part=await Promise.all(batch.map(id=>runProxyCheck(owner,id,batch.length)));
    results.push(...part);
   }
   const active=results.filter(r=>r.ok).length;
@@ -1766,7 +1798,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
       if(wr.status==='frozen')next.status='frozen';
      }catch(e){
       tgOk=false;
-      tgError=String((e as Error).message||e).slice(0,300);
+      tgError=internalError('apply_account_profiles',e,'Не удалось обновить профиль в Telegram');
      }
     }
    }
@@ -1797,7 +1829,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
      results.push({id,ok:false,error:wr.error||'Ошибка фото'});
     }
    }catch(e){
-    results.push({id,ok:false,error:String((e as Error).message||e).slice(0,300)});
+    results.push({id,ok:false,error:internalError('upload_account_photos',e,'Не удалось загрузить фото')});
    }
    await new Promise(r=>setTimeout(r,1500));
   }
@@ -2865,7 +2897,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   }catch(e){
    if(isAccountBusy(e))return reply({error:e.message,busy:true,waitSec:ACCOUNT_BUSY_WAIT_SEC},429);
    logActionError('send_lead_message',owner,e);
-   return reply({error:String((e as Error).message||e).slice(0,500)},503);
+   return reply({error:e instanceof UserFacingError?e.message:'Не удалось отправить сообщение. Повторите попытку.'},503);
   }
  }
  if(b.action==='rescan_groups'){
@@ -5130,6 +5162,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   data.apiBase='https://api.deepseek.com';
   data.keywords=sanitizeLeadKeywords(String(data.keywords||''));
   data.minusKeywords=ensureJunkMinus(String(data.minusKeywords||''));
+  if(existing){try{Object.assign(data,keepOwnerSecretsOnSave(actor,data,JSON.parse(existing.data)))}catch{/* битые старые настройки — перезаписываем */}}
   if(!String(data.leadCriteria||'').trim()){
    data.leadCriteria='Целевой лид ЯВНО ищет сервис/инструмент/подрядчика под ваш продукт (остатки, синхронизация, цены, отзывы, кабинеты, 1С/МойСклад) и готов обсуждать демо или внедрение. Не лид: обычный чат селлеров, жалобы без запроса сервиса, чужая реклама.';
   }
@@ -5222,10 +5255,10 @@ export async function POST(req:Request){const session=await getSessionUser();con
    // Явный opt-in + жёсткий потолок: иначе импорт ZIP зависает на минуты (прокси×ретраи×автообход).
    provision=await Promise.race([
     runAccountCheck(owner,id,{ensureUsername:true,forceUsername:true,checkRestrictions:false,rotateProxy:false}),
-    new Promise<never>((_,rej)=>setTimeout(()=>rej(new Error('Таймаут записи @username')),18_000)),
+    new Promise<never>((_,rej)=>setTimeout(()=>rej(new UserFacingError('Таймаут записи @username')),18_000)),
    ]);
   }catch(e){
-   provision={ok:false,error:String((e as Error).message||e).slice(0,300)};
+   provision={ok:false,error:internalError('provision_username',e,'Не удалось записать @username')};
   }
  }
  return reply({ok:true,id,username:provision?.profile?.username||data.username||undefined,provision});

@@ -1,8 +1,9 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { readEnv, type EnvReader } from "@/lib/env";
+import { safeRelativeReturnPath } from "@/lib/security/return-path";
 
-export { readEnv };
+export { readEnv, safeRelativeReturnPath };
 
 export type SessionUser = {
   userId: string;
@@ -70,17 +71,27 @@ export function sessionCookieName(): string {
   return COOKIE_NAME;
 }
 
+const INSECURE_COOKIE_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
 /** HTTPS deployments (APP_URL https://…) or production builds get `Secure` cookies. */
 export function cookieSecure(read: EnvReader = readEnv): boolean {
   if (read("APP_URL")?.toLowerCase().startsWith("https://")) return true;
   return process.env.NODE_ENV === "production";
 }
 
-export function sessionCookieOptions(maxAge = SESSION_TTL_SEC) {
+/**
+ * Secure when `cookieSecure()` says so, and otherwise unless the request is for a
+ * loopback host (plain-http local dev). Without a request URL the cookie is always Secure.
+ */
+export function sessionCookieOptions(
+  maxAge = SESSION_TTL_SEC,
+  requestUrl?: string,
+) {
+  const host = requestUrl ? new URL(requestUrl).hostname : "";
   return {
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: cookieSecure(),
+    secure: cookieSecure() || !INSECURE_COOKIE_HOSTS.has(host),
     path: "/",
     maxAge,
   };
@@ -177,27 +188,6 @@ export async function verifyPasswordHash(
   const actual = Buffer.from(await deriveKey(password, salt, iterations));
   if (expected.length !== actual.length) return false;
   return timingSafeEqualBytes(expected, actual);
-}
-
-const AUTH_PAGE_PATHS = new Set([LOGIN_PATH, "/register", LOGOUT_PATH, "/callback"]);
-
-/**
- * Validates the *normalised* path too: "/.//evil.com" passes a raw prefix check but
- * resolves to "//evil.com", which browsers read as another origin.
- */
-export function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/";
-  let url: URL;
-  try {
-    url = new URL(value, "https://app.local");
-  } catch {
-    return "/";
-  }
-  if (url.origin !== "https://app.local") return "/";
-  const path = url.pathname;
-  if (!path.startsWith("/") || path.startsWith("//") || path.includes("\\")) return "/";
-  if (AUTH_PAGE_PATHS.has(path)) return "/app";
-  return `${path}${url.search}${url.hash}`;
 }
 
 async function sign(payload: string): Promise<string> {

@@ -6,6 +6,7 @@ import {
   ACCOUNT_MAX_OUTPUT_BYTES,
   COLLECT_MAX_OUTPUT_BYTES,
   DEFAULT_MAX_OUTPUT_BYTES,
+  NO_JSON_ERROR,
   accountKey,
   childEnv,
   createProcessLimiter,
@@ -68,12 +69,15 @@ describe("startPython", () => {
     const result = await h.result;
     await h.exited;
     expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/boom before stdin/);
+    expect(result.error).toBe(NO_JSON_ERROR);
   });
 
-  it("reports stderr as the error when the child prints no JSON", async () => {
+  // stderr may carry paths or secrets: it goes to the log as an exception class only.
+  it("answers a generic error without stderr when the child prints no JSON", async () => {
     const h = run({ mode: "no-json" });
-    expect((await h.result).error).toMatch(/Traceback: kaboom/);
+    const error = String((await h.result).error);
+    expect(error).toBe(NO_JSON_ERROR);
+    expect(error).not.toMatch(/kaboom|Traceback/);
   });
 
   it("on timeout answers at once, SIGTERMs, and cleans the work dir", async () => {

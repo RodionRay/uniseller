@@ -85,11 +85,15 @@ function parseLastJsonLine(out) {
   return JSON.parse(line);
 }
 
-function hintFrom(err, out) {
-  return (err || out || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 400);
+/** Answer when Python printed no JSON; its stderr may hold paths or secrets, so it stays out. */
+export const NO_JSON_ERROR = "Ошибка воркера (нет ответа)";
+
+/** Exception class from a Python traceback, for logs only (never the message). */
+function exceptionType(stderr) {
+  const lines = stderr.trim().split("\n");
+  const last = lines[lines.length - 1] || "";
+  const m = last.match(/^([A-Za-z_][\w.]*)(?::|$)/);
+  return m ? m[1] : "unknown";
 }
 
 /**
@@ -132,7 +136,8 @@ export function startPython({
 
   let child;
   try {
-    child = spawn(python, [script, "--payload", "-"], {
+    // The work dir goes both as an argument and in the env; check_account.py reads either.
+    child = spawn(python, [script, "--payload", "-", "--work-dir", workDir], {
       cwd,
       env: childEnv(process.env, workDir, envPassthrough),
     });
@@ -192,7 +197,8 @@ export function startPython({
       try {
         settle(parseLastJsonLine(out));
       } catch {
-        settle(failure(hintFrom(err, out) || "Ошибка воркера (нет JSON)"));
+        console.warn(`[tg-worker] python produced no JSON (${exceptionType(err)})`);
+        settle(failure(NO_JSON_ERROR));
       }
     }
     cleanup();

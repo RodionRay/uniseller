@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { acquireLock } from "@/lib/locks";
 import { harness, resetHarness } from "./helpers/workspace-harness";
@@ -42,7 +44,11 @@ function mockWorkspace(): { owner: string; action: string; body: Record<string, 
   return calls;
 }
 
-function cronRequest(token = "cron-secret") {
+/** The route accepts only a dedicated CRON_SECRET of at least 32 characters. */
+const CRON_SECRET = "cron-secret".padEnd(40, "c");
+const SESSION_SECRET = "session-secret".padEnd(40, "s");
+
+function cronRequest(token = CRON_SECRET) {
   return new Request("http://localhost/api/cron/auto-rescan", {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
@@ -55,8 +61,9 @@ const booted = (calls: { owner: string; action: string }[]) =>
 
 beforeEach(() => {
   resetHarness();
-  vi.stubEnv("CRON_SECRET", "cron-secret");
-  vi.stubEnv("SESSION_SECRET", "session-secret");
+  vi.stubEnv("CRON_SECRET", CRON_SECRET);
+  vi.stubEnv("SESSION_SECRET", SESSION_SECRET);
+  vi.stubEnv("APP_URL", "https://crm.example.com");
   vi.spyOn(console, "error").mockImplementation(() => undefined);
 });
 afterEach(() => {
@@ -99,15 +106,76 @@ describe("cron auto-rescan (REQ-B7)", () => {
     mockWorkspace();
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("CRON_SECRET", "");
-    expect((await POST(cronRequest("session-secret"))).status).toBe(401);
-    vi.stubEnv("CRON_SECRET", "cron-secret");
-    expect((await POST(cronRequest("session-secret"))).status).toBe(401);
+    expect((await POST(cronRequest(SESSION_SECRET))).status).toBe(503);
+    vi.stubEnv("CRON_SECRET", CRON_SECRET);
+    expect((await POST(cronRequest(SESSION_SECRET))).status).toBe(401);
   });
 
-  it("falls back to SESSION_SECRET outside production", async () => {
+  // No fallback to SESSION_SECRET/TG_WORKER_TOKEN anywhere: npm run dev generates a CRON_SECRET.
+  it("never accepts SESSION_SECRET as the cron bearer, outside production either", async () => {
     mockWorkspace();
     vi.stubEnv("NODE_ENV", "development");
     vi.stubEnv("CRON_SECRET", "");
-    expect((await POST(cronRequest("session-secret"))).status).toBe(200);
+    expect((await POST(cronRequest(SESSION_SECRET))).status).toBe(503);
+  });
+});
+
+describe("auto-rescan self-call origin", () => {
+  function spoofedHost() {
+    return new Request("http://evil.example/api/cron/auto-rescan", {
+      method: "POST",
+      headers: { authorization: `Bearer ${CRON_SECRET}`, host: "evil.example" },
+      body: "{}",
+    });
+  }
+
+  // Minted session cookies must go only to the app itself, never to a host taken from the request.
+  it("sends minted sessions to APP_URL whatever the request host", async () => {
+    mockWorkspace();
+    await POST(spoofedHost());
+    const fetchMock = vi.mocked(fetch);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect(new URL(String(url)).origin).toBe("https://crm.example.com");
+      expect(new Headers(init?.headers).get("origin")).toBe("https://crm.example.com");
+    }
+  });
+
+  // Self-calls stay on the compose network instead of hairpinning through the public proxy.
+  it("prefers INTERNAL_APP_ORIGIN for self-calls", async () => {
+    mockWorkspace();
+    vi.stubEnv("INTERNAL_APP_ORIGIN", "http://web:5173");
+    vi.stubEnv("TG_WORKER_CRON_HTTP_HOSTS", "web");
+    await POST(spoofedHost());
+    const fetchMock = vi.mocked(fetch);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect(new URL(String(url)).origin).toBe("http://web:5173");
+      expect(new Headers(init?.headers).get("origin")).toBe("http://web:5173");
+    }
+  });
+
+  it("refuses plain http to a host outside TG_WORKER_CRON_HTTP_HOSTS", async () => {
+    mockWorkspace();
+    vi.stubEnv("INTERNAL_APP_ORIGIN", "http://evil.example");
+    vi.stubEnv("TG_WORKER_CRON_HTTP_HOSTS", "web");
+    expect((await POST(spoofedHost())).status).toBe(503);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("wires the compose web service to itself over the private network", () => {
+    const compose = readFileSync(path.resolve(__dirname, "..", "docker-compose.yml"), "utf8");
+    const web = compose.slice(compose.indexOf("  web:"), compose.indexOf("  worker:"));
+    expect(web).toMatch(/^\s+INTERNAL_APP_ORIGIN: http:\/\/web:5173$/m);
+    expect(web).toMatch(/^\s+TG_WORKER_CRON_HTTP_HOSTS: web$/m);
+  });
+
+  it("refuses to run without APP_URL instead of trusting the request host", async () => {
+    mockWorkspace();
+    vi.stubEnv("APP_URL", "");
+    vi.stubEnv("INTERNAL_APP_ORIGIN", "");
+    const res = await POST(spoofedHost());
+    expect(res.status).toBe(503);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 });

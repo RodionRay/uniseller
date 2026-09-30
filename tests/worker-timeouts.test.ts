@@ -1,8 +1,7 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { WORKER_REPLY_MARGIN_MS, appTimeoutForWorker, workerTimeoutMs } from "@/lib/processes/worker-timeouts";
 import { acquireLock } from "@/lib/locks";
+import { timeoutForAction } from "../telegram-worker/src/worker-app.mjs";
 import { ACCOUNT_ID, OWNER, harness, mockWorker, post, resetHarness, seedAccount } from "./helpers/workspace-harness";
 
 vi.mock("cloudflare:workers", () => ({ env: {} }));
@@ -26,13 +25,9 @@ vi.mock("@/lib/staff", async () => {
 
 const { POST } = await import("@/app/api/workspace/route");
 
-/** Reads telegram-worker/src/server.mjs::timeoutFor so a worker change breaks this test, not prod. */
+/** The worker's own timeout table, so a worker change breaks this test, not prod. */
 function workerSourceTimeout(action: string): number {
-  const src = readFileSync(join(__dirname, "../telegram-worker/src/server.mjs"), "utf8");
-  const body = src.slice(src.indexOf("function timeoutFor"), src.indexOf("}", src.indexOf("return 120_000")));
-  const line = body.split("\n").find((l) => l.includes(`"${action}"`));
-  const raw = line ? /return ([\d_]+)/.exec(line)?.[1] : /\n\s*return ([\d_]+);\s*$/.exec(body)?.[1];
-  return Number(String(raw).replace(/_/g, ""));
+  return timeoutForAction(action);
 }
 
 describe("worker timeout contract", () => {

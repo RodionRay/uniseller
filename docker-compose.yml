@@ -21,6 +21,13 @@ services:
       D1_PERSIST_DIR: /data/wrangler
       BACKUP_DIR: /data/backups
       TELEGRAM_WORKER_URL: http://worker:8790
+      # auto-rescan self-calls (with minted sessions) stay on the compose network,
+      # not through the public domain and Caddy; plain http is allowed only to these hosts.
+      INTERNAL_APP_ORIGIN: http://web:5173
+      TG_WORKER_CRON_HTTP_HOSTS: web
+      # "none" unless the proxy in front overwrites a client-IP header (Caddy in deploy/ sets
+      # X-Real-IP: TRUSTED_IP_HEADER=x-real-ip in .env enables per-IP limits; README).
+      TRUSTED_IP_HEADER: ${TRUSTED_IP_HEADER:-none}
     ports:
       # Only Caddy on the host reaches the app; never publish on 0.0.0.0.
       - "127.0.0.1:5173:5173"
@@ -50,7 +57,12 @@ services:
       # worker -> web (auto-rescan cron) over the compose network, not the public URL;
       # Caddy blocks /api/cron/* from outside.
       APP_URL: http://web:5173
-      TG_WORKER_CONCURRENCY: ${TG_WORKER_CONCURRENCY:-4}
+      TG_WORKER_MAX_CONCURRENCY: ${TG_WORKER_MAX_CONCURRENCY:-${TG_WORKER_CONCURRENCY:-4}}
+      TG_WORKER_MAX_QUEUE: ${TG_WORKER_MAX_QUEUE:-64}
+      # The web container calls http://worker:8790; the worker rejects other Host headers.
+      TG_WORKER_ALLOWED_HOSTS: worker:8790
+      # APP_URL above is plain http on the private compose network.
+      TG_WORKER_CRON_HTTP_HOSTS: web
       AUTO_RESCAN_EVERY_MS: ${AUTO_RESCAN_EVERY_MS:-300000}
       TG_WORKER_KILL_GRACE_MS: ${TG_WORKER_KILL_GRACE_MS:-}
       TG_WORKER_MAX_OUTPUT_BYTES: ${TG_WORKER_MAX_OUTPUT_BYTES:-}

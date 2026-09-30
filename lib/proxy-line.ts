@@ -142,7 +142,7 @@ export function parseProxyLines(
   );
 }
 
-/** Телефон из имени zip: 4915124479739.zip → +4915124479739 */
+/** Телефон из имени zip: 10000000000.zip → +10000000000 */
 export function phoneFromAccountZipName(filename: string): string {
   const base = filename.replace(/\.(zip|rar)$/i, "").trim();
   const digits = base.replace(/\D/g, "");

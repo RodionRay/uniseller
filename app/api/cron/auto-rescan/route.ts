@@ -5,7 +5,9 @@ import {
   readEnv,
   sessionCookieName,
 } from "@/lib/auth";
+import { internalAppOrigin } from "@/lib/env";
 import { listUserIdsForCron } from "@/lib/users";
+import { constantTimeEqual } from "@/lib/security/secret-compare";
 import { database } from "@/lib/server-store";
 import { acquireLock, releaseLock } from "@/lib/locks";
 import { advanceCursor, rotateFrom } from "@/lib/processes/round-robin";
@@ -48,14 +50,17 @@ function reply(data: unknown, status = 200) {
   });
 }
 
-/**
- * Production accepts only CRON_SECRET. Outside production the worker's own fallback
- * chain is accepted so `npm run dev` works without extra env.
- */
-function cronSecret(): string {
-  const dedicated = readEnv("CRON_SECRET") || "";
-  if (readEnv("NODE_ENV") === "production") return dedicated;
-  return dedicated || readEnv("TG_WORKER_TOKEN") || readEnv("SESSION_SECRET") || "";
+const MIN_CRON_SECRET_LENGTH = 32;
+
+/** Dedicated secret only: never reuse SESSION_SECRET / TG_WORKER_TOKEN. */
+function cronSecret(): string | null {
+  const secret = readEnv("CRON_SECRET");
+  return secret && secret.length >= MIN_CRON_SECRET_LENGTH ? secret : null;
+}
+
+async function bearerMatches(req: Request, secret: string): Promise<boolean> {
+  const auth = req.headers.get("authorization") || "";
+  return constantTimeEqual(auth, `Bearer ${secret}`);
 }
 
 function errorStack(e: unknown): string {
@@ -80,26 +85,6 @@ async function listCronOwners(): Promise<CronOwner[]> {
   }
   const seen = new Set<string>();
   return owners.filter((o) => !seen.has(o.userId) && !!seen.add(o.userId));
-}
-
-/**
- * Compares SHA-256 digests with a fixed-length XOR loop: `===` on the raw header
- * returns at the first differing byte and leaks the secret through timing.
- * Kept local (not lib/auth) so route tests can mock lib/auth wholesale.
- */
-async function bearerMatches(header: string, secret: string): Promise<boolean> {
-  const digest = async (value: string) =>
-    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
-  const [a, b] = await Promise.all([digest(header), digest(`Bearer ${secret}`)]);
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
-  return diff === 0;
-}
-
-async function authOk(req: Request): Promise<boolean> {
-  const secret = cronSecret();
-  if (!secret) return false;
-  return bearerMatches(req.headers.get("authorization") || "", secret);
 }
 
 function isAbort(e: unknown) {
@@ -172,9 +157,19 @@ async function tryJoin(
  * Порциями: 1 join + 1–2 скана за тик, с бюджетом времени. Остаток — следующим тиком.
  */
 export async function POST(req: Request) {
-  if (!(await authOk(req))) return reply({ error: "Unauthorized" }, 401);
+  const secret = cronSecret();
+  if (!secret) {
+    return reply({ error: "CRON_SECRET не настроен (минимум 32 символа)" }, 503);
+  }
+  if (!(await bearerMatches(req, secret))) {
+    return reply({ error: "Unauthorized" }, 401);
+  }
 
-  const origin = new URL(req.url).origin;
+  // Minted session cookies go only to the configured app origin, never to the request's host.
+  const origin = internalAppOrigin();
+  if (!origin) {
+    return reply({ error: "INTERNAL_APP_ORIGIN / APP_URL не настроен или недопустим" }, 503);
+  }
   const force =
     new URL(req.url).searchParams.get("force") === "1" ||
     (await req

@@ -4,18 +4,31 @@ import {
   sessionCookieOptions,
   timingSafeEqualBytes,
 } from "@/lib/auth";
+import {
+  createSignedNonce,
+  readCookie,
+  verifySignedNonce,
+} from "@/lib/security/signed-nonce";
 import { appOrigin, registrationOpen } from "@/lib/env";
 import {
   findOAuthUser,
   findUserByEmail,
   linkOAuth,
   upsertOAuthUser,
+  OAuthEmailTakenError,
   type DbUser,
 } from "@/lib/users";
 
 export type OAuthProvider = "google" | "yandex" | "vk";
 
 const STATE_COOKIE = "unilab_oauth";
+const TELEGRAM_STATE_COOKIE = "unilab_tg_state";
+const TELEGRAM_STATE_TTL_SEC = 600;
+/** Telegram Login payloads older than this are rejected as replays. */
+export const TELEGRAM_AUTH_MAX_AGE_SEC = 300;
+const TELEGRAM_CLOCK_SKEW_SEC = 60;
+/** Our own query params on data-auth-url; Telegram does not sign them. */
+const TELEGRAM_UNSIGNED_KEYS = new Set(["hash", "state", "return_to"]);
 
 export function oauthEnabled(provider: OAuthProvider): boolean {
   const prefix =
@@ -96,12 +109,16 @@ export function oauthAuthorizeUrl(
   return u.toString();
 }
 
-export function oauthStateCookie(value: string, maxAge = 600) {
+export function oauthStateCookie(
+  value: string,
+  requestUrl: string,
+  maxAge = 600,
+) {
   return {
     name: STATE_COOKIE,
     value,
     options: {
-      ...sessionCookieOptions(maxAge),
+      ...sessionCookieOptions(maxAge, requestUrl),
       sameSite: "lax" as const,
     },
   };
@@ -269,15 +286,62 @@ export async function exchangeOAuthCode(
   };
 }
 
+function stateSecret(): string {
+  const secret = readEnv("SESSION_SECRET");
+  if (!secret || secret.length < 32) {
+    throw new Error("SESSION_SECRET не настроен (минимум 32 символа)");
+  }
+  return secret;
+}
+
+/**
+ * Issued when the login page loads the Telegram widget: the nonce is put into
+ * data-auth-url, the signed token into an httpOnly cookie. The callback only
+ * accepts a payload that comes back with the matching pair (login CSRF guard).
+ */
+export async function makeTelegramState(requestUrl: string) {
+  const { nonce, token } = await createSignedNonce(
+    stateSecret(),
+    TELEGRAM_STATE_TTL_SEC,
+  );
+  return {
+    nonce,
+    cookie: {
+      name: TELEGRAM_STATE_COOKIE,
+      value: token,
+      options: sessionCookieOptions(TELEGRAM_STATE_TTL_SEC, requestUrl),
+    },
+  };
+}
+
+export async function telegramStateValid(
+  req: Request,
+  state: string | null | undefined,
+): Promise<boolean> {
+  return verifySignedNonce(
+    readCookie(req, TELEGRAM_STATE_COOKIE),
+    state,
+    stateSecret(),
+  );
+}
+
+export function telegramStateCookieCleared(requestUrl: string) {
+  return {
+    name: TELEGRAM_STATE_COOKIE,
+    value: "",
+    options: { ...sessionCookieOptions(0, requestUrl), maxAge: 0 },
+  };
+}
+
 export async function verifyTelegramAuth(
   data: Record<string, string>,
 ): Promise<{ id: string; name: string }> {
   const token = readEnv("TELEGRAM_BOT_TOKEN");
   if (!token) throw new Error("Telegram Login не настроен");
   const hash = data.hash;
-  if (!hash) throw new Error("Нет подписи Telegram");
+  if (!hash || !data.id) throw new Error("Нет подписи Telegram");
   const check = Object.keys(data)
-    .filter((k) => k !== "hash")
+    .filter((k) => !TELEGRAM_UNSIGNED_KEYS.has(k))
     .sort()
     .map((k) => `${k}=${data[k]}`)
     .join("\n");
@@ -298,9 +362,12 @@ export async function verifyTelegramAuth(
     new TextEncoder().encode(check),
   );
   const expected = Buffer.from(Buffer.from(mac).toString("hex"), "utf8");
-  if (!timingSafeEqualBytes(expected, Buffer.from(hash, "utf8"))) throw new Error("Неверная подпись Telegram");
+  if (!timingSafeEqualBytes(expected, Buffer.from(hash.toLowerCase(), "utf8"))) {
+    throw new Error("Неверная подпись Telegram");
+  }
   const authDate = Number(data.auth_date || 0);
-  if (!authDate || Date.now() / 1000 - authDate > 86400) {
+  const ageSec = Date.now() / 1000 - authDate;
+  if (!authDate || ageSec > TELEGRAM_AUTH_MAX_AGE_SEC || ageSec < -TELEGRAM_CLOCK_SKEW_SEC) {
     throw new Error("Сессия Telegram устарела");
   }
   const name =
@@ -337,6 +404,7 @@ export async function signInOAuthUser(input: {
     provider: input.provider,
     providerUserId: input.providerUserId,
     email,
+    emailVerified: email !== null,
     name: input.name,
   };
   if (registrationOpen()) return upsertOAuthUser(identity);
@@ -344,6 +412,8 @@ export async function signInOAuthUser(input: {
   if (linked) return linked;
   const byEmail = email ? await findUserByEmail(email) : null;
   if (!byEmail) throw new RegistrationClosedError();
+  // Same rule as upsertOAuthUser: a password account is never taken over by email.
+  if (byEmail.passwordHash) throw new OAuthEmailTakenError();
   await linkOAuth(byEmail.id, input.provider, input.providerUserId);
   return byEmail;
 }

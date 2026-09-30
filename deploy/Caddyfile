@@ -16,6 +16,11 @@ leads.example.com {
 		max_size 200MB
 	}
 
+	# Cron endpoints are called only by the worker over the compose network
+	# (APP_URL=http://web:5173); never expose them publicly. /api/health stays open.
+	@cron path /api/cron /api/cron/*
+	respond @cron 404
+
 	# Caddy sets X-Forwarded-For to the real client IP (incoming values are not
 	# trusted by default) — the login/contact throttles key on it.
 	reverse_proxy 127.0.0.1:5173

@@ -43,6 +43,8 @@ export type LeadScoreResult = {
   score: number;
   reasons: string[];
   rejectReason: string;
+  /** Passes the core only because of the seller-question gate: without AI it is not a lead. */
+  questionGateOnly: boolean;
 };
 
 export type LeadCoreDecision = LeadScoreResult & {
@@ -183,7 +185,25 @@ export function distinctTopicHits(hits: readonly string[]): string[] {
   return topical.filter((h) => !topical.some((other) => other !== h && other.includes(h)));
 }
 
+type ScoreOptions = { sellerQuestions: boolean };
+
 export function scoreLead(text: string, settings: LeadCoreSettings): LeadScoreResult {
+  const full = scoreLeadWith(text, settings, { sellerQuestions: true });
+  if (full.score < LEAD_SCORE_WARM) return full;
+  const legacy = scoreLeadWith(text, settings, { sellerQuestions: false });
+  return { ...full, questionGateOnly: legacy.score < LEAD_SCORE_WARM };
+}
+
+/** Without AI only messages that pass without the seller-question gate become leads. */
+export function passesWithoutAi(score: LeadScoreResult): boolean {
+  return passesLeadCore(score) && !score.questionGateOnly;
+}
+
+function scoreLeadWith(
+  text: string,
+  settings: LeadCoreSettings,
+  options: ScoreOptions,
+): LeadScoreResult {
   const rejectReason = hardReject(text, settings);
   if (rejectReason) {
     return {
@@ -196,13 +216,15 @@ export function scoreLead(text: string, settings: LeadCoreSettings): LeadScoreRe
       score: 0,
       reasons: [rejectReason],
       rejectReason,
+      questionGateOnly: false,
     };
   }
 
   const { body } = normalizeCandidate(text);
   const buyer = hasBuyerIntent(text);
   // The worker passes seller questions without a plus keyword; the core treats them as soft asks.
-  const sellerQuestion = hasQuestion(text) && sellerTopicHits(text).length > 0;
+  const sellerQuestion =
+    options.sellerQuestions && hasQuestion(text) && sellerTopicHits(text).length > 0;
   const softAsk = hasSoftAsk(text) || sellerQuestion;
 
   const plus = strongPlusTerms(settings.keywords || "");
@@ -273,7 +295,7 @@ export function scoreLead(text: string, settings: LeadCoreSettings): LeadScoreRe
     ...plusHits,
     ...signalHits,
     ...criteriaHits,
-    ...(settingsFit ? sellerOpsTopicHits(text) : []),
+    ...(settingsFit && options.sellerQuestions ? sellerOpsTopicHits(text) : []),
   ]).length;
   if (softAsk && !buyer && topicHitCount >= SOFT_ASK_WARM_MIN_HITS) {
     score = Math.max(score, LEAD_SCORE_WARM);
@@ -297,6 +319,7 @@ export function scoreLead(text: string, settings: LeadCoreSettings): LeadScoreRe
     score,
     reasons: reasons.length ? reasons : ["Нет сигналов по настройкам AI-ассистента"],
     rejectReason: "",
+    questionGateOnly: false,
   };
 }
 

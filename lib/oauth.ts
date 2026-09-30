@@ -96,12 +96,16 @@ export function oauthAuthorizeUrl(
   return u.toString();
 }
 
-export function oauthStateCookie(value: string, maxAge = 600) {
+export function oauthStateCookie(
+  value: string,
+  requestUrl: string,
+  maxAge = 600,
+) {
   return {
     name: STATE_COOKIE,
     value,
     options: {
-      ...sessionCookieOptions(maxAge),
+      ...sessionCookieOptions(maxAge, requestUrl),
       sameSite: "lax" as const,
     },
   };
@@ -260,7 +264,7 @@ function stateSecret(): string {
  * data-auth-url, the signed token into an httpOnly cookie. The callback only
  * accepts a payload that comes back with the matching pair (login CSRF guard).
  */
-export async function makeTelegramState() {
+export async function makeTelegramState(requestUrl: string) {
   const { nonce, token } = await createSignedNonce(
     stateSecret(),
     TELEGRAM_STATE_TTL_SEC,
@@ -270,7 +274,7 @@ export async function makeTelegramState() {
     cookie: {
       name: TELEGRAM_STATE_COOKIE,
       value: token,
-      options: sessionCookieOptions(TELEGRAM_STATE_TTL_SEC),
+      options: sessionCookieOptions(TELEGRAM_STATE_TTL_SEC, requestUrl),
     },
   };
 }
@@ -286,11 +290,11 @@ export async function telegramStateValid(
   );
 }
 
-export function telegramStateCookieCleared() {
+export function telegramStateCookieCleared(requestUrl: string) {
   return {
     name: TELEGRAM_STATE_COOKIE,
     value: "",
-    options: { ...sessionCookieOptions(0), maxAge: 0 },
+    options: { ...sessionCookieOptions(0, requestUrl), maxAge: 0 },
   };
 }
 

@@ -74,7 +74,7 @@ describe("verifyTelegramAuth", () => {
 });
 
 async function stateFromProviders() {
-  const res = await providersGet();
+  const res = await providersGet(new Request("https://app.test/api/auth/providers"));
   const body = (await res.json()) as { telegramState?: string };
   const cookie = (res.headers.get("set-cookie") || "").split(";")[0] || "";
   return { state: body.telegramState || "", cookie };

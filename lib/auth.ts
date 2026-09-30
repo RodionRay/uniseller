@@ -84,11 +84,21 @@ export function sessionCookieName(): string {
   return COOKIE_NAME;
 }
 
-export function sessionCookieOptions(maxAge = SESSION_TTL_SEC) {
+const INSECURE_COOKIE_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Secure unless the request is for a loopback host (plain-http local dev).
+ * Without a request URL the cookie is always Secure.
+ */
+export function sessionCookieOptions(
+  maxAge = SESSION_TTL_SEC,
+  requestUrl?: string,
+) {
+  const host = requestUrl ? new URL(requestUrl).hostname : "";
   return {
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: process.env.NODE_ENV === "production",
+    secure: !INSECURE_COOKIE_HOSTS.has(host),
     path: "/",
     maxAge,
   };
@@ -213,7 +223,7 @@ async function sessionKey(): Promise<CryptoKey> {
 
 async function deriveKey(
   password: string,
-  salt: Buffer | Uint8Array,
+  salt: Uint8Array<ArrayBuffer>,
   iterations: number,
 ): Promise<ArrayBuffer> {
   const baseKey = await crypto.subtle.importKey(

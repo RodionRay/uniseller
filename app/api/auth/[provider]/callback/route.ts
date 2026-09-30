@@ -59,8 +59,8 @@ export async function GET(
       displayName: user.name,
     });
     const res = NextResponse.redirect(new URL(parsed.returnTo, url.origin));
-    res.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-    res.cookies.set(STATE_COOKIE, "", { ...sessionCookieOptions(0), maxAge: 0 });
+    res.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
+    res.cookies.set(STATE_COOKIE, "", { ...sessionCookieOptions(0, req.url), maxAge: 0 });
     return res;
   } catch (e) {
     return fail(e instanceof OAuthEmailTakenError ? "exists" : "oauth");

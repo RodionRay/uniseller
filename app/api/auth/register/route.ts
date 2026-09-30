@@ -56,7 +56,7 @@ export async function POST(req: Request) {
       displayName: user.name,
     });
     const response = reply({ ok: true });
-    response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
+    response.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
     return response;
   } catch {
     return reply({ error: "Не удалось зарегистрироваться" }, 503);

@@ -7,9 +7,9 @@ import {
 
 export const dynamic = "force-dynamic";
 
-function clearSession(response: NextResponse): NextResponse {
+function clearSession(req: Request, response: NextResponse): NextResponse {
   response.cookies.set(sessionCookieName(), "", {
-    ...sessionCookieOptions(0),
+    ...sessionCookieOptions(0, req.url),
     maxAge: 0,
   });
   return response;
@@ -25,6 +25,7 @@ export async function GET(req: Request) {
     url.searchParams.get("return_to") || "/",
   );
   return clearSession(
+    req,
     NextResponse.redirect(new URL(returnTo, url.origin), 302),
   );
 }
@@ -39,6 +40,7 @@ export async function POST(req: Request) {
     );
   }
   return clearSession(
+    req,
     NextResponse.json({ ok: true }, { headers: { "Cache-Control": "no-store" } }),
   );
 }

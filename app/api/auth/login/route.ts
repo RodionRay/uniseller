@@ -52,7 +52,7 @@ export async function POST(req: Request) {
         displayName: dbUser.name,
       });
       const response = reply({ ok: true });
-      response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
+      response.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
       return response;
     }
 
@@ -69,7 +69,7 @@ export async function POST(req: Request) {
         displayName: "Администратор",
       });
       const response = reply({ ok: true });
-      response.cookies.set(sessionCookieName(), token, sessionCookieOptions());
+      response.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
       return response;
     }
 

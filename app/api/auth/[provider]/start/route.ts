@@ -25,7 +25,7 @@ export async function GET(
   const { s, packed } = makeOAuthState(provider, returnTo);
   const dest = oauthAuthorizeUrl(url.origin, provider as OAuthProvider, s);
   const res = NextResponse.redirect(dest);
-  const cookie = oauthStateCookie(packed);
+  const cookie = oauthStateCookie(packed, req.url);
   res.cookies.set(cookie.name, cookie.value, cookie.options);
   return res;
 }

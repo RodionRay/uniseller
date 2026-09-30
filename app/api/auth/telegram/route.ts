@@ -15,14 +15,15 @@ import { upsertOAuthUser } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
-function withStateCleared(res: NextResponse): NextResponse {
-  const cleared = telegramStateCookieCleared();
+function withStateCleared(req: Request, res: NextResponse): NextResponse {
+  const cleared = telegramStateCookieCleared(req.url);
   res.cookies.set(cleared.name, cleared.value, cleared.options);
   return res;
 }
 
 function fail(req: Request): NextResponse {
   return withStateCleared(
+    req,
     NextResponse.redirect(new URL("/login?error=oauth", new URL(req.url).origin)),
   );
 }
@@ -52,8 +53,8 @@ async function finish(req: Request, data: Record<string, string>) {
   const res = NextResponse.redirect(
     new URL(safeRelativeReturnPath(data.return_to || "/app"), url.origin),
   );
-  res.cookies.set(sessionCookieName(), token, sessionCookieOptions());
-  return withStateCleared(res);
+  res.cookies.set(sessionCookieName(), token, sessionCookieOptions(undefined, req.url));
+  return withStateCleared(req, res);
 }
 
 export async function GET(req: Request) {

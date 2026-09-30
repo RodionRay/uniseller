@@ -5,7 +5,7 @@ import { contactTasks } from "@/components/marketing/content";
 import { trustedClientIp } from "@/lib/security/client-ip";
 import {
   RATE_LIMITS,
-  consumeRateLimit,
+  consumeRateLimits,
   tooManyRequests,
 } from "@/lib/security/rate-limit";
 
@@ -43,10 +43,9 @@ export async function POST(req: Request) {
     return reply({ error: "Недопустимый источник запроса" }, 403);
   }
   try {
-    const limit = await consumeRateLimit(
-      RATE_LIMITS.contactPerIp,
-      trustedClientIp(req) ?? "unknown",
-    );
+    const limit = await consumeRateLimits([
+      [RATE_LIMITS.contactPerIp, trustedClientIp(req)],
+    ]);
     if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
     const body = (await req.json()) as Record<string, string>;
     const name = String(body.name ?? "").trim().slice(0, 80);

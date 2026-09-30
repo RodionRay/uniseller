@@ -10,7 +10,7 @@ import {
 import { trustedClientIp } from "@/lib/security/client-ip";
 import {
   RATE_LIMITS,
-  consumeRateLimit,
+  consumeRateLimits,
   tooManyRequests,
 } from "@/lib/security/rate-limit";
 import { createUser, findUserByEmail } from "@/lib/users";
@@ -33,10 +33,9 @@ export async function POST(req: Request) {
     if (!authConfigured()) {
       return reply({ error: "Авторизация не настроена на сервере" }, 503);
     }
-    const limit = await consumeRateLimit(
-      RATE_LIMITS.registerPerIp,
-      trustedClientIp(req) ?? "unknown",
-    );
+    const limit = await consumeRateLimits([
+      [RATE_LIMITS.registerPerIp, trustedClientIp(req)],
+    ]);
     if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
     const body = (await req.json()) as {
       email?: string;

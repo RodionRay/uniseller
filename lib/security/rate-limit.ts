@@ -18,6 +18,9 @@ const DAY = 24 * HOUR;
 /**
  * Fixed-window limits, stored in D1 so they hold across Worker isolates.
  * Every attempt counts (successful ones too); humans stay far below these.
+ * Exception: `loginPerEmail` counts failed logins only (see login route), so
+ * an attacker cannot lock a victim out by spending their quota with noise
+ * while the victim keeps logging in successfully.
  */
 export const RATE_LIMITS = {
   loginPerIp: { name: "login-ip", limit: 20, windowSec: 15 * MINUTE },
@@ -27,6 +30,21 @@ export const RATE_LIMITS = {
   assistantAnonPerIp: { name: "assistant-anon-ip", limit: 30, windowSec: DAY },
   assistantAnonGlobal: { name: "assistant-anon-global", limit: 500, windowSec: DAY },
 } as const satisfies Record<string, RateLimitRule>;
+
+const DEFAULT_ASSISTANT_USER_DAILY_LIMIT = 200;
+
+/**
+ * Daily cap per signed-in user on the paid assistant key.
+ * `ASSISTANT_USER_DAILY_LIMIT` overrides the default; invalid values fall back to it.
+ */
+export function assistantUserDailyRule(): RateLimitRule {
+  const configured = Number(process.env.ASSISTANT_USER_DAILY_LIMIT);
+  const limit =
+    Number.isInteger(configured) && configured > 0
+      ? configured
+      : DEFAULT_ASSISTANT_USER_DAILY_LIMIT;
+  return { name: "assistant-user", limit, windowSec: DAY };
+}
 
 let tableReady = false;
 
@@ -87,13 +105,45 @@ export async function consumeRateLimit(
   return { allowed: count <= rule.limit, retryAfterSec: Math.max(1, expires - nowSec) };
 }
 
-/** First rule that is exceeded wins; all rules are counted. */
+/** Whether `subject` still has quota under `rule`, without counting an attempt. */
+export async function peekRateLimit(
+  rule: RateLimitRule,
+  subject: string,
+  nowMs = Date.now(),
+): Promise<RateLimitResult> {
+  await ensureTable();
+  const nowSec = Math.floor(nowMs / 1000);
+  const windowStart = nowSec - (nowSec % rule.windowSec);
+  const expires = windowStart + rule.windowSec;
+  const row = await database()
+    .prepare("SELECT count FROM rate_limits WHERE key = ? AND window_start = ?")
+    .bind(await bucketKey(rule, subject), windowStart)
+    .first<{ count: number }>();
+  const count = Number(row?.count ?? 0);
+  return { allowed: count < rule.limit, retryAfterSec: Math.max(1, expires - nowSec) };
+}
+
+/** Forgets all counted attempts of `subject` under `rule`. */
+export async function resetRateLimit(rule: RateLimitRule, subject: string): Promise<void> {
+  await ensureTable();
+  await database()
+    .prepare("DELETE FROM rate_limits WHERE key = ?")
+    .bind(await bucketKey(rule, subject))
+    .run();
+}
+
+/**
+ * First rule that is exceeded wins; all rules are counted. A null subject
+ * (e.g. no trusted client IP) skips that rule: one shared bucket for every
+ * unidentified client would let a single abuser lock everyone out.
+ */
 export async function consumeRateLimits(
-  checks: ReadonlyArray<readonly [RateLimitRule, string]>,
+  checks: ReadonlyArray<readonly [RateLimitRule, string | null]>,
   nowMs = Date.now(),
 ): Promise<RateLimitResult> {
   let blocked: RateLimitResult | null = null;
   for (const [rule, subject] of checks) {
+    if (subject === null) continue;
     const result = await consumeRateLimit(rule, subject, nowMs);
     if (!result.allowed && !blocked) blocked = result;
   }

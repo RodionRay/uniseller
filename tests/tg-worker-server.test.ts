@@ -8,6 +8,7 @@ import type {Server} from 'node:http';
 import {
   createPythonRunner,
   createWorkerServer,
+  cronSecretProblem,
   cronTargetAllowed,
   purgeStaleWorkDirs,
   resolveConfig,
@@ -80,6 +81,29 @@ describe('tg-worker config', () => {
     expect(code).not.toBe(0);
   });
 
+  it('flags a missing or short CRON_SECRET', () => {
+    expect(cronSecretProblem('')).toMatch(/CRON_SECRET/);
+    expect(cronSecretProblem(undefined)).toMatch(/CRON_SECRET/);
+    expect(cronSecretProblem('x'.repeat(31))).toMatch(/32/);
+    expect(cronSecretProblem('x'.repeat(32))).toBeNull();
+  });
+
+  it('warns once at startup when CRON_SECRET is missing', async () => {
+    const child = spawn(process.execPath, [SERVER_ENTRY], {
+      env: {...process.env, TG_WORKER_TOKEN: TOKEN, TG_WORKER_PORT: '0', CRON_SECRET: ''},
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (c) => (stderr += c));
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.on('data', (c) => String(c).includes('tg-worker http') && resolve());
+      child.on('exit', (code) => reject(new Error(`exited ${code}: ${stderr}`)));
+    });
+    child.kill();
+    expect(stderr.match(/CRON_SECRET/g)?.length).toBe(1);
+    expect(stderr).toMatch(/auto-rescan/);
+  });
+
   it('compares tokens exactly', () => {
     expect(tokenMatches(`Bearer ${TOKEN}`, TOKEN)).toBe(true);
     expect(tokenMatches(`Bearer ${TOKEN}x`, TOKEN)).toBe(false);
@@ -133,9 +157,34 @@ describe('tg-worker HTTP guard', () => {
   });
 
   it('returns 413 for an oversized body', async () => {
-    const {base} = await listen();
-    const res = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json', body: JSON.stringify({x: 'y'.repeat(7_000_000)})});
-    expect(res.status).toBe(413);
+    // Declare a huge body but send only a few bytes: the server must refuse on the
+    // declared length alone. Streaming 7 MB raced the server's Connection: close
+    // and failed with EPIPE/ECONNRESET before the 413 could be read.
+    const {port} = await listen();
+    const {request} = await import('node:http');
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request(
+        {
+          host: '127.0.0.1',
+          port,
+          path: '/check-proxy',
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${TOKEN}`,
+            'Content-Type': 'application/json',
+            'Content-Length': '7000000',
+          },
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+          req.destroy();
+        },
+      );
+      req.on('error', reject);
+      req.write('{"x":"');
+    });
+    expect(status).toBe(413);
   });
 
   it('returns 429 when all worker slots are busy', async () => {

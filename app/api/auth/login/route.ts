@@ -14,7 +14,10 @@ import {
 import { trustedClientIp } from "@/lib/security/client-ip";
 import {
   RATE_LIMITS,
+  consumeRateLimit,
   consumeRateLimits,
+  peekRateLimit,
+  resetRateLimit,
   tooManyRequests,
 } from "@/lib/security/rate-limit";
 import { findUserByEmail } from "@/lib/users";
@@ -74,14 +77,18 @@ export async function POST(req: Request) {
     const password = String(body.password ?? "");
     if (!email || !password) return reply({ error: BAD_CREDENTIALS }, 401);
 
-    const limit = await consumeRateLimits([
-      [RATE_LIMITS.loginPerIp, trustedClientIp(req) ?? "unknown"],
-      [RATE_LIMITS.loginPerEmail, email],
-    ]);
-    if (!limit.allowed) return tooManyRequests(limit.retryAfterSec);
+    const ipLimit = await consumeRateLimits([[RATE_LIMITS.loginPerIp, trustedClientIp(req)]]);
+    if (!ipLimit.allowed) return tooManyRequests(ipLimit.retryAfterSec);
+    // Per email only failures count, so noise cannot lock out a user who knows the password.
+    const emailLimit = await peekRateLimit(RATE_LIMITS.loginPerEmail, email);
+    if (!emailLimit.allowed) return tooManyRequests(emailLimit.retryAfterSec);
 
     const user = await resolveUser(email, password);
-    if (!user) return reply({ error: BAD_CREDENTIALS }, 401);
+    if (!user) {
+      await consumeRateLimit(RATE_LIMITS.loginPerEmail, email);
+      return reply({ error: BAD_CREDENTIALS }, 401);
+    }
+    await resetRateLimit(RATE_LIMITS.loginPerEmail, email);
     return signedIn(req, user);
   } catch {
     return reply({ error: "Не удалось выполнить вход" }, 503);

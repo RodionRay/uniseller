@@ -355,6 +355,9 @@ export async function clearAllStaff(workspaceOwnerId: string): Promise<{
   };
 }
 
+const ALREADY_IN_OTHER_WORKSPACE =
+  "Вы уже состоите в другом кабинете. Сначала выйдите из него.";
+
 export async function acceptInvite(input: {
   token: string;
   userId: string;
@@ -381,11 +384,7 @@ export async function acceptInvite(input: {
       .prepare("SELECT id FROM workspace_members WHERE user_id=? LIMIT 1")
       .bind(input.userId)
       .first();
-    if (other)
-      return {
-        ok: false,
-        error: "Вы уже состоите в другом кабинете. Сначала выйдите из него.",
-      };
+    if (other) return { ok: false, error: ALREADY_IN_OTHER_WORKSPACE };
   }
 
   // Claim the invite atomically before creating the membership: of two concurrent
@@ -395,12 +394,16 @@ export async function acceptInvite(input: {
     return { ok: false, error: "Приглашение уже использовано" };
   if (existing) return { ok: true, ownerId: invite.workspaceOwnerId };
 
+  // The pre-check above is advisory: two accepts into different workspaces can both
+  // pass it. The guarded INSERT is one statement, so only one membership can land.
+  let inserted: boolean;
   try {
-    await database()
+    const r = await database()
       .prepare(
         `INSERT INTO workspace_members
          (id,workspace_owner_id,user_id,role,access,created)
-         VALUES (?,?,?,?,?,?)`,
+         SELECT ?,?,?,?,?,?
+         WHERE NOT EXISTS (SELECT 1 FROM workspace_members WHERE user_id=?)`,
       )
       .bind(
         crypto.randomUUID(),
@@ -409,11 +412,17 @@ export async function acceptInvite(input: {
         invite.role,
         JSON.stringify(invite.access),
         now,
+        input.userId,
       )
       .run();
+    inserted = (r.meta?.changes || 0) > 0;
   } catch (error) {
     await releaseInvite(invite.id, input.userId);
     throw error;
+  }
+  if (!inserted) {
+    await releaseInvite(invite.id, input.userId);
+    return { ok: false, error: ALREADY_IN_OTHER_WORKSPACE };
   }
   return { ok: true, ownerId: invite.workspaceOwnerId };
 }

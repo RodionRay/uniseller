@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { safeRelativeReturnPath } from "@/lib/auth";
+import { safeRelativeReturnPath as authPathsSafeReturn } from "@/lib/auth-paths";
 import { GET as logoutGet } from "@/app/api/auth/logout/route";
 
 const HOSTILE = [
@@ -9,6 +10,14 @@ const HOSTILE = [
   "//evil.com",
   "https://evil.com",
   "/%5Cevil.com",
+  // Dot-segment normalisation collapses these into a protocol-relative "//evil.com".
+  "/.//evil.com",
+  "/%2e//evil.com",
+  "/%2E//evil.com",
+  "/a/..//evil.com",
+  "/a/%2e%2e//evil.com",
+  "/./%2e/..//evil.com",
+  "/.//evil.com/path?q=1#h",
 ];
 
 describe("safeRelativeReturnPath", () => {
@@ -25,6 +34,29 @@ describe("safeRelativeReturnPath", () => {
 
   it("keeps a normal relative path", () => {
     expect(safeRelativeReturnPath("/app/leads?x=1#h")).toBe("/app/leads?x=1#h");
+  });
+});
+
+describe("safeRelativeReturnPath dot-segment bypass", () => {
+  it.each([
+    "/.//evil.com",
+    "/%2e//evil.com",
+    "/a/..//evil.com",
+    "/a/%2e%2e//evil.com",
+  ])("returns / for %s", (value) => {
+    expect(safeRelativeReturnPath(value)).toBe("/");
+  });
+
+  it("still resolves harmless dot segments", () => {
+    expect(safeRelativeReturnPath("/a/../app/leads")).toBe("/app/leads");
+  });
+});
+
+describe("lib/auth-paths safeRelativeReturnPath", () => {
+  it.each(HOSTILE)("keeps %s on-site", (value) => {
+    const out = authPathsSafeReturn(value);
+    expect(out.startsWith("//")).toBe(false);
+    expect(new URL(out, "https://app.test").origin).toBe("https://app.test");
   });
 });
 

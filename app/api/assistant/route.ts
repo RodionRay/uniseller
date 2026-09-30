@@ -9,6 +9,8 @@ import {
 import { trustedClientIp } from "@/lib/security/client-ip";
 import {
   RATE_LIMITS,
+  assistantUserDailyRule,
+  consumeRateLimit,
   consumeRateLimits,
   tooManyRequests,
 } from "@/lib/security/rate-limit";
@@ -21,6 +23,18 @@ function reply(data: unknown, status = 200) {
     status,
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+function dailyCapReached(limit: number, retryAfterSec: number) {
+  return Response.json(
+    {
+      error: `Дневной лимит вопросов ассистенту исчерпан (${limit} в сутки). Попробуйте завтра.`,
+    },
+    {
+      status: 429,
+      headers: { "Cache-Control": "no-store", "Retry-After": String(retryAfterSec) },
+    },
+  );
 }
 
 function clientKey(req: Request, owner?: string | null) {
@@ -89,9 +103,13 @@ export async function POST(req: Request) {
       if (!owner) {
         const quota = await consumeRateLimits([
           [RATE_LIMITS.assistantAnonGlobal, "all"],
-          [RATE_LIMITS.assistantAnonPerIp, trustedClientIp(req) ?? "unknown"],
+          [RATE_LIMITS.assistantAnonPerIp, trustedClientIp(req)],
         ]);
         if (!quota.allowed) return tooManyRequests(quota.retryAfterSec);
+      } else {
+        const rule = assistantUserDailyRule();
+        const quota = await consumeRateLimit(rule, owner);
+        if (!quota.allowed) return dailyCapReached(rule.limit, quota.retryAfterSec);
       }
       await db
         .prepare(

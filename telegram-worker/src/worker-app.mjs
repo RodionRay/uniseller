@@ -81,6 +81,19 @@ export function tokenMatches(header, token) {
   return timingSafeEqual(digest(header), digest(`Bearer ${token}`));
 }
 
+/**
+ * Why auto-rescan cannot run with this CRON_SECRET, or null when it can.
+ * The app rejects secrets shorter than MIN_TOKEN_LENGTH, so those are unusable too.
+ * @param {string | undefined} secret
+ */
+export function cronSecretProblem(secret) {
+  if (!secret) return "CRON_SECRET is not set";
+  if (secret.length < MIN_TOKEN_LENGTH) {
+    return `CRON_SECRET is shorter than ${MIN_TOKEN_LENGTH} characters`;
+  }
+  return null;
+}
+
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
 
 /**

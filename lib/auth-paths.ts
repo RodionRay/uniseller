@@ -1,3 +1,5 @@
+import { safeRelativeReturnPath as safeOnSitePath } from "@/lib/security/return-path";
+
 const SIGN_IN_PATH = "/login";
 const SIGN_OUT_PATH = "/logout";
 const REGISTER_PATH = "/register";
@@ -11,18 +13,11 @@ export function isReservedAuthPath(pathname: string): boolean {
 }
 
 export function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
-
-  let url: URL;
-  try {
-    url = new URL(value, "https://app.local");
-  } catch {
-    return "/";
-  }
-  if (url.origin !== "https://app.local") return "/";
-  if (isReservedAuthPath(url.pathname)) return "/";
-
-  return `${url.pathname}${url.search}${url.hash}`;
+  const safe = safeOnSitePath(value);
+  if (safe === "/") return "/";
+  // safeOnSitePath maps auth pages to "/app"; this module's contract is "/".
+  const { pathname } = new URL(value, "https://app.local");
+  return isReservedAuthPath(pathname) ? "/" : safe;
 }
 
 export function chatGPTSignInPath(returnTo: string): string {

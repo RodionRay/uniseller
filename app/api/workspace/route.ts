@@ -21,7 +21,7 @@ import {
  type LeadCoreSettings,
 } from '@/lib/lead-core';
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew} from '@/lib/ai-keywords';
-import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,generateTelegramUsername,hasChatQuota,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isDayLimitCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
+import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,floodWaitSeconds,generateTelegramUsername,hasChatQuota,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isDayLimitCooldown,isFloodCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeStatusFilters,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
 import {canonicalizeTgUrl,duplicateReason,isDuplicateKind,telegramEntityKey} from '@/lib/record-identity';
 import {
@@ -599,10 +599,9 @@ async function persistRefreshedSession(owner:string,accountId:string,result:any)
  }
 }
 
-/** Worker reports FloodWait as status 'flood' + waitSec: pause the account, never mark it dead. */
+/** Worker FloodWait (any shape, see floodWaitSeconds): pause the account, never mark it dead. */
 async function applyFloodCooldown(owner:string,accountId:string,result:any){
- if(result?.status!=='flood')return;
- const waitSec=Math.max(1,Math.round(Number(result.waitSec)||0));
+ const waitSec=floodWaitSeconds(result);
  if(!waitSec)return;
  try{
   await patchRecordData(database(),{owner,kind:'account',id:accountId},{
@@ -3419,7 +3418,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     .map(aid=>{
      const a=accMap.get(aid);
      if(!a)return 0;
-     if(!(isDayLimitCooldown(a)||String(a.status||'')==='spamblock'))return 0;
+     if(!(isDayLimitCooldown(a)||isFloodCooldown(a)||String(a.status||'')==='spamblock'))return 0;
      const t=Date.parse(String(a.cooldownUntil||''));
      return Number.isFinite(t)&&t>Date.now()?t:0;
     })
@@ -3534,8 +3533,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
      const adata=JSON.parse(arow.data);
      await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(withFrozenStatus(adata,result.error||'')),owner,accountId,'account').run();
     }
-   }else if(result.status==='floodwait'||Number(result.floodWait)>0){
-    const waitSec=Math.max(60,Number(result.floodWait)||900);
+   }else if(floodWaitSeconds(result)>0){
+    const waitSec=Math.max(60,floodWaitSeconds(result));
     // FloodWait — пауза задачи, без статуса «Отлежка» на аккаунте.
     logEntries.push({level:'error',text:`Аккаунт ${bracketLabel(accountLabel)} получил FloodWait ${waitSec}с — пауза тика`});
     logEntries.push({level:'info',text:`Ожидание ${waitSec} секунд`});
@@ -3946,7 +3945,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     const a=accMap.get(aid);
     if(!a)return 0;
     // Таймер учитываем только для реальной отлёжки / спамблока.
-    if(!(isDayLimitCooldown(a)||String(a.status||'')==='spamblock'))return 0;
+    if(!(isDayLimitCooldown(a)||isFloodCooldown(a)||String(a.status||'')==='spamblock'))return 0;
     const t=Date.parse(String(a.cooldownUntil||''));
     return Number.isFinite(t)&&t>Date.now()?t:0;
    }).filter(t=>t>0).sort((a,b)=>a-b);
@@ -4267,15 +4266,14 @@ export async function POST(req:Request){const session=await getSessionUser();con
     const rateLimited=
      !peerFlood&&
      !accountFrozen&&
-     (result.status==='flood'||
-      !!result.flood||
+     (floodWaitSeconds(result)>0||
       Number(result.waitSec)>0||
       isRateLimitMailingError(errRaw));
 
     if(rateLimited){
      const waitSec=Math.max(
       60,
-      Number(result.waitSec)||0,
+      floodWaitSeconds(result)||Number(result.waitSec)||0,
       parseMailingFloodWaitSec(errRaw,900),
      );
      // FloodWait / Too many requests — пауза тика/получателя, аккаунт НЕ в «Отлёжку».

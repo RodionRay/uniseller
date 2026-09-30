@@ -192,6 +192,26 @@ export function joinFailurePatch(
   };
 }
 
+/** Слот не резолвит даже @telegram — даём ему отлежаться, в ферму вступлений не берём. */
+export const ACCOUNT_BLIND_COOLDOWN_MS = 6 * 60 * 60_000;
+
+/** Воркер подтвердил, что слеп аккаунт, а не группа (контрольный @telegram тоже не виден). */
+export function isAccountBlindResult(result: { accountBlind?: unknown } | null | undefined): boolean {
+  return result?.accountBlind === true;
+}
+
+export function isAccountResolveBlind(
+  account: { resolveBlindUntil?: string | null } | null | undefined,
+  now = Date.now(),
+): boolean {
+  const until = Date.parse(String(account?.resolveBlindUntil || ""));
+  return Number.isFinite(until) && until > now;
+}
+
+export function accountBlindPatch(now = Date.now()): { resolveBlindUntil: string } {
+  return { resolveBlindUntil: new Date(now + ACCOUNT_BLIND_COOLDOWN_MS).toISOString() };
+}
+
 export const JOIN_SUCCESS_PATCH: Required<JoinRetryFields> = {
   joinAttempts: 0,
   joinNextAt: "",

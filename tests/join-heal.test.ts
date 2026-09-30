@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  ACCOUNT_BLIND_COOLDOWN_MS,
   JOIN_MAX_ATTEMPTS,
   JOIN_SUCCESS_PATCH,
+  accountBlindPatch,
+  isAccountBlindResult,
+  isAccountResolveBlind,
   joinFailurePatch,
   joinRetryDelayMs,
   planGroupHeal,
@@ -70,5 +74,23 @@ describe("повторы вступления", () => {
     expect(g.joinGaveUp).toBe(true);
     expect(Date.parse(g.joinNextAt!)).toBeGreaterThan(NOW);
     expect({ ...g, ...JOIN_SUCCESS_PATCH }).toEqual({ joinAttempts: 0, joinNextAt: "", joinGaveUp: false });
+  });
+});
+
+describe("account resolve blindness", () => {
+  it("recognises only an explicit worker accountBlind flag", () => {
+    expect(isAccountBlindResult({ accountBlind: true })).toBe(true);
+    expect(isAccountBlindResult({ accountBlind: "true" })).toBe(false);
+    expect(isAccountBlindResult({})).toBe(false);
+    expect(isAccountBlindResult(null)).toBe(false);
+  });
+
+  it("keeps a blind account out of the farm for the cooldown window only", () => {
+    const acc = accountBlindPatch(NOW);
+    expect(Date.parse(acc.resolveBlindUntil) - NOW).toBe(ACCOUNT_BLIND_COOLDOWN_MS);
+    expect(isAccountResolveBlind(acc, NOW)).toBe(true);
+    expect(isAccountResolveBlind(acc, NOW + ACCOUNT_BLIND_COOLDOWN_MS)).toBe(false);
+    expect(isAccountResolveBlind({}, NOW)).toBe(false);
+    expect(isAccountResolveBlind({ resolveBlindUntil: "garbage" }, NOW)).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 "use client";
-import {useState,useEffect,useCallback,useRef,useMemo,Suspense} from 'react';
+import {useState,useEffect,useEffectEvent,useCallback,useRef,useMemo,Suspense} from 'react';
 import {useSearchParams} from 'next/navigation';
-import {Users,Radio,Shield,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge,AlertTriangle,BarChart3,Folder,CircleX} from 'lucide-react';
+import {Users,Radio,Sparkles,Plus,ArrowRight,Search,ChevronRight,ExternalLink,Pencil,Trash2,Check,Upload,Plug,Loader2,LogOut,RefreshCw,X,CloudUpload,FileArchive,Ban,ImagePlus,UserRound,Shuffle,UserPlus,Database,ScrollText,History,FilterX,Send,MessageSquare,Timer,Network,Gauge,AlertTriangle,BarChart3,Folder,CircleX} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {OverviewDashboard} from '@/components/product/overview-dashboard';
 import {LeadCorePanel} from '@/components/product/lead-core-panel';
@@ -170,7 +170,7 @@ async function staffApi(body:{action:string}&Record<string,unknown>,fallbackErro
 }
 
 /** Чистый payload группы: не тащим битый joinStateError из records в save. */
-function cleanGroupSaveData(data:Record<string,unknown>){
+function cleanGroupSaveData(data:Record<string,unknown>):Record<string,unknown>{
   const err=data.joinStateError;
   const joinStateError=
     err==null||typeof err==='object'?'':String(err).slice(0,500);
@@ -206,21 +206,6 @@ function proxyDisplayLabel(data:any){
   if(name&&!name.startsWith(':'))return name;
   if(name.startsWith(':')&&port)return `?:${port}`;
   return name||'Прокси';
-}
-
-function ProxyRefLabel({proxy}:{proxy:{id:string;data:any}|undefined}){
-  if(!proxy)return <span className="muted">Не назначен</span>;
-  const st=String(proxy.data.status||'inactive');
-  const active=st==='active';
-  const label=proxyDisplayLabel(proxy.data);
-  return (
-    <span className={`proxy-ref ${active?'is-active':st==='checking'?'is-checking':''}`} title={label}>
-      <span className="proxy-ref-name">{label}</span>
-      {active&&<span className="badge success">активен</span>}
-      {st==='checking'&&<span className="badge warning">проверка</span>}
-      {st==='inactive'&&<span className="badge neutral">неактивен</span>}
-    </span>
-  );
 }
 
 function Pick({value,onChange,options,placeholder}:{
@@ -264,12 +249,6 @@ function Pick({value,onChange,options,placeholder}:{
 function tempBadge(t?:string){
   const temp=(t==='hot'||t==='warm'||t==='cold'?t:'warm') as LeadTemperature;
   return <span className={`temp-badge ${temp}`}>{LEAD_TEMPERATURE_LABELS[temp]}</span>;
-}
-
-function groupRatingStars(rating:number){
-  const n=Math.max(0,Math.min(5,Math.round(Number(rating)||0)));
-  if(!n)return <span className="muted text-sm">Нет оценки</span>;
-  return <span className="group-rating" aria-label={`Рейтинг ${n} из 5`}>{'★'.repeat(n)}{'☆'.repeat(5-n)}</span>;
 }
 
 function parseKeywordList(value:string){
@@ -464,6 +443,18 @@ function AccountLimitsCell({data}:{data:any}){
   );
 }
 
+/** Итог «вступление + скан» для тоста. */
+type OnboardSummary={
+  joined:'requested'|'already'|'joined';
+  scanned:number;
+  matched:number;
+  added:number;
+  aiUsed:boolean;
+  title:string;
+  metrics?:unknown;
+  addedByTemp?:{hot?:number;warm?:number;cold?:number}|null;
+};
+
 function WorkspaceHome(){
   const searchParams=useSearchParams();
   const notices=useWorkspaceNotices();
@@ -473,7 +464,7 @@ function WorkspaceHome(){
   const [groupImportText,setGroupImportText]=useState('');
   const [groupImportAccountId,setGroupImportAccountId]=useState('');
   const [groupImportJoin,setGroupImportJoin]=useState(true);
-  const [accountImportOpen,setAccountImportOpen]=useState(false),[accountImportProxyId,setAccountImportProxyId]=useState(''),[accountImportNames,setAccountImportNames]=useState<string[]>([]);
+  const [accountImportOpen,setAccountImportOpen]=useState(false),[accountImportProxyId,setAccountImportProxyId]=useState('');
   const [accountImportFiles,setAccountImportFiles]=useState<File[]>([]);
   const [accountImportSessionMode,setAccountImportSessionMode]=useState<SessionMode>('keep');
   const [accountImportMixProxy,setAccountImportMixProxy]=useState(true);
@@ -523,7 +514,7 @@ function WorkspaceHome(){
   const [bulkProxyMix,setBulkProxyMix]=useState(false);
   const [bulkDeleteOpen,setBulkDeleteOpen]=useState(false);
   const [bulkLimitsOpen,setBulkLimitsOpen]=useState(false);
-  const [bulkLimits,setBulkLimits]=useState({
+  const [bulkLimits,setBulkLimits]=useState<{invite:number;message:number;chat:number;memberInvite:number}>({
     invite:TELEGRAM_RECOMMENDED_LIMITS.invite,
     message:TELEGRAM_RECOMMENDED_LIMITS.message,
     chat:TELEGRAM_RECOMMENDED_LIMITS.chat,
@@ -700,6 +691,7 @@ function WorkspaceHome(){
     setModal({kind,item});setForm(data);setSecret('');setClearSecret(false);setFormError('');setProxyPaste('');setOnboardAfterSave(false);
   };
 
+  const openGroupCreation=useEffectEvent(()=>{navigate('Группы и каналы');open('group')});
   useEffect(()=>{
     const context=(document as any).modelContext;
     if(!context?.registerTool)return;
@@ -711,7 +703,7 @@ function WorkspaceHome(){
       annotations:{readOnlyHint:false},
       execute(input:unknown){
         if(!input||typeof input!=='object'||Object.keys(input).length)throw new Error('Ожидается пустой объект');
-        navigate('Группы и каналы');open('group');return {opened:true};
+        openGroupCreation();return {opened:true};
       }
     },{signal:abort.signal})).catch(()=>{});
     return()=>abort.abort();
@@ -778,7 +770,8 @@ function WorkspaceHome(){
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[records,freshLeads.length,aiKeyReady,notices,staffInvites.length]);
 
-  useEffect(()=>{
+  // Синхронизируем форму только при смене значимых полей, а не на каждый refresh records.
+  const syncGenSettings=useEffectEvent(()=>{
     const d=settings?.data||{};
     setGenSettings({
       scanDepthDays:Math.max(1,Math.min(90,Number(d.scanDepthDays)||7)),
@@ -791,7 +784,8 @@ function WorkspaceHome(){
       notifyBotToken:String(d.notifyBotToken||''),
       notifyChatId:String(d.notifyChatId||''),
     });
-  },[settings?.id,settings?.data?.scanDepthDays,settings?.data?.autoRescanEnabled,settings?.data?.autoRescanMinutes,settings?.data?.profileName,settings?.data?.profileAbout,settings?.data?.profileContact,settings?.data?.notifyEnabled,settings?.data?.notifyBotToken,settings?.data?.notifyChatId]);
+  });
+  useEffect(()=>{syncGenSettings()},[settings?.id,settings?.data?.scanDepthDays,settings?.data?.autoRescanEnabled,settings?.data?.autoRescanMinutes,settings?.data?.profileName,settings?.data?.profileAbout,settings?.data?.profileContact,settings?.data?.notifyEnabled,settings?.data?.notifyBotToken,settings?.data?.notifyChatId]);
 
   // Автообход лидов крутит tg-worker → /api/cron/auto-rescan (24/7, без открытого кабинета).
   // Здесь только кнопка «Собрать лиды» и отображение статуса.
@@ -1322,30 +1316,7 @@ function WorkspaceHome(){
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[telegramConnected,loading]);
 
-  /** Вступление + скан лидов по сохранённой группе. */
-  async function onboardGroup(id:string,name?:string){
-    if(!telegramConnected)throw new Error('Запустите: npm run dev');
-    const join=await joinGroupPaced(id,name);
-    if(join.result?.join==='requested'){
-      return {joined:'requested' as const,scanned:0,matched:0,added:0,aiUsed:false,title:''};
-    }
-    if(!join.ok&&join.result?.join!=='already'){
-      throw new Error(join.result?.error||join.error||'Не удалось вступить в группу');
-    }
-    const scan=await scanAfterJoin(id,name||'Группа');
-    return {
-      joined:(join.result?.join==='already'?'already':'joined') as 'already'|'joined',
-      scanned:scan.scanned||0,
-      matched:scan.matched??scan.added??0,
-      added:scan.added||0,
-      aiUsed:!!scan.aiUsed,
-      title:scan.title||'',
-      metrics:scan.metrics||null,
-      addedByTemp:scan.addedByTemp||null,
-    };
-  }
-
-  function toastOnboard(name:string,r:Awaited<ReturnType<typeof onboardGroup>>){
+  function toastOnboard(name:string,r:OnboardSummary){
     if(r.joined==='requested'){
       toast.message(`${name}: заявка на вступление отправлена — скан после одобрения`);
       return;
@@ -1844,7 +1815,6 @@ function WorkspaceHome(){
       for(const f of next)map.set(f.name,f);
       return [...map.values()].slice(0,50);
     });
-    setAccountImportNames([]);
     setFormError(errs.slice(0,3).join(' · '));
   }
 
@@ -1914,7 +1884,6 @@ function WorkspaceHome(){
       await refresh();
       setAccountImportOpen(false);
       setAccountImportFiles([]);
-      setAccountImportNames([]);
       setAccountImportProxyId('');
       setAccountImportSessionMode('keep');
       setAccountImportMixProxy(true);
@@ -2736,8 +2705,7 @@ function WorkspaceHome(){
     const handle=window.setTimeout(()=>{
       if(catalogMarket==='db'){
         const q=catalogQuery.trim().toLowerCase();
-        const groups=list('group');
-        const hits=groups
+        const hits=records.filter(r=>r.kind==='group')
           .map(r=>{
             const url=String(r.data.url||'');
             const name=String(r.data.name||'Без названия');
@@ -3161,7 +3129,7 @@ function WorkspaceHome(){
                     disabled={busy}
                     onClick={()=>void importFullCatalogToDb()}
                   >Залить каталог ({catalogStats().uniqueUrls})</Button>
-                  <Button onClick={openCatalog}><Search size={16}/>Поиск по темам</Button>
+                  <Button onClick={()=>openCatalog()}><Search size={16}/>Поиск по темам</Button>
                 </>
               ):view==='Настройки'||view==='Сбор аудитории'||view==='Инвайтинг'||view==='Рассылка'||view==='Уведомления'||view==='Сотрудники'?null:(
                 <Button onClick={()=>open(currentKind||'group',currentKind==='settings'?settings:undefined)}>
@@ -3429,7 +3397,7 @@ function WorkspaceHome(){
                   )}
                   <Button variant="outline" disabled={busy} onClick={async()=>{setFarmProfileOpen(true);if(!farmAbout)await generateFarmProfile()}}><UserRound size={15}/>Профили фермы</Button>
                   <Button variant="outline" onClick={()=>{setFarmLogoOpen(true);setFarmLogoFile(null);setFarmLogoPreview('')}}><ImagePlus size={15}/>Логотип фермы</Button>
-                  <Button variant="outline" onClick={()=>{setAccountImportOpen(true);setFormError('');setAccountImportFiles([]);setAccountImportNames([]);setAccountImportProxyId('');setAccountImportSessionMode('keep');setAccountImportMixProxy(true)}}><Upload size={15}/>Импорт ZIP/RAR</Button>
+                  <Button variant="outline" onClick={()=>{setAccountImportOpen(true);setFormError('');setAccountImportFiles([]);setAccountImportProxyId('');setAccountImportSessionMode('keep');setAccountImportMixProxy(true)}}><Upload size={15}/>Импорт ZIP/RAR</Button>
                 </>
               ):currentKind==='group'?(
                 <div className="flex flex-wrap gap-2 items-center">
@@ -3557,7 +3525,7 @@ function WorkspaceHome(){
                 <div className="groups-page">
                   <div className="groups-top">
                     <div className="groups-top-actions">
-                      <Button onClick={openCatalog} disabled={busy}><Search size={15}/>Найти темы</Button>
+                      <Button onClick={()=>openCatalog()} disabled={busy}><Search size={15}/>Найти темы</Button>
                       <Button variant="outline" onClick={openManualGroup}><Plus size={15}/>Ссылка</Button>
                       <Button variant="outline" onClick={openMassGroups} disabled={busy}><Upload size={15}/>Массово</Button>
                       <Button
@@ -4661,7 +4629,7 @@ function WorkspaceHome(){
         </DialogContent>
       </Dialog>
 
-      <Dialog open={accountImportOpen} onOpenChange={o=>{if(!busy){setAccountImportOpen(o);if(!o){setAccountImportFiles([]);setAccountImportNames([]);setFormError('')}}}}>
+      <Dialog open={accountImportOpen} onOpenChange={o=>{if(!busy){setAccountImportOpen(o);if(!o){setAccountImportFiles([]);setFormError('')}}}}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Выберите аккаунты для загрузки</DialogTitle>

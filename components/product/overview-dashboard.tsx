@@ -111,8 +111,6 @@ export function OverviewDashboard({
   joinQueue,
   freshCount,
   hotCount,
-  warmCount: _warmCount,
-  coldCount: _coldCount,
   draftCount,
   joinedChats,
   needJoin,

@@ -2,6 +2,7 @@ import {
   readEnv,
   safeRelativeReturnPath,
   sessionCookieOptions,
+  timingSafeEqualBytes,
 } from "@/lib/auth";
 import { appOrigin, registrationOpen } from "@/lib/env";
 import {
@@ -268,8 +269,8 @@ export async function verifyTelegramAuth(
     key,
     new TextEncoder().encode(check),
   );
-  const hex = Buffer.from(mac).toString("hex");
-  if (hex !== hash) throw new Error("Неверная подпись Telegram");
+  const expected = Buffer.from(Buffer.from(mac).toString("hex"), "utf8");
+  if (!timingSafeEqualBytes(expected, Buffer.from(hash, "utf8"))) throw new Error("Неверная подпись Telegram");
   const authDate = Number(data.auth_date || 0);
   if (!authDate || Date.now() / 1000 - authDate > 86400) {
     throw new Error("Сессия Telegram устарела");

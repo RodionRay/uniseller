@@ -82,11 +82,24 @@ async function listCronOwners(): Promise<CronOwner[]> {
   return owners.filter((o) => !seen.has(o.userId) && !!seen.add(o.userId));
 }
 
-function authOk(req: Request): boolean {
+/**
+ * Compares SHA-256 digests with a fixed-length XOR loop: `===` on the raw header
+ * returns at the first differing byte and leaks the secret through timing.
+ * Kept local (not lib/auth) so route tests can mock lib/auth wholesale.
+ */
+async function bearerMatches(header: string, secret: string): Promise<boolean> {
+  const digest = async (value: string) =>
+    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+  const [a, b] = await Promise.all([digest(header), digest(`Bearer ${secret}`)]);
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
+}
+
+async function authOk(req: Request): Promise<boolean> {
   const secret = cronSecret();
   if (!secret) return false;
-  const auth = req.headers.get("authorization") || "";
-  return auth === `Bearer ${secret}`;
+  return bearerMatches(req.headers.get("authorization") || "", secret);
 }
 
 function isAbort(e: unknown) {
@@ -157,7 +170,7 @@ async function tryJoin(
  * Порциями: 1 join + 1–2 скана за тик, с бюджетом времени. Остаток — следующим тиком.
  */
 export async function POST(req: Request) {
-  if (!authOk(req)) return reply({ error: "Unauthorized" }, 401);
+  if (!(await authOk(req))) return reply({ error: "Unauthorized" }, 401);
 
   const origin = new URL(req.url).origin;
   const force =

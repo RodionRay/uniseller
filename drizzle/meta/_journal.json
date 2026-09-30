@@ -8,6 +8,20 @@
       "when": 1789320312073,
       "tag": "0000_even_hydra",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1790741976448,
+      "tag": "0001_users_oauth",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790741977258,
+      "tag": "0002_workspace_contact",
+      "breakpoints": true
     }
   ]
 }

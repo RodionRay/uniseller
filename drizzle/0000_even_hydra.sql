@@ -1,4 +1,4 @@
-CREATE TABLE `records` (
+CREATE TABLE IF NOT EXISTS `records` (
 	`id` text PRIMARY KEY NOT NULL,
 	`owner` text NOT NULL,
 	`kind` text NOT NULL,
@@ -7,4 +7,4 @@ CREATE TABLE `records` (
 	`created` text NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX `idx_records_owner_kind` ON `records` (`owner`,`kind`);
+CREATE INDEX IF NOT EXISTS `idx_records_owner_kind` ON `records` (`owner`,`kind`);

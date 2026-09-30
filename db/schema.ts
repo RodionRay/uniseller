@@ -71,3 +71,14 @@ export const workspaceInvites = sqliteTable(
     index("idx_ws_invites_owner").on(t.workspaceOwnerId),
   ],
 );
+
+export const contactMessages = sqliteTable("contact_messages", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  email: text("email").notNull(),
+  telegram: text("telegram"),
+  company: text("company"),
+  task: text("task"),
+  message: text("message").notNull(),
+  created: text("created").notNull(),
+});

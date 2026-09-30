@@ -6,6 +6,7 @@ import {
   sessionCookieName,
 } from "@/lib/auth";
 import { listUserIdsForCron } from "@/lib/users";
+import { constantTimeEqual } from "@/lib/security/secret-compare";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -26,20 +27,17 @@ function reply(data: unknown, status = 200) {
   });
 }
 
-function cronSecret(): string {
-  return (
-    readEnv("CRON_SECRET") ||
-    readEnv("TG_WORKER_TOKEN") ||
-    readEnv("SESSION_SECRET") ||
-    ""
-  );
+const MIN_CRON_SECRET_LENGTH = 32;
+
+/** Dedicated secret only: never reuse SESSION_SECRET / TG_WORKER_TOKEN. */
+function cronSecret(): string | null {
+  const secret = readEnv("CRON_SECRET");
+  return secret && secret.length >= MIN_CRON_SECRET_LENGTH ? secret : null;
 }
 
-function authOk(req: Request): boolean {
-  const secret = cronSecret();
-  if (!secret) return false;
+async function bearerMatches(req: Request, secret: string): Promise<boolean> {
   const auth = req.headers.get("authorization") || "";
-  return auth === `Bearer ${secret}`;
+  return constantTimeEqual(auth, `Bearer ${secret}`);
 }
 
 function isAbort(e: unknown) {
@@ -110,7 +108,13 @@ async function tryJoin(
  * Порциями: 1 join + 1–2 скана за тик, с бюджетом времени. Остаток — следующим тиком.
  */
 export async function POST(req: Request) {
-  if (!authOk(req)) return reply({ error: "Unauthorized" }, 401);
+  const secret = cronSecret();
+  if (!secret) {
+    return reply({ error: "CRON_SECRET не настроен (минимум 32 символа)" }, 503);
+  }
+  if (!(await bearerMatches(req, secret))) {
+    return reply({ error: "Unauthorized" }, 401);
+  }
 
   const origin = new URL(req.url).origin;
   const force =

@@ -231,7 +231,7 @@ async function sessionKey(): Promise<CryptoKey> {
 
 async function deriveKey(
   password: string,
-  salt: Buffer | Uint8Array,
+  salt: Uint8Array,
   iterations: number,
 ): Promise<ArrayBuffer> {
   const baseKey = await crypto.subtle.importKey(
@@ -244,7 +244,9 @@ async function deriveKey(
   return crypto.subtle.deriveBits(
     {
       name: "PBKDF2",
-      salt,
+      // Copy into a fresh ArrayBuffer-backed view: WebCrypto's BufferSource type
+      // rejects Buffer/SharedArrayBuffer-backed views.
+      salt: new Uint8Array(salt),
       iterations,
       hash: "SHA-256",
     },

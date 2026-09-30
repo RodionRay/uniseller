@@ -17,6 +17,8 @@ const DEFAULT_MAX_CONCURRENCY = 4;
 const DEFAULT_MAX_QUEUE = 64;
 const DEFAULT_MAX_STDOUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5_000;
+// After SIGKILL the kernel reaps the child almost at once; this only bounds a missing 'close'.
+const STOP_FALLBACK_MARGIN_MS = 1_000;
 const GENERIC_WORKER_ERROR = "Ошибка воркера (нет ответа)";
 const TIMEOUT_ERROR = "Таймаут воркера";
 const ABORTED_ERROR = "Запрос отменён клиентом";
@@ -209,21 +211,32 @@ export function createPythonRunner(opts) {
         child.kill("SIGTERM");
         killTimer = setTimeout(() => child.kill("SIGKILL"), killGraceMs);
       };
-      const timer = setTimeout(() => {
+      /** Result to report once a stopped child is gone; null while it runs normally. */
+      /** @type {Record<string, unknown> | null} */
+      let stopResult = null;
+      /** @type {NodeJS.Timeout | undefined} */
+      let stopFallback;
+      /**
+       * Kills the child and answers only when it has exited ('close'), so the caller's
+       * slot is not freed while Python still runs. The fallback covers a killed child
+       * whose pipes stay open (e.g. an orphaned grandchild holding stdout).
+       * @param {string} error
+       */
+      const stop = (error) => {
+        if (settled || stopResult) return;
+        stopResult = { ok: false, status: "disconnected", error };
         terminate();
-        finish({ ok: false, status: "disconnected", error: TIMEOUT_ERROR });
-      }, timeoutMs);
-      const onAbort = () => {
-        terminate();
-        finish({ ok: false, status: "disconnected", error: ABORTED_ERROR });
+        const result = stopResult;
+        stopFallback = setTimeout(() => finish(result), killGraceMs + STOP_FALLBACK_MARGIN_MS);
       };
+      const timer = setTimeout(() => stop(TIMEOUT_ERROR), timeoutMs);
+      const onAbort = () => stop(ABORTED_ERROR);
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) onAbort();
       child.stdout.on("data", (/** @type {Buffer} */ d) => {
         outBytes += d.length;
         if (outBytes > maxStdoutBytes) {
-          terminate();
-          finish({ ok: false, status: "disconnected", error: GENERIC_WORKER_ERROR });
+          stop(GENERIC_WORKER_ERROR);
           return;
         }
         outChunks.push(d);
@@ -236,10 +249,12 @@ export function createPythonRunner(opts) {
           clearTimeout(timer);
           signal?.removeEventListener("abort", onAbort);
           if (killTimer) clearTimeout(killTimer);
+          if (stopFallback) clearTimeout(stopFallback);
           rm(workDir, { recursive: true, force: true })
             .catch(() => console.warn("[tg-worker] failed to remove work dir"))
             .finally(() => done(undefined));
           if (settled) return;
+          if (stopResult) return finish(stopResult);
           const line = Buffer.concat(outChunks).toString("utf8").trim().split("\n").filter(Boolean).pop() || "";
           try {
             finish(JSON.parse(line));

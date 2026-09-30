@@ -1,6 +1,6 @@
 import {afterEach, beforeAll, describe, expect, it} from 'vitest';
 import {spawn} from 'node:child_process';
-import {mkdtempSync, mkdirSync, readdirSync, writeFileSync, existsSync, utimesSync} from 'node:fs';
+import {mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync, utimesSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import type {AddressInfo} from 'node:net';
@@ -343,6 +343,54 @@ describe('tg-worker python runner', () => {
     expect(result.error).not.toMatch(/secret|Traceback|\/Users/);
     await run.idle();
     expect(readdirSync(tmpRoot)).toEqual([]);
+  });
+
+  function pidAlive(pid: number) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it.each(['timeout', 'abort'] as const)('answers only after a SIGTERM-ignoring child is gone (%s)', async (how) => {
+    const tmpRoot = mkdtempSync(join(scratch, 'root-'));
+    const pidFile = join(scratch, `pid-${how}`);
+    const script = fakeScript(`stubborn-${how}.mjs`, `
+      (await import('node:fs')).writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+      process.on('SIGTERM', () => {});
+      setInterval(() => {}, 1000);
+    `);
+    const run = createPythonRunner({python: process.execPath, script, tmpRoot, killGraceMs: 400});
+    const ac = new AbortController();
+    const pending = run({action: 'check'}, how === 'timeout' ? 300 : 60_000, ac.signal);
+    if (how === 'abort') setTimeout(() => ac.abort(), 300);
+    expect(await pending).toMatchObject({ok: false, status: 'disconnected'});
+    expect(pidAlive(Number(readFileSync(pidFile, 'utf8')))).toBe(false);
+    await run.idle();
+  });
+
+  it('still answers when a killed child cannot close its pipes', async () => {
+    const tmpRoot = mkdtempSync(join(scratch, 'root-'));
+    const pidFile = join(scratch, 'pid-grandchild');
+    // The grandchild inherits stdout, so 'close' never fires after the child is killed.
+    const script = fakeScript('orphaner.mjs', `
+      const {spawn} = await import('node:child_process');
+      const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio: 'inherit', detached: true});
+      (await import('node:fs')).writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
+      process.on('SIGTERM', () => {});
+      setInterval(() => {}, 1000);
+    `);
+    const run = createPythonRunner({python: process.execPath, script, tmpRoot, killGraceMs: 200});
+    const t0 = Date.now();
+    try {
+      expect(await run({action: 'check'}, 300)).toMatchObject({ok: false, status: 'disconnected'});
+      expect(Date.now() - t0).toBeLessThan(3_000);
+    } finally {
+      process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL');
+      await run.idle();
+    }
   });
 
   it('kills the child and skips spawning when the job is aborted', async () => {

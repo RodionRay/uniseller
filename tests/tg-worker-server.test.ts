@@ -1,0 +1,211 @@
+import {afterEach, beforeAll, describe, expect, it} from 'vitest';
+import {spawn} from 'node:child_process';
+import {mkdtempSync, mkdirSync, readdirSync, writeFileSync, existsSync, utimesSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import type {AddressInfo} from 'node:net';
+import type {Server} from 'node:http';
+import {
+  createPythonRunner,
+  createWorkerServer,
+  cronTargetAllowed,
+  purgeStaleWorkDirs,
+  resolveConfig,
+  tokenMatches,
+} from '../telegram-worker/src/worker-app.mjs';
+
+const TOKEN = 'a'.repeat(64);
+const SERVER_ENTRY = join(__dirname, '../telegram-worker/src/server.mjs');
+
+let scratch = '';
+beforeAll(() => {
+  scratch = mkdtempSync(join(tmpdir(), 'tgw-test-'));
+});
+
+const servers: Server[] = [];
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(() => r(null)))));
+});
+
+async function listen(opts: {maxConcurrency?: number; runPython?: (p: unknown, t: number) => Promise<unknown>} = {}) {
+  const config = resolveConfig({TG_WORKER_TOKEN: TOKEN, TG_WORKER_PORT: '0', TG_WORKER_MAX_CONCURRENCY: String(opts.maxConcurrency ?? 4)});
+  const server = createWorkerServer(config, {
+    runPython: opts.runPython ?? (async () => ({ok: true})),
+    tickAutoRescan: async () => ({skipped: true}),
+    autoRescanStatus: () => ({appUrl: 'http://127.0.0.1:5173', busy: false}),
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  servers.push(server);
+  const port = (server.address() as AddressInfo).port;
+  return {port, base: `http://127.0.0.1:${port}`};
+}
+
+function post(base: string, path: string, init: {token?: string; host?: string; contentType?: string; body?: string} = {}) {
+  const headers: Record<string, string> = {};
+  if (init.token !== undefined) headers.Authorization = `Bearer ${init.token}`;
+  if (init.contentType !== undefined) headers['Content-Type'] = init.contentType;
+  if (init.host) headers.Host = init.host;
+  return rawRequest(base, path, 'POST', headers, init.body ?? '{}');
+}
+
+// fetch() forbids overriding Host, so use node:http directly.
+async function rawRequest(base: string, path: string, method: string, headers: Record<string, string>, body?: string) {
+  const {request} = await import('node:http');
+  const url = new URL(path, base);
+  return new Promise<{status: number; json: Record<string, unknown>}>((resolve, reject) => {
+    const req = request({host: url.hostname, port: url.port, path: url.pathname, method, headers}, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => resolve({status: res.statusCode ?? 0, json: data ? JSON.parse(data) : {}}));
+    });
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+describe('tg-worker config', () => {
+  it('refuses a missing or short TG_WORKER_TOKEN', () => {
+    expect(() => resolveConfig({})).toThrow(/TG_WORKER_TOKEN/);
+    expect(() => resolveConfig({TG_WORKER_TOKEN: 'short'})).toThrow(/32/);
+    expect(resolveConfig({TG_WORKER_TOKEN: TOKEN}).token).toBe(TOKEN);
+  });
+
+  it('process exits non-zero when started without a token', async () => {
+    const child = spawn(process.execPath, [SERVER_ENTRY], {
+      env: {...process.env, TG_WORKER_TOKEN: '', TG_WORKER_PORT: '0', CRON_SECRET: ''},
+      stdio: 'ignore',
+    });
+    const code = await new Promise<number | null>((r) => child.on('exit', (c) => r(c)));
+    expect(code).not.toBe(0);
+  });
+
+  it('compares tokens exactly', () => {
+    expect(tokenMatches(`Bearer ${TOKEN}`, TOKEN)).toBe(true);
+    expect(tokenMatches(`Bearer ${TOKEN}x`, TOKEN)).toBe(false);
+    expect(tokenMatches('', TOKEN)).toBe(false);
+    expect(tokenMatches(undefined, TOKEN)).toBe(false);
+  });
+
+  it('sends cron only to https or loopback APP_URL', () => {
+    expect(cronTargetAllowed('https://app.example.com')).toBe(true);
+    expect(cronTargetAllowed('http://127.0.0.1:5173')).toBe(true);
+    expect(cronTargetAllowed('http://localhost:5173')).toBe(true);
+    expect(cronTargetAllowed('http://[::1]:5173')).toBe(true);
+    expect(cronTargetAllowed('http://app.example.com')).toBe(false);
+    expect(cronTargetAllowed('not a url')).toBe(false);
+  });
+});
+
+describe('tg-worker HTTP guard', () => {
+  it('rejects a wrong token with 401', async () => {
+    const {base} = await listen();
+    const res = await post(base, '/check-proxy', {token: 'b'.repeat(64), contentType: 'application/json'});
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects a foreign Host header with 403 (DNS rebinding)', async () => {
+    const {base, port} = await listen();
+    const res = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json', host: `evil.example:${port}`});
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects a non-JSON Content-Type with 415', async () => {
+    const {base} = await listen();
+    const res = await post(base, '/check-proxy', {token: TOKEN, contentType: 'text/plain'});
+    expect(res.status).toBe(415);
+  });
+
+  it('accepts a valid request on localhost Host', async () => {
+    const {base, port} = await listen();
+    const res = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json; charset=utf-8', host: `localhost:${port}`});
+    expect(res.status).toBe(200);
+    expect(res.json.ok).toBe(true);
+  });
+
+  it('hides autoRescan details on /health unless authed', async () => {
+    const {base} = await listen();
+    const anon = await rawRequest(base, '/health', 'GET', {});
+    expect(anon.status).toBe(200);
+    expect(anon.json).toEqual({ok: true, service: 'uniseller-tg-worker'});
+    const authed = await rawRequest(base, '/health', 'GET', {Authorization: `Bearer ${TOKEN}`});
+    expect(authed.json.autoRescan).toBeDefined();
+  });
+
+  it('returns 413 for an oversized body', async () => {
+    const {base} = await listen();
+    const res = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json', body: JSON.stringify({x: 'y'.repeat(7_000_000)})});
+    expect(res.status).toBe(413);
+  });
+
+  it('returns 429 when all worker slots are busy', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const {base} = await listen({maxConcurrency: 1, runPython: async () => {await gate; return {ok: true};}});
+    const first = post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    await new Promise((r) => setTimeout(r, 100));
+    const second = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    expect(second.status).toBe(429);
+    release();
+    expect((await first).status).toBe(200);
+    const third = await post(base, '/check-proxy', {token: TOKEN, contentType: 'application/json'});
+    expect(third.status).toBe(200);
+  });
+});
+
+describe('tg-worker python runner', () => {
+  function fakeScript(name: string, body: string) {
+    const path = join(scratch, name);
+    writeFileSync(path, body);
+    return path;
+  }
+
+  it('removes the work dir after a timeout even if the child ignores SIGTERM', async () => {
+    const tmpRoot = mkdtempSync(join(scratch, 'root-'));
+    const script = fakeScript('sleeper.mjs', `
+      const i = process.argv.indexOf('--work-dir');
+      const fs = await import('node:fs');
+      fs.writeFileSync(process.argv[i + 1] + '/account.session', 'secret');
+      process.on('SIGTERM', () => {});
+      setInterval(() => {}, 1000);
+    `);
+    const run = createPythonRunner({python: process.execPath, script, tmpRoot, killGraceMs: 200});
+    const result = await run({action: 'check'}, 300);
+    expect(result).toMatchObject({ok: false, status: 'disconnected'});
+    await run.idle();
+    expect(readdirSync(tmpRoot).filter((n) => n.startsWith('uniseller-acc-'))).toEqual([]);
+  });
+
+  it('returns a generic error without stderr when the child prints no JSON', async () => {
+    const tmpRoot = mkdtempSync(join(scratch, 'root-'));
+    const script = fakeScript('crash.mjs', `process.stderr.write('Traceback: secret /Users/x/path ValueError: boom\\n'); process.exit(1);`);
+    const run = createPythonRunner({python: process.execPath, script, tmpRoot, killGraceMs: 200});
+    const result = (await run({action: 'check'}, 5000)) as {error: string};
+    expect(result.error).not.toMatch(/secret|Traceback|\/Users/);
+    await run.idle();
+    expect(readdirSync(tmpRoot)).toEqual([]);
+  });
+
+  it('kills a child whose stdout exceeds the cap', async () => {
+    const tmpRoot = mkdtempSync(join(scratch, 'root-'));
+    const script = fakeScript('flood.mjs', `const s = 'x'.repeat(65536); const w = () => process.stdout.write(s, w); w();`);
+    const run = createPythonRunner({python: process.execPath, script, tmpRoot, killGraceMs: 200, maxStdoutBytes: 256 * 1024});
+    const result = (await run({action: 'check'}, 10_000)) as {ok: boolean};
+    expect(result.ok).toBe(false);
+  });
+
+  it('purges only stale uniseller-acc-* dirs', async () => {
+    const tmpRoot = mkdtempSync(join(scratch, 'root-'));
+    const stale = join(tmpRoot, 'uniseller-acc-old');
+    const fresh = join(tmpRoot, 'uniseller-acc-new');
+    const other = join(tmpRoot, 'other-old');
+    for (const d of [stale, fresh, other]) mkdirSync(d);
+    const old = new Date(Date.now() - 11 * 60_000);
+    utimesSync(stale, old, old);
+    utimesSync(other, old, old);
+    await purgeStaleWorkDirs({dir: tmpRoot, maxAgeMs: 10 * 60_000});
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(other)).toBe(true);
+  });
+});

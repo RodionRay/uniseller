@@ -2258,8 +2258,20 @@ async def upload_profile_photo(client, payload: dict[str, Any]) -> dict[str, Any
         return {"ok": False, "error": str(e)[:300]}
     return {"ok": True, "hasPhoto": True}
 
+# Задаётся Node-воркером (--work-dir): он создаёт каталог 0700 и удаляет его сам,
+# даже если процесс Python убит по таймауту (иначе сессии остаются в /tmp открытым текстом).
+_WORK_DIR_OVERRIDE: Path | None = None
+
+
+def acquire_work_dir() -> Path:
+    if _WORK_DIR_OVERRIDE is not None:
+        _WORK_DIR_OVERRIDE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="job-", dir=_WORK_DIR_OVERRIDE))
+    return Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+
+
 async def run_check(payload: dict[str, Any]) -> dict[str, Any]:
-    work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+    work = acquire_work_dir()
     client = None
     try:
         client = await open_client(payload, work)
@@ -2332,7 +2344,7 @@ async def run_action(payload: dict[str, Any]) -> dict[str, Any]:
         if action == "check_proxy":
             return await check_proxy_alive(payload)
 
-        work = Path(tempfile.mkdtemp(prefix="uniseller-acc-"))
+        work = acquire_work_dir()
         client = None
         try:
             client = await open_client(payload, work)
@@ -2429,8 +2441,9 @@ def _emit_error(exc: BaseException) -> int:
     if isinstance(exc, asyncio.CancelledError):
         text = "Операция прервана (таймаут/отмена)"
     else:
-        msg = str(exc).strip()
-        text = f"{name}: {msg}" if msg else name
+        # Сообщение исключения может содержать пути/секреты — наружу только тип.
+        text = f"Ошибка воркера ({name})"
+    print(f"[check_account] unhandled {name}", file=sys.stderr)
     err = {
         "ok": False,
         "status": "disconnected",
@@ -2448,7 +2461,11 @@ def _emit_error(exc: BaseException) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--payload", help="JSON file or - for stdin")
+    parser.add_argument("--work-dir", help="Scratch dir owned (and removed) by the caller")
     args = parser.parse_args()
+    global _WORK_DIR_OVERRIDE
+    if args.work_dir:
+        _WORK_DIR_OVERRIDE = Path(args.work_dir)
     try:
         if args.payload == "-" or not args.payload:
             payload = json.load(sys.stdin)

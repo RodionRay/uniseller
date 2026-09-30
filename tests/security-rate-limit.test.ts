@@ -32,6 +32,20 @@ describe("consumeRateLimit", () => {
     expect(Number(rows?.n)).toBe(0);
   });
 
+  it("stops at the first exceeded rule without counting the later ones", async () => {
+    const narrow = { name: "narrow", limit: 1, windowSec: 60 };
+    const wide = { name: "wide", limit: 100, windowSec: 60 };
+    await consumeRateLimits([[narrow, "ip"], [wide, "all"]], T0);
+    for (let i = 0; i < 5; i++) {
+      expect((await consumeRateLimits([[narrow, "ip"], [wide, "all"]], T0)).allowed).toBe(false);
+    }
+    const row = await db
+      .prepare("SELECT count FROM rate_limits WHERE key LIKE 'wide:%'")
+      .bind()
+      .first<{ count: number }>();
+    expect(Number(row?.count)).toBe(1);
+  });
+
   it("stores hashed subjects, not raw emails", async () => {
     await consumeRateLimit(RULE, "person@example.com", T0);
     const rows = await db.prepare("SELECT key FROM rate_limits").bind().all();

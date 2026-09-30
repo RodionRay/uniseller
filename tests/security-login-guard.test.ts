@@ -81,42 +81,91 @@ describe("admin cannot be shadowed by a DB user", () => {
 });
 
 describe("login and register rate limits", () => {
-  it("limits attempts per email across IPs", async () => {
+  it("limits failed guesses per email from one IP", async () => {
+    const ip = "203.0.113.101";
     const statuses: number[] = [];
     for (let i = 0; i < 11; i++) {
-      const res = await post(login, "/api/auth/login", {
-        email: "target@example.com",
-        password: `guess-${i}`,
-      });
+      const res = await post(
+        login,
+        "/api/auth/login",
+        { email: "target@example.com", password: `guess-${i}` },
+        ip,
+      );
       statuses.push(res.status);
     }
     expect(statuses.slice(0, 10).every((s) => s === 401)).toBe(true);
     expect(statuses[10]).toBe(429);
   });
 
-  it("does not count successful logins against the email", async () => {
+  it("does not lock the owner out when an attacker exhausts guesses from another IP", async () => {
+    const email = "victim@example.com";
+    await createUser({ email, passwordHash: await hashPassword(DB_PW), name: "V" });
+    for (let i = 0; i < 11; i++) {
+      await post(login, "/api/auth/login", { email, password: `attack-${i}` }, "203.0.113.102");
+    }
+    expect(
+      (await post(login, "/api/auth/login", { email, password: DB_PW }, "203.0.113.102")).status,
+    ).toBe(429);
+    expect(
+      (await post(login, "/api/auth/login", { email, password: DB_PW }, "203.0.113.103")).status,
+    ).toBe(200);
+  });
+
+  it("caps attempts per email across all IPs", async () => {
+    const statuses: number[] = [];
+    for (let i = 0; i < 101; i++) {
+      const res = await post(login, "/api/auth/login", {
+        email: "distributed@example.com",
+        password: `guess-${i}`,
+      });
+      statuses.push(res.status);
+    }
+    expect(statuses.slice(0, 100).every((s) => s === 401)).toBe(true);
+    expect(statuses[100]).toBe(429);
+  });
+
+  it("counts parallel guesses before the slow password check", async () => {
+    const email = "raced@example.com";
+    await createUser({ email, passwordHash: await hashPassword(DB_PW), name: "R" });
+    const responses = await Promise.all(
+      Array.from({ length: 30 }, (_, i) =>
+        post(login, "/api/auth/login", { email, password: `race-${i}` }, "203.0.113.104"),
+      ),
+    );
+    const statuses = responses.map((r) => r.status);
+    expect(statuses.filter((s) => s === 401)).toHaveLength(10);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(20);
+  });
+
+  it("does not block repeated successful logins", async () => {
     const email = "busy@example.com";
     await createUser({ email, passwordHash: await hashPassword(DB_PW), name: "Busy" });
     const statuses: number[] = [];
     for (let i = 0; i < 15; i++) {
-      statuses.push((await post(login, "/api/auth/login", { email, password: DB_PW })).status);
+      statuses.push(
+        (await post(login, "/api/auth/login", { email, password: DB_PW }, "203.0.113.105")).status,
+      );
     }
     expect(statuses.every((s) => s === 200)).toBe(true);
   });
 
-  it("resets the email failure count after a successful login", async () => {
+  it("resets the email+IP failure count after a successful login", async () => {
     const email = "forgetful@example.com";
+    const ip = "203.0.113.106";
     await createUser({ email, passwordHash: await hashPassword(DB_PW), name: "F" });
     for (let i = 0; i < 9; i++) {
-      await post(login, "/api/auth/login", { email, password: `wrong-${i}` });
+      await post(login, "/api/auth/login", { email, password: `wrong-${i}` }, ip);
     }
-    expect((await post(login, "/api/auth/login", { email, password: DB_PW })).status).toBe(200);
+    expect((await post(login, "/api/auth/login", { email, password: DB_PW }, ip)).status).toBe(200);
     const statuses: number[] = [];
     for (let i = 0; i < 10; i++) {
-      statuses.push((await post(login, "/api/auth/login", { email, password: `again-${i}` })).status);
+      statuses.push(
+        (await post(login, "/api/auth/login", { email, password: `again-${i}` }, ip)).status,
+      );
     }
     expect(statuses.every((s) => s === 401)).toBe(true);
-    expect((await post(login, "/api/auth/login", { email, password: DB_PW })).status).toBe(429);
+    // Guessing from this IP is exhausted again; the owner's other networks are unaffected.
+    expect((await post(login, "/api/auth/login", { email, password: DB_PW }, ip)).status).toBe(429);
   });
 
   it("limits attempts per IP across emails", async () => {

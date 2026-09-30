@@ -28,6 +28,15 @@ Telegram authorization / tdata import, joining groups, proxy connectivity checks
    Только UI без воркера: `npm run dev:web`
 6. Open http://localhost:5173/login
 
+### Telegram worker (`telegram-worker/`)
+- Python deps: `cd telegram-worker && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` (versions pinned from the working venv). The venv runs **Python 3.9, which is end-of-life since October 2025** — no security fixes; migration to 3.12+ is pending (not done yet).
+- `telegram-worker/src/server.mjs` refuses to start without `TG_WORKER_TOKEN` (≥32 chars); the web app sends it as `Authorization: Bearer …`. Requests must use `Host: 127.0.0.1:<port>` or `localhost:<port>` (extra hosts: `TG_WORKER_ALLOWED_HOSTS`, comma-separated) and `Content-Type: application/json`. `/health` returns only `{ok, service}` without the token.
+- Limits: `TG_WORKER_MAX_CONCURRENCY` (default 4, excess → 429), `TG_WORKER_MAX_BODY_BYTES` (default 6000000 → 413), Python stdout 2 MB, account archives ≤5000 files / ≤200 MB unpacked. Proxy hosts resolving to loopback/private/link-local/CGNAT/multicast addresses are rejected.
+- Session archives are unpacked into a `0700` temp dir `uniseller-acc-*` created and always removed by Node (timeout → SIGTERM, SIGKILL after 5 s); stale dirs older than 10 minutes are purged on start.
+- Auto-rescan cron: the worker calls `APP_URL/api/cron/auto-rescan` with `Authorization: Bearer $CRON_SECRET` only if `APP_URL` is https or loopback.
+- `npm run dev`: if `TG_WORKER_TOKEN` / `CRON_SECRET` are absent from env and `.env`, random per-run values are generated and passed to both processes (not written to `.env`).
+- Tests: `npx vitest run tests/tg-worker-server.test.ts`; Python guards: `telegram-worker/.venv/bin/python -m unittest discover -s telegram-worker/tests`.
+
 Runtime DB is Cloudflare D1 (local file under `.wrangler/state`). `better-sqlite3` is only for optional Node scripts (`npm run db:migrate`).
 
 ## Not implemented yet

@@ -129,5 +129,20 @@ class ScanCountersTest(unittest.TestCase):
             {"fetched": 0, "skippedMinus": 0, "skippedKw": 0, "skippedNotUser": 0},
         )
 
+    def test_not_a_member_early_return_reports_zero_counters(self) -> None:
+        async def run() -> dict[str, Any]:
+            with mock.patch.object(ca, "_resolve_entity", lambda _c, _u: resolve_to(GROUP)), mock.patch.object(
+                ca, "_is_member", mock.AsyncMock(return_value=False)
+            ):
+                return await ca.scan_group(FakeClient(None, {}), "https://t.me/example", ["остатк"], ["казино"])
+
+        result = asyncio.run(run())
+        self.assertEqual(result["join"], "need_join")
+        self.assertEqual(
+            {k: result[k] for k in ("fetched", "skippedMinus", "skippedKw", "skippedNotUser")},
+            {"fetched": 0, "skippedMinus": 0, "skippedKw": 0, "skippedNotUser": 0},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

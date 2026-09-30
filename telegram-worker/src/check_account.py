@@ -1273,6 +1273,7 @@ async def scan_group(
                     "error": "Сначала вступите в группу по инвайту",
                     "messages": [],
                     "member": False,
+                    **counters(),
                 }
             entity = invite.chat
         else:
@@ -1285,6 +1286,7 @@ async def scan_group(
                     "error": str(resolve_err.get("error") or "Не удалось найти группу")[:400],
                     "messages": [],
                     "member": False,
+                    **counters(),
                     "usernameMissing": bool(resolve_err.get("usernameMissing")),
                     "title": "",
                 }
@@ -1296,6 +1298,7 @@ async def scan_group(
                     "error": f"Слот не видит @{ref.get('value')}",
                     "messages": [],
                     "member": False,
+                    **counters(),
                     "usernameMissing": True,
                 }
             if not await member_of(entity):
@@ -1306,6 +1309,7 @@ async def scan_group(
                     "error": "Аккаунт не в группе — сначала нажмите «Вступить»",
                     "messages": [],
                     "member": False,
+                    **counters(),
                     "title": getattr(entity, "title", None)
                     or getattr(entity, "username", "")
                     or url,

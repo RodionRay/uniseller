@@ -724,6 +724,8 @@ const INVITE_TICK_LOCK_MS=10*60_000;
 const MAILING_TICK_LOCK_MS=15*60_000;
 /** Mailing stops taking new recipients after this, so the lock TTL is never reached. */
 const MAILING_TICK_BUDGET_MS=10*60_000;
+/** Invite tick fields that survive a pause landing mid-tick (the rest is the user's call). */
+const INVITE_PROGRESS_FIELDS=new Set(['done','invitedToday','inviteDay','lastTickAt']);
 const TICK_BUSY_WAIT_SEC=15;
 /** poll_dm_replies: at most this many sessions per call, inside one time budget (REQ-B8). */
 const POLL_DM_MAX_ACCOUNTS=2;
@@ -1933,7 +1935,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    const {payload}=await loadAccountSessionPayload(owner,gdata.accountId);
    const result=await accountWorkerPost(owner,gdata.accountId,'/join-group',{...payload,url:gdata.url});
    const frozen=result.status==='frozen'||result.join==='frozen'||/FROZEN|заморожен/i.test(String(result.error||''));
-   const flood=result.join==='flood'||/FloodWait/i.test(String(result.error||''));
+   const flood=floodWaitSeconds(result)>0||result.join==='flood'||/FloodWait/i.test(String(result.error||''));
    const joinedOk=!!result.ok||result.join==='already'||result.join==='requested';
    const reallyJoined=result.join==='already'||(!!result.ok&&result.join!=='requested'&&result.join!=='flood'&&result.join!=='missing'&&result.join!=='frozen');
    const status=result.join==='requested'?'pending':reallyJoined?'active':frozen?'error':'error';
@@ -1956,7 +1958,9 @@ export async function POST(req:Request){const session=await getSessionUser();con
    }
    if(flood){
     const m=/FloodWait\s+(\d+)/i.exec(String(result.error||''));
-    const sec=Math.max(60,m?Number(m[1]):900);
+    const sec=Math.max(60,floodWaitSeconds(result)||(m?Number(m[1]):900));
+    // Legacy join:'flood' without status: still pause the account (idempotent with accountWorkerPost).
+    await applyFloodCooldown(owner,String(gdata.accountId),{status:'flood',waitSec:sec});
     // FloodWait — только пауза темпа (lastJoinAt), без статуса «Отлежка».
     const paced={
      ...adata,
@@ -3306,7 +3310,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
   const data=JSON.parse(row.data);
   if(b.action==='pause_invite'){
    const next={...data,status:'paused',nextAt:'',tickLockUntil:'',log:pushTaskLog(data.log,'info','Задача остановлена')};
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'invite_task').run();
+   await writeRecordDiff(db,{owner,kind:'invite_task',id},data,next);
    return reply({ok:true,task:next});
   }
   // Уже запущена — не дублируем лог (двойной клик / гонка с poller)
@@ -3480,19 +3484,14 @@ export async function POST(req:Request){const session=await getSessionUser();con
    // Перечитываем перед записью — не затираем параллельный start/pause
    const freshRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'invite_task').first();
    const fresh=freshRow?JSON.parse(freshRow.data):data;
-   if(fresh.status==='paused'){
-    const paused={...fresh,tickLockUntil:''};
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(paused),owner,id,'invite_task').run();
-    return paused;
-   }
-   const next={
-    ...fresh,
-    ...patch,
-    log:entries?pushTaskLogs(Array.isArray(fresh.log)?fresh.log:data.log,entries):(patch.log??fresh.log),
-    tickLockUntil:'',
-   };
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'invite_task').run();
-   return next;
+   const log=entries?pushTaskLogs(Array.isArray(fresh.log)?fresh.log:data.log,entries):(patch.log??fresh.log);
+   // Paused meanwhile: keep the user's status/schedule, but never drop the invites counted.
+   const owned=fresh.status==='paused'
+    ?Object.fromEntries(Object.entries(patch).filter(([k])=>INVITE_PROGRESS_FIELDS.has(k)))
+    :patch;
+   const fields={...owned,log,tickLockUntil:''};
+   await patchRecordData(db,{owner,kind:'invite_task',id},fields);
+   return {...fresh,...fields};
   };
   try{
    const {payload,account}=await loadAccountSessionPayload(owner,accountId);
@@ -3530,7 +3529,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
     if(arow){
      const adata=JSON.parse(arow.data);
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(withSpamblockStatus(adata,'PEER_FLOOD')),owner,accountId,'account').run();
+     await writeRecordDiff(db,{owner,kind:'account',id:accountId},adata,withSpamblockStatus(adata,'PEER_FLOOD'));
     }
    }else if(result.status==='frozen'){
     accountWentCooldown=true;
@@ -3538,7 +3537,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
     if(arow){
      const adata=JSON.parse(arow.data);
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(withFrozenStatus(adata,result.error||'')),owner,accountId,'account').run();
+     await writeRecordDiff(db,{owner,kind:'account',id:accountId},adata,withFrozenStatus(adata,result.error||''));
     }
    }else if(floodWaitSeconds(result)>0){
     const waitSec=Math.max(60,floodWaitSeconds(result));
@@ -3584,7 +3583,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     const adata=JSON.parse(arow2.data);
     const mday=adata.memberInviteDay===day?Number(adata.memberInvitesToday)||0:0;
     const bumped=applyQuotaCooldownIfExhausted({...adata,memberInviteDay:day,memberInvitesToday:mday+okN});
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,accountId,'account').run();
+    await writeRecordDiff(db,{owner,kind:'account',id:accountId},adata,bumped);
     accMap.set(accountId,bumped);
    }
 
@@ -3723,14 +3722,15 @@ export async function POST(req:Request){const session=await getSessionUser();con
   const data=JSON.parse(row.data);
   if(b.action==='pause_mailing'){
    const next={...data,status:'paused',nextAt:'',tickLockUntil:'',log:pushTaskLog(data.log,'info','Задача остановлена',500)};
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'mailing_task').run();
+   // Field-level: a tick running right now keeps writing its delivery progress.
+   await writeRecordDiff(db,{owner,kind:'mailing_task',id},data,next);
    return reply({ok:true,task:next});
   }
   if(data.status==='running'){
    const lockT=Date.parse(String(data.tickLockUntil||''));
    const locked=Number.isFinite(lockT)&&lockT>Date.now();
    const next={...data,error:'',nextAt:locked?data.nextAt:'',tickLockUntil:locked?data.tickLockUntil:''};
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'mailing_task').run();
+   await writeRecordDiff(db,{owner,kind:'mailing_task',id},data,next);
    return reply({ok:true,task:next,already:true});
   }
   if(data.sourceKind==='audience'&&!data.audienceTaskId){
@@ -3829,7 +3829,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     ),
    };
   }
-  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'mailing_task').run();
+  await writeRecordDiff(db,{owner,kind:'mailing_task',id},data,next);
   if(next.status==='running'){
    void notifyMailingEvent(db,owner,String(next.name||'Рассылка'),`Запущена · к отправке ~${pending}`);
   }else if(next.status==='paused'&&next.error){
@@ -4141,22 +4141,48 @@ export async function POST(req:Request){const session=await getSessionUser();con
    logEntries.push({level:'info',text:'Смена аккаунта (смешанный режим)'});
   }
 
+  const taskRef={owner,kind:'mailing_task',id};
+  let okN=0;
+  let failN=0;
+  const aiPool:string[]=Array.isArray(data.aiPool)?[...data.aiPool]:[];
+  let aiPoolUsed=Number(data.aiPoolUsed)||0;
+  let deliveries:MailingDelivery[]=Array.isArray(data.deliveries)?[...data.deliveries]:[];
+  const newKeys:string[]=[...deliveredKeys];
+  const liveDeferred=()=>Object.fromEntries(Object.entries(deferredUntil).filter(([,v])=>{
+   const t=Date.parse(v);
+   return Number.isFinite(t)&&t>Date.now();
+  }));
+  /** Fields this tick owns; written after every recipient so pause/crash never resends. */
+  const progressFields=()=>({
+   sentTotal:(Number(data.sentTotal)||0)+okN,
+   sentToday:sentToday+okN,
+   failed:(Number(data.failed)||0)+failN,
+   sendDay:day,
+   aiPool,
+   aiPoolUsed,
+   deliveredKeys:newKeys.slice(-5000),
+   deferredUntil:liveDeferred(),
+   deliveries,
+  });
+  const readTaskStatus=async()=>{
+   const r:any=await db.prepare('SELECT json_extract(data,\'$.status\') AS status FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'mailing_task').first();
+   return String(r?.status||'');
+  };
+  /** Returns false when the task was paused/stopped meanwhile: stop sending. */
+  const saveMailingProgress=async()=>{
+   await patchRecordData(db,taskRef,progressFields());
+   return (await readTaskStatus())==='running';
+  };
   const persistMailingTask=async(patch:Record<string,unknown>,entries?:{level:'info'|'ok'|'warn'|'error';text:string}[])=>{
    const freshRow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'mailing_task').first();
    const fresh=freshRow?JSON.parse(freshRow.data):data;
-   if(fresh.status==='paused'){
-    const paused={...fresh,tickLockUntil:''};
-    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(paused),owner,id,'mailing_task').run();
-    return paused;
-   }
-   const next={
-    ...fresh,
-    ...patch,
-    log:entries?pushTaskLogs(Array.isArray(fresh.log)?fresh.log:data.log,entries,500):(patch.log??fresh.log),
-    tickLockUntil:'',
-   };
-   await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(next),owner,id,'mailing_task').run();
-   return next;
+   const log=entries?pushTaskLogs(Array.isArray(fresh.log)?fresh.log:data.log,entries,500):(patch.log??fresh.log);
+   // Paused meanwhile: keep the user's status, but never drop what was delivered.
+   const fields=fresh.status==='paused'
+    ?{...progressFields(),log,tickLockUntil:''}
+    :{...progressFields(),...patch,log,tickLockUntil:''};
+   await patchRecordData(db,taskRef,fields);
+   return {...fresh,...fields};
   };
 
   try{
@@ -4170,15 +4196,19 @@ export async function POST(req:Request){const session=await getSessionUser();con
    let activeAccountId=accountId;
    let activeLabel=accountLabel;
    let payload=await loadPayload(activeAccountId);
-   let okN=0;
-   let failN=0;
    let accountWentCooldown=false;
    let cooldownUntil='';
-   const aiPool:string[]=Array.isArray(data.aiPool)?[...data.aiPool]:[];
-   let aiPoolUsed=Number(data.aiPoolUsed)||0;
-   let deliveries:MailingDelivery[]=Array.isArray(data.deliveries)?[...data.deliveries]:[];
-   const newKeys:string[]=[...deliveredKeys];
    let nextAccountIndex=accountIndex;
+   /** Per-send quota bump: counters survive a crash later in the batch. */
+   const bumpSendCounters=async(aid:string)=>{
+    const arow:any=await db.prepare('SELECT data FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,aid,'account').first();
+    if(!arow)return;
+    const adata=JSON.parse(arow.data);
+    const counters=deliveryMode==='chat'?bumpChatCounters(adata,1):bumpMessageCounters(adata,1);
+    const bumped=applyQuotaCooldownIfExhausted({...adata,...counters});
+    await writeRecordDiff(db,{owner,kind:'account',id:aid},adata,bumped);
+    accMap.set(aid,bumped);
+   };
 
    for(const cand of batch){
     if(Date.now()-tickStartedAt>MAILING_TICK_BUDGET_MS){
@@ -4342,6 +4372,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     const ok=!!result.ok;
     if(ok){
      okN++;
+     await bumpSendCounters(activeAccountId);
      logEntries.push({level:'ok',text:mailingOkText(cand.username,cand.userId,link,text)});
      newKeys.push(cand.key);
      delete deferredUntil[cand.key];
@@ -4364,15 +4395,14 @@ export async function POST(req:Request){const session=await getSessionUser();con
         if(leadRow){
          const L=JSON.parse(leadRow.data);
          const replies=[...(Array.isArray(L.replies)?L.replies:[]),outbound].slice(-40);
-         await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-          ...L,
+         await patchRecordData(db,{owner,kind:'lead',id:cand.leadId},{
           replies,
           mailingTaskId:L.mailingTaskId||id,
           accountId:activeAccountId,
           senderId:L.senderId||cand.userId,
           senderUsername:L.senderUsername||cand.username||String(result.senderUsername||''),
           senderAccessHash:freshHash||L.senderAccessHash||cand.accessHash||'',
-         }),owner,cand.leadId,'lead').run();
+         });
         }
        }else{
         // Рассылка по аудитории — создаём карточку, чтобы ответ попал в «Переписки»
@@ -4412,16 +4442,15 @@ export async function POST(req:Request){const session=await getSessionUser();con
           const urow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,cand.recordId,'audience_user').first();
           if(urow){
            const ud=JSON.parse(urow.data);
-           await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-            ...ud,
+           await patchRecordData(db,{owner,kind:'audience_user',id:cand.recordId},{
             accessHash:freshHash,
             collectedByAccountId:ud.collectedByAccountId||activeAccountId,
-           }),owner,cand.recordId,'audience_user').run();
+           });
           }
-         }catch{/* */}
+         }catch(e){logActionError('tick_mailing_audience_hash',owner,e)}
         }
        }
-      }catch{/* */}
+      }catch(e){logActionError('tick_mailing_outbound_lead',owner,e)}
      }
      // После успеха крутим слот (если не sticky-only)
      nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
@@ -4454,13 +4483,11 @@ export async function POST(req:Request){const session=await getSessionUser();con
       logEntries.push({level:'warn',text:`Аккаунт ${bracketLabel(activeLabel)} недоступен: ${errRaw.slice(0,120)}`});
       const arow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,activeAccountId,'account').first();
       if(arow){
-       const adata=JSON.parse(arow.data);
-       await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({
-        ...adata,
+       await patchRecordData(db,{owner,kind:'account',id:activeAccountId},{
         status:'unauthorized',
         error:errRaw.slice(0,500),
         checkingAt:'',
-       }),owner,activeAccountId,'account').run();
+       });
       }
       nextAccountIndex=(nextAccountIndex+1)%Math.max(1,liveIds.length);
       break;
@@ -4485,6 +4512,10 @@ export async function POST(req:Request){const session=await getSessionUser();con
      deliveries=pushMailingDelivery(deliveries,entry);
     }
 
+    if(!(await saveMailingProgress())){
+     logEntries.push({level:'info',text:'Задача остановлена — остальные получатели не отправлены'});
+     break;
+    }
     if(accountWentCooldown)break;
    }
 
@@ -4493,15 +4524,8 @@ export async function POST(req:Request){const session=await getSessionUser();con
    accountIndex=nextAccountIndex;
 
    if(okN){
-    const arow2:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
-    if(arow2){
-     const adata=JSON.parse(arow2.data);
-     const counters=deliveryMode==='chat'
-      ?bumpChatCounters(adata,okN)
-      :bumpMessageCounters(adata,okN);
-     const bumped=applyQuotaCooldownIfExhausted({...adata,...counters});
-     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(bumped),owner,accountId,'account').run();
-     accMap.set(accountId,bumped);
+    const bumped=accMap.get(accountId);
+    if(bumped){
      if(bumped.status==='cooldown'){
       logEntries.push({level:'warn',text:`Аккаунт ${bracketLabel(accountLabel)} выработал дневной лимит — отлёжка до полуночи МСК`});
      }else if(!hasMessageQuota(bumped)&&deliveryMode!=='chat'){
@@ -4530,31 +4554,17 @@ export async function POST(req:Request){const session=await getSessionUser();con
    }
    logEntries.push({level:'info',text:`Ожидание ${pause} секунд`});
 
-   const cleanedDeferred:Record<string,string>={};
-   for(const [k,v] of Object.entries(deferredUntil)){
-    const t=Date.parse(v);
-    if(Number.isFinite(t)&&t>Date.now())cleanedDeferred[k]=v;
-   }
 
    if(!stillLive.length){
     const resumeIso=accountWentCooldown?(cooldownUntil||cooldownHoursFromNow(24)):moscowNextMidnightIso();
     logEntries.push({level:'info',text:accountWentCooldown?'Нет активных аккаунтов':'Ферма: дневной лимит сообщений, следующий аккаунт после полуночи'});
     logEntries.push({level:'info',text:`Автозапуск ${formatRuWhen(resumeIso)}`});
     const next=await persistMailingTask({
-     sentTotal:(Number(data.sentTotal)||0)+okN,
-     sentToday:sentToday+okN,
-     failed:(Number(data.failed)||0)+failN,
-     sendDay:day,
      accountIndex:0,
      lastAccountId:accountId,
      lastTickAt:new Date().toISOString(),
      nextAt:resumeIso,
      status:'scheduled',
-     aiPool,
-     aiPoolUsed,
-     deliveredKeys:newKeys.slice(-5000),
-     deferredUntil:cleanedDeferred,
-     deliveries,
      error:'',
     },logEntries);
     return reply({ok:true,sent:okN,scheduled:true,task:next});
@@ -4563,20 +4573,11 @@ export async function POST(req:Request){const session=await getSessionUser();con
    const nextLive=stillLive.length?stillLive:liveIds;
    const nextIndex=accountWentCooldown?0:(accountIndex%Math.max(1,nextLive.length));
    const next=await persistMailingTask({
-    sentTotal:(Number(data.sentTotal)||0)+okN,
-    sentToday:sentToday+okN,
-    failed:(Number(data.failed)||0)+failN,
-    sendDay:day,
     accountIndex:nextIndex,
     lastAccountId:accountId,
     lastTickAt:new Date().toISOString(),
     nextAt:new Date(Date.now()+pause*1000).toISOString(),
     status:'running',
-    aiPool,
-    aiPoolUsed,
-    deliveredKeys:newKeys.slice(-5000),
-    deferredUntil:cleanedDeferred,
-    deliveries,
     error:'',
    },logEntries);
    return reply({ok:true,sent:okN,failed:failN,task:next,accountId});

@@ -102,6 +102,26 @@ describe("FloodWait puts the account on cooldown", () => {
     expect(Date.parse(String(acc.cooldownUntil))).toBeGreaterThan(Date.now() + 200_000);
   });
 
+  it.each([
+    ["new status flood", { ok: false, status: "flood", join: "flood", waitSec: 400, error: "FloodWait 400" }],
+    ["legacy join flood", { ok: false, status: "setup", join: "flood", error: "FloodWait 400" }],
+  ])("join_group with %s", async (_label, answer) => {
+    mockWorker(() => answer);
+    insertRecord(harness.sqlite!, {
+      id: "22222222-2222-4222-8222-222222222222",
+      owner: OWNER,
+      kind: "group",
+      data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "none" },
+    });
+
+    const res = await POST(post({ action: "join_group", id: "22222222-2222-4222-8222-222222222222" }));
+
+    expect(res.status).toBe(429);
+    const acc = readData(harness.sqlite!, ACCOUNT_ID)!;
+    expect(acc.cooldownReason).toBe("flood");
+    expect(Date.parse(String(acc.cooldownUntil))).toBeGreaterThan(Date.now() + 300_000);
+  });
+
   it("tick_mailing send with flood:true/waitSec", async () => {
     mockWorker(() => ({ ok: false, status: "floodwait", flood: true, waitSec: 300, error: "FloodWait" }));
     insertRecord(harness.sqlite!, {

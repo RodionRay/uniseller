@@ -4643,7 +4643,7 @@ function WorkspaceHome(){
               </SelectContent>
             </Select>
           </label>
-          <Textarea aria-label="Список прокси" rows={7} value={importText} onChange={e=>setImportText(e.target.value)} placeholder={'176.56.35.182:5545:user:pass\n46.149.174.113:5545:user:pass'}/>
+          <Textarea aria-label="Список прокси" rows={7} value={importText} onChange={e=>setImportText(e.target.value)} placeholder={'192.0.2.10:5545:user:pass\n198.51.100.20:5545:user:pass'}/>
           <label className="field">Или загрузите .txt
             <Input type="file" accept=".txt" onChange={async e=>{const f=e.target.files?.[0];if(f){if(f.size>500000){setFormError('Файл больше 500 КБ');return}setImportText(await f.text());setFormError('')}}}/>
           </label>

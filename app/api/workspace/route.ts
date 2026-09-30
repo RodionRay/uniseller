@@ -39,6 +39,9 @@ import {
  type MailingLeadFilter,
  type MailingSourceKind,
 } from '@/lib/mailing';
+import {checkProxyTarget} from '@/lib/security/net-guard';
+import {authorizeWorkspaceAction,keepOwnerSecretsOnSave,visibleRecordsFor,type WorkspaceActor} from '@/lib/security/workspace-authz';
+import {ALL_CRM_ACCESS} from '@/lib/staff-types';
 import {env} from 'cloudflare:workers';
 import {z} from 'zod';
 export const dynamic='force-dynamic';
@@ -163,7 +166,7 @@ const schemas={
  }),
  proxy:z.object({
   name:short,
-  host:z.string().trim().regex(/^[a-zA-Z0-9.-]+$/).max(253),
+  host:z.string().trim().regex(/^[a-zA-Z0-9.-]+$/).max(253).refine(h=>checkProxyTarget(h,1).ok,{message:'forbidden_host'}),
   port:z.coerce.number().int().min(1).max(65535),
   protocol:z.enum(['socks5','http']),
   username:z.string().max(200).default(''),
@@ -357,15 +360,26 @@ const schemas={
  }),
 };
 function reply(data:unknown,status=200){return Response.json(data,{status,headers:{'Cache-Control':'no-store'}})}
-async function readOwner(){
+/** Messages safe to show the user verbatim; any other error text stays in server logs. */
+class UserFacingError extends Error{}
+
+function internalError(context:string,e:unknown,publicMessage:string){
+ if(e instanceof UserFacingError)return e.message;
+ console.error(`[workspace] ${context}:`,String((e as Error)?.message||e).slice(0,500));
+ return publicMessage;
+}
+
+async function readActor():Promise<WorkspaceActor|undefined>{
   const u=await getSessionUser();
   if(!u?.userId)return;
   try{
     const {resolveWorkspaceContext}=await import('@/lib/staff');
     const ctx=await resolveWorkspaceContext(u.userId);
-    return ctx.ownerId;
-  }catch{
-    return u.userId;
+    return {userId:u.userId,ownerId:ctx.ownerId,isOwner:ctx.isOwner,role:ctx.role,access:ctx.access};
+  }catch(e){
+    // Staff tables unavailable: fall back to the user's own (possibly empty) workspace, never the employer's.
+    console.error('[workspace] resolve context:',String((e as Error)?.message||e).slice(0,300));
+    return {userId:u.userId,ownerId:u.userId,isOwner:true,role:'owner',access:ALL_CRM_ACCESS};
   }
 }
 
@@ -382,6 +396,12 @@ async function runProxyCheck(owner:string,id:string){
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'proxy').first();
  if(!row)return {id,ok:false as const,error:'Прокси не найден',latencyMs:0,status:'inactive' as const};
  const data=JSON.parse(row.data);
+ const target=checkProxyTarget(String(data.host||''),Number(data.port));
+ if(!target.ok){
+  const failed={...data,status:'inactive',lastChecked:new Date().toISOString(),checkError:target.reason,exitIp:'',telegramOk:false,checkingAt:''};
+  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(failed),owner,id,'proxy').run();
+  return {id,ok:false as const,error:target.reason,latencyMs:0,status:'inactive' as const};
+ }
  const checkingAt=new Date().toISOString();
  await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...data,status:'checking',checkError:'',checkingAt}),owner,id,'proxy').run();
  if(!row.secret){
@@ -477,8 +497,8 @@ async function healStuckProxyChecks(owner:string,maxAgeMs=45_000){
 async function loadAccountSessionPayload(owner:string,accountId:string){
  const db=database();
  const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,accountId,'account').first();
- if(!row)throw new Error('Аккаунт не найден');
- if(!row.secret)throw new Error('У аккаунта нет сессии');
+ if(!row)throw new UserFacingError('Аккаунт не найден');
+ if(!row.secret)throw new UserFacingError('У аккаунта нет сессии');
  const data=JSON.parse(row.data);
  const secretRaw=await unseal(row.secret,owner);
  const session=JSON.parse(secretRaw);
@@ -487,6 +507,8 @@ async function loadAccountSessionPayload(owner:string,accountId:string){
   const prow:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,data.proxyId,'proxy').first();
   if(prow){
    const pdata=JSON.parse(prow.data);
+   const target=checkProxyTarget(String(pdata.host||''),Number(pdata.port));
+   if(!target.ok)throw new UserFacingError(target.reason);
    let password='';
    if(prow.secret){try{password=await unseal(prow.secret,owner)}catch{/* */}}
    proxyPayload={host:pdata.host,port:Number(pdata.port),protocol:pdata.protocol||'socks5',username:pdata.username||'',password};
@@ -1381,15 +1403,10 @@ function sameMailingPeer(lead:any,msg:any){
 }
 
 export async function GET(){const session=await getSessionUser();if(!session?.userId)return reply({error:'Войдите в рабочее пространство'},401);
- let owner=session.userId;
- let workspace:{ownerId:string;isOwner:boolean;role:string;access:Record<string,boolean>}={ownerId:session.userId,isOwner:true,role:'owner',access:{}};
- try{
-  const {resolveWorkspaceContext,CRM_ACCESS_KEYS}=await import('@/lib/staff');
-  const ctx=await resolveWorkspaceContext(session.userId);
-  owner=ctx.ownerId;
-  workspace={ownerId:ctx.ownerId,isOwner:ctx.isOwner,role:ctx.role,access:ctx.access};
-  for(const k of CRM_ACCESS_KEYS){if(workspace.access[k]==null)workspace.access[k]=ctx.isOwner}
- }catch{/* */}
+ const actor=await readActor();
+ if(!actor)return reply({error:'Войдите в рабочее пространство'},401);
+ const owner=actor.ownerId;
+ const workspace={ownerId:actor.ownerId,isOwner:actor.isOwner,role:actor.role,access:actor.access};
  try{
  // Снять залипшие «Проверяется», чтобы UI не блокировался
  try{await healStuckAccountChecks(owner,180_000)}catch{/* */}
@@ -1401,18 +1418,22 @@ export async function GET(){const session=await getSessionUser();if(!session?.us
  try{const h=await fetch(workerUrl()+'/health',{signal:AbortSignal.timeout(1500)});telegramConnected=h.ok}catch{telegramConnected=false}
  const envKey=!!envAiApiKey();
  return reply({
-  records:result.results.map((r:any)=>({
+  records:visibleRecordsFor(actor,result.results.map((r:any)=>({
    ...r,
    data:JSON.parse(r.data),
    hasSecret:r.kind==='settings'?!!(r.hasSecret||envKey):!!r.hasSecret,
-  })),
+  }))),
   telegramConnected,
   ai:{provider:process.env.AI_PROVIDER||'deepseek',hasEnvKey:envKey},
   workspace,
   me:{userId:session.userId,email:session.email,name:session.displayName},
  });
-}catch{return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
-export async function POST(req:Request){const owner=await readOwner();if(!owner)return reply({error:'Войдите в рабочее пространство'},401);const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);const db=database();
+}catch(e){internalError('GET',e,'');return reply({error:'Не удалось загрузить данные. Повторите попытку.'},503)}}
+export async function POST(req:Request){const actor=await readActor();if(!actor)return reply({error:'Войдите в рабочее пространство'},401);const owner=actor.ownerId;const origin=req.headers.get('origin');if(origin&&origin!==new URL(req.url).origin)return reply({error:'Недопустимый источник запроса'},403);try{const bodyText=await req.text();if(bodyText.length>250000)return reply({error:'Слишком большой запрос'},413);const b=JSON.parse(bodyText);
+ if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'Некорректный запрос'},400);
+ const authz=authorizeWorkspaceAction(actor,b.action,b.kind);
+ if(!authz.ok)return reply({error:authz.error},403);
+ const db=database();
  if(b.action==='draft'){
   const id=z.string().uuid().parse(b.id);
   const row:any=await db.prepare('SELECT * FROM records WHERE owner=? AND id=? AND kind=?').bind(owner,id,'lead').first();
@@ -1444,7 +1465,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    if(!update.meta.changes)return reply({error:'Сообщение изменено или лид удалён во время подготовки. Откройте актуальную карточку.'},409);
    return reply({ok:true,draft,model:resolveAiConfig(settings).model});
   }catch(e){
-   return reply({error:String((e as Error).message||e).slice(0,300)},502);
+   return reply({error:internalError('draft',e,'AI не смог подготовить черновик. Повторите попытку позже.')},502);
   }
  }
  if(b.action==='check_proxy'){
@@ -1586,7 +1607,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
       if(wr.status==='frozen')next.status='frozen';
      }catch(e){
       tgOk=false;
-      tgError=String((e as Error).message||e).slice(0,300);
+      tgError=internalError('apply_account_profiles',e,'Не удалось обновить профиль в Telegram');
      }
     }
    }
@@ -1620,7 +1641,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      results.push({id,ok:false,error:wr.error||'Ошибка фото'});
     }
    }catch(e){
-    results.push({id,ok:false,error:String((e as Error).message||e).slice(0,300)});
+    results.push({id,ok:false,error:internalError('upload_account_photos',e,'Не удалось загрузить фото')});
    }
    await new Promise(r=>setTimeout(r,1500));
   }
@@ -2587,7 +2608,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    }
    return reply({ok:true,lead:next,mode,link,messageId,rotatedAccount,accountId:sendAccountId});
   }catch(e){
-   return reply({error:String((e as Error).message||e).slice(0,500)},503);
+   return reply({error:internalError('send_lead_message',e,'Не удалось отправить сообщение. Повторите попытку.')},503);
   }
  }
  if(b.action==='rescan_groups'){
@@ -4550,6 +4571,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
   data.apiBase='https://api.deepseek.com';
   data.keywords=sanitizeLeadKeywords(String(data.keywords||''));
   data.minusKeywords=ensureJunkMinus(String(data.minusKeywords||''));
+  if(existing){try{Object.assign(data,keepOwnerSecretsOnSave(actor,data,JSON.parse(existing.data)))}catch{/* битые старые настройки — перезаписываем */}}
   if(!String(data.leadCriteria||'').trim()){
    data.leadCriteria='Целевой лид ЯВНО ищет сервис/инструмент/подрядчика под ваш продукт (остатки, синхронизация, цены, отзывы, кабинеты, 1С/МойСклад) и готов обсуждать демо или внедрение. Не лид: обычный чат селлеров, жалобы без запроса сервиса, чужая реклама.';
   }
@@ -4642,11 +4664,11 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    // Явный opt-in + жёсткий потолок: иначе импорт ZIP зависает на минуты (прокси×ретраи×автообход).
    provision=await Promise.race([
     runAccountCheck(owner,id,{ensureUsername:true,forceUsername:true,checkRestrictions:false,rotateProxy:false}),
-    new Promise<never>((_,rej)=>setTimeout(()=>rej(new Error('Таймаут записи @username')),18_000)),
+    new Promise<never>((_,rej)=>setTimeout(()=>rej(new UserFacingError('Таймаут записи @username')),18_000)),
    ]);
   }catch(e){
-   provision={ok:false,error:String((e as Error).message||e).slice(0,300)};
+   provision={ok:false,error:internalError('provision_username',e,'Не удалось записать @username')};
   }
  }
  return reply({ok:true,id,username:provision?.profile?.username||data.username||undefined,provision});
- }catch(e){if(e instanceof z.ZodError)return reply({error:'Проверьте поля: '+e.issues.map(i=>i.path.join('.')).join(', ')},400);if(e instanceof SyntaxError)return reply({error:'Некорректный запрос'},400);return reply({error:'Не удалось выполнить действие. Данные формы сохранены — повторите попытку.'},503)}}
+ }catch(e){if(e instanceof z.ZodError)return reply({error:'Проверьте поля: '+e.issues.map(i=>i.path.join('.')).join(', ')},400);if(e instanceof SyntaxError)return reply({error:'Некорректный запрос'},400);internalError('POST',e,'');return reply({error:'Не удалось выполнить действие. Данные формы сохранены — повторите попытку.'},503)}}

@@ -433,12 +433,15 @@ async function runProxyCheck(owner:string,id:string){
   };
  }catch(e){
   const msg=String((e as Error).message||e);
-  const workerDown=/ECONNREFUSED|fetch failed|AbortError|timeout|воркер/i.test(msg);
-  inconclusive=workerDown;
+  const busy=e instanceof WorkerBusyError;
+  const workerDown=!busy&&/ECONNREFUSED|fetch failed|AbortError|timeout|воркер/i.test(msg);
+  inconclusive=busy||workerDown;
   result={
    ok:false,
    latencyMs:0,
-   error:workerDown
+   error:busy
+    ?'Telegram-воркер занят другими проверками. Повторите через несколько секунд.'
+    :workerDown
     ?(/AbortError|timeout/i.test(msg)
       ?'Таймаут проверки прокси. Повторите или смените прокси.'
       :'Telegram-воркер недоступен для проверки прокси. Запустите: npm run dev')
@@ -532,12 +535,16 @@ async function loadAccountSessionPayload(owner:string,accountId:string){
  };
 }
 
+/** Worker answered 429: every slot and queue place is taken; nothing is wrong with the target. */
+class WorkerBusyError extends Error{}
+
 async function workerPost(path:string,body:unknown,timeoutMs=120_000){
  const headers:Record<string,string>={'Content-Type':'application/json'};
  const token=workerToken();
  if(token)headers.Authorization=`Bearer ${token}`;
  const res=await fetch(workerUrl()+path,{method:'POST',headers,body:JSON.stringify(body),signal:AbortSignal.timeout(timeoutMs)});
  const data:any=await res.json().catch(()=>({}));
+ if(res.status===429)throw new WorkerBusyError(data?.error||'Воркер занят');
  if(!res.ok&&!data?.ok&&!data?.status)throw new Error(data?.error||`Воркер ${res.status}`);
  return data;
 }

@@ -301,8 +301,6 @@ function groupAlreadyIn(item:RecordItem){
   if(d.membership==='joined'||d.membership==='pending')return true;
   if(d.status==='pending')return true;
   if(d.joinedAt)return true;
-  if(Number(d.leadsTotal)>0||Number(d.leadsHot)>0||Number(d.leadsWarm)>0||Number(d.scanMatched)>0)return true;
-  if(Array.isArray(d.scanLog)&&d.scanLog.length>0)return true;
   return false;
 }
 
@@ -735,9 +733,9 @@ function WorkspaceHome(){
   },[allowedNav,view]);
 
   const navBadges=useMemo(()=>{
+    // Только непрочитанные ответы клиента — не все открытые переписки
+    // Бейдж «Переписки» — только needsManager (непрочитанный ответ клиента)
     const needManager=list('lead').filter(r=>!!r.data.needsManager&&!r.data.excludeFromTraining).length;
-    const unreadChats=list('lead').filter(r=>(!!r.data.conversationOpen||!!r.data.draft)&&!r.data.viewed&&!r.data.excludeFromTraining).length;
-    const drafts=needManager||unreadChats;
     const groups=list('group').filter(r=>{
       const d=r.data||{};
       return d.status==='error'||d.membership==='pending'||JOIN_BUSY.has(String(d.joinState||''));
@@ -753,7 +751,7 @@ function WorkspaceHome(){
     const badges:Partial<Record<NavName,number>>={
       'Уведомления':notices.filter(n=>!n.read).length,
       'Лиды':freshLeads.length,
-      'Переписки':drafts,
+      'Переписки':needManager,
       'Группы и каналы':groups,
       'Сбор аудитории':audienceBusy,
       'Инвайтинг':inviteBusy,
@@ -789,7 +787,8 @@ function WorkspaceHome(){
   useEffect(()=>{
     if(!telegramConnected)return;
     const tick=async()=>{
-      if(taskPollLock.current||busyRef.current||joinRunnerLock.current||autoRescanLock.current)return;
+      if(taskPollLock.current)return;
+      // autoRescan/join не стопят тики задач — иначе сбор/инвайт простаивают минутами
       const snap=recordsRef.current;
       const runningAudience=snap.filter(r=>r.kind==='audience_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
       const runningInvite=snap.filter(r=>r.kind==='invite_task'&&(r.data.status==='running'||r.data.status==='scheduled')&&!pausedTasksRef.current.has(r.id));
@@ -800,30 +799,33 @@ function WorkspaceHome(){
         for(const t of runningAudience){
           try{
             const r=await api({action:'tick_audience',id:t.id});
+            if(r.busy||r.skipped)continue;
             applyTickTask(t.id,r.task);
             if(r.joined)toast.message(`${displayTgHandle(t.data.url||'')}: вступили в источник`);
             if(r.task?.status==='completed')toast.success(`Сбор завершён: ${displayTgHandle(t.data.url||'')} · ${r.task.collected||0}`);
-          }catch{/* */}
+            if(r.task?.status==='paused'&&r.task?.error)toast.error(String(r.task.error).slice(0,120));
+          }catch(e){toast.error(`Сбор: ${String((e as Error).message||e).slice(0,100)}`)}
         }
         for(const t of runningInvite){
           try{
             const r=await api({action:'tick_invite',id:t.id});
+            if(r.busy||r.skipped||r.waiting)continue;
             applyTickTask(t.id,r.task);
             if(r.completed)toast.success(`Инвайт завершён: ${displayTgHandle(t.data.targetUrl||'')}`);
-          }catch{/* */}
+          }catch(e){toast.error(`Инвайт: ${String((e as Error).message||e).slice(0,100)}`)}
         }
         for(const t of runningMailing){
           try{
             const r=await api({action:'tick_mailing',id:t.id});
             // skipped/busy — не затираем локальный running устаревшим paused
-            if(r.skipped||r.busy)continue;
+            if(r.skipped||r.busy||r.waiting)continue;
             applyTickTask(t.id,r.task);
             if(r.stopped){
               toast.error(r.task?.error||`Рассылка остановлена: ${t.data.name||''}`);
             }else if(r.completed){
               toast.success(`Рассылка завершена: ${t.data.name||''} · ${r.task?.sentTotal||0}`);
             }
-          }catch{/* */}
+          }catch(e){toast.error(`Рассылка: ${String((e as Error).message||e).slice(0,100)}`)}
         }
         }
         try{
@@ -1136,8 +1138,8 @@ function WorkspaceHome(){
               scan=await scanAfterJoin(g.id,g.name);
             }catch(scanErr){
               const scanData=(scanErr as Error & {data?:any})?.data;
-              // Soft need_join после успешного join: membership сохраняем, не в авто-rejoin
-              const keepJoined=!!scanData?.soft||!!scanData?.preserved||!!scanData?.needJoin;
+              // Soft need_join только при soft/preserved от API (не любой needJoin)
+              const keepJoined=!!scanData?.soft||!!scanData?.preserved;
               void persistJoinState(g.id,'');
               if(keepJoined){
                 patchGroupLocal(g.id,{
@@ -1149,11 +1151,22 @@ function WorkspaceHome(){
                   joinStateError:'',
                   error:'',
                 });
+                setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
+                toast.message(`${g.name}: вступили, скан подхватит автообход`);
+                onboarded++;
+              }else{
+                patchGroupLocal(g.id,{
+                  status:'setup',
+                  membership:'none',
+                  joinedAt:'',
+                  joinState:'queued',
+                  joinStateAt:new Date().toISOString(),
+                  joinStateError:String(scanData?.error||(scanErr as Error).message||'').slice(0,200),
+                  error:String(scanData?.error||(scanErr as Error).message||'').slice(0,200),
+                });
+                setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'error',error:String(scanData?.error||'нужно вступить снова').slice(0,120)}:q));
+                toast.message(`${g.name}: скан не подтвердил членство — снова в очередь`);
               }
-              setJoinQueueSync(prev=>prev.map(q=>q.id===g.id?{...q,status:'done',error:`Вступили · скан в автообходе`}:q));
-              toast.message(`${g.name}: вступили, скан подхватит автообход`);
-              // Не ставим autoRescanPending→rejoin: иначе снова в очередь
-              onboarded++;
               await refresh();
               continue;
             }
@@ -1410,7 +1423,7 @@ function WorkspaceHome(){
       if(modal.kind==='group')payload.url=canonicalizeTgUrl(payload.url||'');
       if(modal.kind==='audience_task')payload.url=canonicalizeTgUrl(payload.url||'');
       if(modal.kind==='invite_task')payload.targetUrl=canonicalizeTgUrl(payload.targetUrl||'');
-      const dup=findDuplicate(modal.kind,payload,records,modal.item?.id);
+      const dup=findDuplicate(modal.kind,payload,records.filter(r=>r.kind===modal.kind),modal.item?.id);
       if(dup){
         setFormError(duplicateReason(modal.kind,payload,dup.data)||'Такая запись уже есть');
         setBusy(false);
@@ -1554,6 +1567,7 @@ function WorkspaceHome(){
     }
     let added=0,scanned=0;
     const rejoin: {id:string;name:string}[]=[];
+    const scanErrors:string[]=[];
     for(const id of ids){
       if(!opts?.force&&(busyRef.current||joinRunnerLock.current))break;
       try{
@@ -1570,14 +1584,30 @@ function WorkspaceHome(){
         const data=(err as any)?.data;
         if(data?.rejoinItem?.id){
           // Soft/preserved — не перекидываем в очередь вступлений
-          if(data?.soft||data?.preserved)continue;
+          if(data?.soft||data?.preserved){
+            if(data?.usernameMissing&&!quiet){
+              const msg=String(data?.error||(err as Error).message||'').slice(0,120);
+              if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
+            }
+            continue;
+          }
           rejoin.push({id:data.rejoinItem.id,name:data.rejoinItem.name||'Группа'});
           continue;
         }
-        if(!quiet)toast.error(`Скан: ${(err as Error).message}`);
+        if(data?.usernameMissing||data?.skipped){
+          const msg=String(data?.error||(err as Error).message||'').slice(0,120);
+          if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
+          continue;
+        }
+        const msg=String((err as Error).message||'ошибка').slice(0,140);
+        if(msg&&!scanErrors.includes(msg))scanErrors.push(msg);
       }
     }
     if(rejoin.length)void startBackgroundJoins(rejoin);
+    if(!quiet&&scanErrors.length){
+      const head=scanErrors[0];
+      toast.error(scanErrors.length>1?`Скан: ${head} · ещё ${scanErrors.length-1}`:`Скан: ${head}`);
+    }
     if(scanned>0||added>0)await refresh();
     return {scanned,added,due:Number(pack.total)||ids.length,reassigned:Number(pack.reassigned)||0};
   }
@@ -4294,7 +4324,11 @@ function WorkspaceHome(){
           <form className="form-stack" onSubmit={save}>
             {modal?.kind!=='settings'&&modal?.kind!=='audience_task'&&modal?.kind!=='invite_task'&&modal?.kind!=='mailing_task'&&field('name','Название')}
             {modal?.kind==='audience_task'&&(
-              <AudienceTaskFields form={form} setForm={setForm} accounts={accountsUsableOpts}/>
+              <AudienceTaskFields
+                form={form}
+                setForm={(fn)=>{setFormError('');setForm(fn)}}
+                accounts={accountsUsableOpts}
+              />
             )}
             {modal?.kind==='invite_task'&&inviteWizardStep===1&&(
               <InviteModePicker mode={form.mode||'ordinary'} onPick={m=>setForm((f:any)=>({...f,mode:m}))} onContinue={()=>setInviteWizardStep(2)}/>

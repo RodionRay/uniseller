@@ -148,3 +148,109 @@ export function interpretJoinWorkerResult(result: JoinWorkerResult): JoinOutcome
   }
   return { kind: "fail", error: err.slice(0, 500) || "Не удалось вступить" };
 }
+
+/**
+ * Статусы, при которых аккаунт не вернётся сам: только тогда группу можно
+ * пересаживать со сбросом членства. disconnected / proxy_error / checking /
+ * отлёжка — временные: группы остаются на аккаунте.
+ */
+export const PERMANENT_DEAD_ACCOUNT_STATUSES = ["unauthorized", "frozen"] as const;
+
+export function isPermanentlyDeadAccount(status: string | null | undefined): boolean {
+  if (status == null) return true;
+  return (PERMANENT_DEAD_ACCOUNT_STATUSES as readonly string[]).includes(String(status));
+}
+
+/** После стольких неудачных вступлений группа выходит из автоочереди. */
+export const JOIN_MAX_ATTEMPTS = 5;
+const JOIN_RETRY_BASE_MS = 30 * 60_000;
+const JOIN_RETRY_MAX_MS = 24 * 60 * 60_000;
+/** Сбой воркера/сети — не вина группы: попытку не считаем, но и не долбим. */
+export const JOIN_WORKER_ERROR_RETRY_MS = 15 * 60_000;
+
+export function joinRetryDelayMs(attempts: number): number {
+  const n = Math.max(1, Math.floor(attempts));
+  return Math.min(JOIN_RETRY_MAX_MS, JOIN_RETRY_BASE_MS * 2 ** (n - 1));
+}
+
+type JoinRetryFields = {
+  joinAttempts?: number;
+  joinNextAt?: string;
+  joinGaveUp?: boolean;
+};
+
+/** Поля группы после неудачного вступления (backoff + отказ после лимита). */
+export function joinFailurePatch(
+  group: JoinRetryFields,
+  now = Date.now(),
+): Required<JoinRetryFields> {
+  const attempts = Math.max(0, Number(group.joinAttempts) || 0) + 1;
+  return {
+    joinAttempts: attempts,
+    joinNextAt: new Date(now + joinRetryDelayMs(attempts)).toISOString(),
+    joinGaveUp: attempts >= JOIN_MAX_ATTEMPTS,
+  };
+}
+
+export const JOIN_SUCCESS_PATCH: Required<JoinRetryFields> = {
+  joinAttempts: 0,
+  joinNextAt: "",
+  joinGaveUp: false,
+};
+
+export type GroupHealAction =
+  /** Уже внутри на рабочем слоте — не трогать. */
+  | "keep"
+  /** Вернуть на аккаунт, который уже вступал (членство в Telegram живо). */
+  | "restore_previous"
+  /** Аккаунт умер насовсем — пересадка на живой. */
+  | "reassign"
+  /** В очередь вступления на текущем слоте (join_group сам возьмёт свободный из фермы). */
+  | "enqueue"
+  /** Backoff после неудачи — ждём joinNextAt. */
+  | "wait"
+  /** Лимит попыток исчерпан — только ручное вступление. */
+  | "gave_up";
+
+/**
+ * Решение автопочинки по одной группе. Инвариант: членство вступившей группы
+ * сбрасывается только если её аккаунт умер насовсем.
+ */
+export function planGroupHeal(opts: {
+  group: JoinRetryFields & {
+    membership?: string;
+    status?: string;
+    joinedAt?: string;
+    accountId?: string;
+    joinedAccountId?: string;
+  };
+  /** status аккаунта группы; null — аккаунта нет. */
+  accountStatus: string | null;
+  /** status аккаунта joinedAccountId; null — нет/не найден. */
+  previousAccountStatus?: string | null;
+  now?: number;
+}): GroupHealAction {
+  const g = opts.group;
+  const now = opts.now ?? Date.now();
+  const member =
+    g.membership === "joined" ||
+    g.membership === "pending" ||
+    g.status === "pending" ||
+    !!g.joinedAt;
+  const dead = !g.accountId || isPermanentlyDeadAccount(opts.accountStatus);
+  if (member) return dead ? "reassign" : "keep";
+
+  const prev = String(g.joinedAccountId || "");
+  if (
+    prev &&
+    prev !== g.accountId &&
+    opts.previousAccountStatus != null &&
+    !isPermanentlyDeadAccount(opts.previousAccountStatus)
+  ) {
+    return "restore_previous";
+  }
+  if (g.joinGaveUp) return "gave_up";
+  const next = g.joinNextAt ? Date.parse(g.joinNextAt) : 0;
+  if (Number.isFinite(next) && next > now) return "wait";
+  return dead ? "reassign" : "enqueue";
+}

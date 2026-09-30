@@ -56,3 +56,11 @@ telegram-worker/vendor/
 
 # nested accidental copy
 uniseller-project/
+
+# Telegram sessions, archives, local DBs, editor state (may hold secrets/PII)
+tdata/
+*.session-journal
+*.zip
+*.sqlite*
+.cursor/
+# .env.bak* is already covered by .env* above

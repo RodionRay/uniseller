@@ -25,6 +25,8 @@ ENV NODE_ENV=production \
 # wrangler dev --local passes a client-supplied CF-Connecting-IP through, so no header is
 # trusted by default; see README "Client IP and rate limits".
 ENV TRUSTED_IP_HEADER=none
+# Wrangler 4.92 enables miniflare's Local Explorer (/cdn-cgi/explorer: raw SQL on D1) by default.
+ENV X_LOCAL_EXPLORER=false
 # wrangler (the server) is a devDependency, so node_modules is kept whole.
 COPY --from=web-build --chown=node:node /app /app
 RUN mkdir -p /data && chown node:node /data

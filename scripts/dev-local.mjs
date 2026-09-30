@@ -249,6 +249,8 @@ async function main() {
         env: {
           ...sharedSecrets,
           ...webRuntimeEnv,
+          // miniflare Local Explorer = raw SQL on D1 for anyone reaching the port.
+          X_LOCAL_EXPLORER: "false",
           PORT: String(webPort),
           TELEGRAM_WORKER_URL:
             process.env.TELEGRAM_WORKER_URL || `http://127.0.0.1:${workerPort}`,

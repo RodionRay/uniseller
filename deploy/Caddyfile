@@ -21,6 +21,9 @@ leads.example.com {
 	@cron path /api/cron /api/cron/*
 	respond @cron 404
 
+	# miniflare internals (Local Explorer = raw SQL on D1) must never be reachable publicly.
+	respond /cdn-cgi/* 404
+
 	# X-Real-IP is overwritten with the peer address, so a client cannot forge it.
 	# The app trusts it only with TRUSTED_IP_HEADER=x-real-ip in .env (default: no
 	# header is trusted and per-IP limits are off; README "Client IP and rate limits").

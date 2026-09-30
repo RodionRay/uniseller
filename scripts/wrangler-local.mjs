@@ -51,6 +51,9 @@ function wranglerEnv() {
       process.env.WRANGLER_REGISTRY_PATH || path.join(projectRoot, ".wrangler/dev-registry"),
     MINIFLARE_REGISTRY_PATH:
       process.env.MINIFLARE_REGISTRY_PATH || path.join(projectRoot, ".wrangler/registry"),
+    // Wrangler 4.92 serves miniflare's Local Explorer (/cdn-cgi/explorer: raw SQL on D1) by
+    // default to any request with `Host: localhost`; never overridable from the env.
+    X_LOCAL_EXPLORER: "false",
   };
 }
 

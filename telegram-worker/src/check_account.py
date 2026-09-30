@@ -1152,6 +1152,15 @@ async def scan_group(
     discussion_id = ""
     discussion_title = ""
 
+    def counters() -> dict[str, int]:
+        """Worker funnel for the scan log: read, dropped by stop-list, no keyword, not a person."""
+        return {
+            "fetched": fetched,
+            "skippedMinus": skipped_minus,
+            "skippedKw": skipped_kw,
+            "skippedNotUser": skipped_not_user,
+        }
+
     def passes_kw(text: str) -> bool:
         nonlocal skipped_kw
         low = text.lower()
@@ -1324,6 +1333,7 @@ async def scan_group(
                             "title": title,
                             "scanMode": scan_mode,
                             "needDiscussionJoin": True,
+                            **counters(),
                         }
                 async for m in client.iter_messages(linked, limit=fetch_limit):
                     await add_msg(m, kind="discussion", peer_entity=linked)
@@ -1363,7 +1373,7 @@ async def scan_group(
 
     except RPCError as e:
         if is_frozen_rpc(e):
-            return frozen_action_error("скан сообщений")
+            return {**frozen_action_error("скан сообщений"), **counters()}
         raise
 
     return {
@@ -1373,10 +1383,7 @@ async def scan_group(
         "messages": out[: max(limit, 40)],
         "error": "",
         "member": True,
-        "fetched": fetched,
-        "skippedMinus": skipped_minus,
-        "skippedKw": skipped_kw,
-        "skippedNotUser": skipped_not_user,
+        **counters(),
         "scanMode": scan_mode,
         "discussionId": discussion_id,
         "discussionTitle": discussion_title,

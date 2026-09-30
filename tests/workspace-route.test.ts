@@ -180,6 +180,36 @@ describe("per-account lease (REQ-B1)", () => {
     expect(readData(sqlite(), GROUP_ID)).toMatchObject({ membership: "joined" });
   });
 
+  it("scan_group writes the worker funnel counters into the group scan log", async () => {
+    mockWorker(() => ({
+      ok: true,
+      status: "active",
+      title: "G",
+      messages: [],
+      member: true,
+      fetched: 120,
+      skippedMinus: 80,
+      skippedKw: 30,
+      skippedNotUser: 2,
+      scanMode: "group_messages",
+    }));
+    await seedAccount(sqlite());
+    insertRecord(sqlite(), {
+      id: GROUP_ID,
+      owner: OWNER,
+      kind: "group",
+      data: { name: "G", url: "https://t.me/grp_one", accountId: ACCOUNT_ID, membership: "joined" },
+    });
+
+    const res = await POST(post({ action: "scan_group", id: GROUP_ID, force: true }));
+
+    expect(res.status).toBe(200);
+    const log = (readData(sqlite(), GROUP_ID) as { scanLog: { text: string }[] }).scanLog;
+    expect(log.at(-1)?.text).toBe(
+      "Переобход · 0 · group_messages · прочитано 120 · стоп 80 · нет ключей 30 · не люди 2 · worker 0 → ядро 0 → AI/match 0",
+    );
+  });
+
   it("check_account on a busy account keeps its status", async () => {
     const calls = mockWorker(() => ({ ok: true, status: "active" }));
     await seedAccount(sqlite(), ACCOUNT_ID, { status: "active" });

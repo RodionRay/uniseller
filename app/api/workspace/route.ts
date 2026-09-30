@@ -23,6 +23,7 @@ import {
 } from '@/lib/lead-core';
 import {appendLearnExamples,extractTermsFromHotMessages,extractStopTermsFromMessage,mergeKeywords,mergeKeywordsPreferNew,parseKeywordCsv} from '@/lib/ai-keywords';
 import {learnableMinusTerms,sanitizeMinusTerms,scanStopTerms} from '@/lib/lead-stopwords';
+import {workerFunnelText} from '@/lib/scan-funnel';
 import {ACCOUNT_STATUSES,DEFAULT_ACCOUNT_LIMITS,JOIN_GAP_DEFAULT_SEC,PROXY_STATUSES,applyQuotaCooldownIfExhausted,bumpChatCounters,bumpJoinCounters,bumpMessageCounters,canPollDmInbox,cooldownHoursFromNow,floodWaitSeconds,generateTelegramUsername,hasChatQuota,hasInviteQuota,hasMemberInviteQuota,hasMessageQuota,isAccountUsable,isDayLimitCooldown,isFloodCooldown,isOnCooldown,joinWaitSec,moscowDayKey,moscowNextMidnightIso,withFrozenStatus,withSpamblockStatus} from '@/lib/telegram-accounts';
 import {bracketLabel,formatRuWhen,inviteUserFailText,inviteUserOkText,normalizeStatusFilters,normalizeTgRef,pushTaskLog,pushTaskLogs,randomPauseSec} from '@/lib/audience-invite';
 import {canonicalizeTgUrl,duplicateReason,isDuplicateKind,telegramEntityKey} from '@/lib/record-identity';
@@ -2240,6 +2241,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
    }
    const cutoff=Date.now()-scanDepthDays*24*60*60*1000;
    const workerRaw=Array.isArray(result.messages)?result.messages.length:0;
+   const workerFunnel=workerFunnelText(result);
    let candidates=(result.messages||[]).filter((msg:any)=>{
     if(msg.date){
      const t=Date.parse(msg.date);
@@ -2413,9 +2415,7 @@ export async function POST(req:Request){const session=await getSessionUser();con
     scanLog:pushTaskLog(
      gdata.scanLog,
      added?'ok':'info',
-     added
-      ?`Переобход · +${added} · ${String(result.scanMode||'chat')} · worker ${workerRaw} → ядро ${prefilterCount} → AI/match ${candidates.length}${aiUsed?' · AI':''}`
-      :`Переобход · 0 · ${String(result.scanMode||'chat')} · worker ${workerRaw} → ядро ${prefilterCount} → AI/match ${candidates.length}${aiUsed?' · AI':''}`,
+     `Переобход · ${added?`+${added}`:'0'} · ${String(result.scanMode||'chat')}${workerFunnel?` · ${workerFunnel}`:''} · worker ${workerRaw} → ядро ${prefilterCount} → AI/match ${candidates.length}${aiUsed?' · AI':''}`,
      50,
     ),
    };

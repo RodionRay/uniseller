@@ -77,7 +77,7 @@ export function interpretInviteWorkerResult(
     }).format(new Date());
     const prev =
       account.memberInviteDay === day ? Number(account.memberInvitesToday) || 0 : 0;
-    const bumped = applyQuotaCooldownIfExhausted({
+    const bumped = applyQuotaCooldownIfExhausted<Record<string, unknown>>({
       ...account,
       memberInviteDay: day,
       memberInvitesToday: prev + okN,
@@ -95,11 +95,19 @@ export function interpretInviteWorkerResult(
 }
 
 /** Жив ли слот для следующего тика инвайта. */
+export type InviteAccountState = {
+  status?: string | null;
+  cooldownUntil?: string | null;
+  limits?: { memberInvite?: unknown };
+  memberInvitesToday?: number;
+  memberInviteDay?: string;
+} | null | undefined;
+
 export function inviteAccountStillLive(
-  account: Parameters<typeof isAccountUsable>[0],
+  account: InviteAccountState,
   wentCooldown: boolean,
 ): boolean {
   if (wentCooldown) return false;
   if (!isAccountUsable(account)) return false;
-  return hasMemberInviteQuota(account as Parameters<typeof hasMemberInviteQuota>[0]);
+  return hasMemberInviteQuota(account);
 }

@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { decideScanLead, evaluateScanGate } from "@/lib/processes/scan-flow";
+import {
+  decideScanLead,
+  evaluateScanGate as scanGate,
+} from "@/lib/processes/scan-flow";
 import type { LeadCoreSettings } from "@/lib/lead-core";
 import { withDayLimitCooldown, withSpamblockStatus } from "@/lib/telegram-accounts";
+
+/** Narrows the gate union so blocked results expose `reason`. */
+function evaluateScanGate(...args: Parameters<typeof scanGate>) {
+  const r = scanGate(...args);
+  if (!r.ok) return r;
+  return { ...r, reason: undefined };
+}
 
 const settings: LeadCoreSettings = {
   keywords:

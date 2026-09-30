@@ -680,6 +680,7 @@ async def join_group(client, url: str, peer_hint: dict | None = None) -> dict[st
                     "status": "error",
                     "join": resolve_err.get("join") or "missing",
                     "usernameMissing": bool(resolve_err.get("usernameMissing")),
+                    "accountBlind": bool(resolve_err.get("accountBlind")),
                     "error": str(resolve_err.get("error") or "Не удалось найти группу")[:400],
                     "member": False,
                 }
@@ -1241,6 +1242,26 @@ async def _resolve_username_via_search(client, want: str):
         return None
 
 
+RESOLVE_CONTROL_USERNAME = "telegram"
+
+
+async def _account_resolve_blind(client) -> bool:
+    """Аккаунт не резолвит даже @telegram → ограничен сам слот, группа ни при чём.
+
+    Только явный UsernameNotOccupied/Invalid считаем слепотой; сеть/прочее — «не знаем» (False).
+    """
+    from telethon.tl.functions.contacts import ResolveUsernameRequest
+    from telethon.errors import UsernameNotOccupiedError, UsernameInvalidError
+
+    try:
+        await client(ResolveUsernameRequest(RESOLVE_CONTROL_USERNAME))
+        return False
+    except (UsernameNotOccupiedError, UsernameInvalidError):
+        return True
+    except Exception:
+        return False
+
+
 async def _resolve_entity(client, url: str, peer_hint: dict | None = None):
     from telethon.tl.functions.messages import CheckChatInviteRequest
     from telethon.tl.types import ChatInviteAlready
@@ -1296,6 +1317,20 @@ async def _resolve_entity(client, url: str, peer_hint: dict | None = None):
             or "cannot find any entity" in detail.lower()
             or "no user has" in detail.lower()
         ):
+            if await _account_resolve_blind(client):
+                return None, {
+                    "ok": False,
+                    "status": "error",
+                    "join": "missing",
+                    "usernameMissing": True,
+                    "accountBlind": True,
+                    "error": (
+                        f"Аккаунт не резолвит даже @{RESOLVE_CONTROL_USERNAME} — ограничен Telegram, "
+                        f"@{uname} тут ни при чём ({type(e).__name__}: {detail})"
+                    )[:400],
+                    "users": [],
+                    "hasMore": False,
+                }
             return None, {
                 "ok": False,
                 "status": "error",
@@ -2591,7 +2626,10 @@ async def run_action(payload: dict[str, Any]) -> dict[str, Any]:
             url = payload.get("url") or ""
             if action == "join":
                 peer_hint = payload.get("peerHint") if isinstance(payload.get("peerHint"), dict) else None
-                return await join_group(client, url, peer_hint=peer_hint)
+                res = await join_group(client, url, peer_hint=peer_hint)
+                # Диагностика: новая авторизация на каждый вызов — главный подозреваемый в «слепоте»
+                res["sessionRefreshed"] = bool(getattr(client, "_uniseller_session_refreshed", False))
+                return res
             if action == "scan":
                 keywords = payload.get("keywords") or []
                 if isinstance(keywords, str):

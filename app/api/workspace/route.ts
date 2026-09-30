@@ -1,6 +1,6 @@
 import {getSessionUser} from '@/lib/auth';
 import {GROUP_CATALOG,isCatalogPlaceholderUrl} from '@/lib/group-catalog';
-import {JOIN_SUCCESS_PATCH,JOIN_WORKER_ERROR_RETRY_MS,joinFailurePatch,planGroupHeal,sanitizeJoinStateError} from '@/lib/processes/join-flow';
+import {JOIN_SUCCESS_PATCH,JOIN_WORKER_ERROR_RETRY_MS,accountBlindPatch,isAccountBlindResult,isAccountResolveBlind,joinFailurePatch,planGroupHeal,sanitizeJoinStateError} from '@/lib/processes/join-flow';
 import {database,seal,unseal} from '@/lib/server-store';
 import {aiChatText,envAiApiKey,resolveAiConfig} from '@/lib/ai-client';
 import {buildProjectBrief,leadMessageFingerprint,normalizeLeadMessage,parseLeadTemperature,ratingFromTemperatures,strongPlusTerms,type LeadTemperature} from '@/lib/lead-filter';
@@ -1052,6 +1052,7 @@ async function listJoinFarmCandidates(owner:string):Promise<FarmJoinCandidate[]>
    const a=JSON.parse(String(r.data));
    if(!isAccountUsable(a))continue;
    if(!hasInviteQuota(a))continue;
+   if(isAccountResolveBlind(a))continue;
    const id=String(r.id);
    live.push({id,data:a,wait:joinWaitSec(a),load:load.get(id)||0});
   }catch{/* */}
@@ -1582,6 +1583,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const currentReady=
     isAccountUsable(adata)&&
     hasInviteQuota(adata)&&
+    !isAccountResolveBlind(adata)&&
     joinWaitSec(adata)===0;
    if(!currentReady){
     const farm=await listJoinFarmCandidates(owner);
@@ -1594,6 +1596,15 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
      rotatedAccount=true;
      try{await appendGlobalRescanLog(owner,'info',`${gdata.name||'Группа'}: ферма ${fromId.slice(0,8)} → ${pick.id.slice(0,8)}`)}catch{/* */}
     }else if(!pick){
+     if(isAccountResolveBlind(adata)){
+      const until=Date.parse(String(adata.resolveBlindUntil));
+      return reply({
+       error:'Все аккаунты фермы не резолвят @username (ограничены Telegram) — ждём отлёжку или нужен новый аккаунт',
+       waitSec:Math.max(300,Math.ceil((until-Date.now())/1000)),
+       accountBlind:true,
+       cooldown:true,
+      },429);
+     }
      const inviteLimit=Number(adata.limits?.invite??DEFAULT_ACCOUNT_LIMITS.invite);
      if(!hasInviteQuota(adata)||!isAccountUsable(adata)){
       return reply({
@@ -1637,6 +1648,8 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
    const result=await workerPost('/join-group',{...payload,url:gdata.url});
    const frozen=result.status==='frozen'||result.join==='frozen'||/FROZEN|заморожен/i.test(String(result.error||''));
    const flood=result.join==='flood'||/FloodWait/i.test(String(result.error||''));
+   // Слеп аккаунт, а не группа — попытку группе не засчитываем (иначе живые группы уходят в отказ)
+   const accountBlind=isAccountBlindResult(result);
    const joinedOk=!!result.ok||result.join==='already'||result.join==='requested';
    const reallyJoined=result.join==='already'||(!!result.ok&&result.join!=='requested'&&result.join!=='flood'&&result.join!=='missing'&&result.join!=='frozen');
    const status=result.join==='requested'?'pending':reallyJoined?'active':frozen?'error':'error';
@@ -1653,7 +1666,7 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     joinStateAt:'',
     joinStateError:reallyJoined||result.join==='requested'?'':(result.error||'Не удалось вступить').slice(0,500),
     // FloodWait — проблема аккаунта, не группы: попытку не считаем
-    ...(joinedOk?JOIN_SUCCESS_PATCH:flood?{}:joinFailurePatch(gdata)),
+    ...(joinedOk?JOIN_SUCCESS_PATCH:flood||accountBlind?{}:joinFailurePatch(gdata)),
     name:result.title&&(!gdata.name||gdata.name.startsWith('http')||gdata.name==='Группа')?result.title:gdata.name,
    };
    // accessHash только от фактического join/already этой сессии
@@ -1677,6 +1690,10 @@ export async function POST(req:Request){const owner=await readOwner();if(!owner)
     };
     await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify(paced),owner,gdata.accountId,'account').run();
     return reply({ok:false,result,error:result.error,waitSec:sec,flood:true,pace:true},429);
+   }
+   if(accountBlind){
+    await db.prepare('UPDATE records SET data=? WHERE owner=? AND id=? AND kind=?').bind(JSON.stringify({...adata,...accountBlindPatch(),error:String(result.error||'').slice(0,500)}),owner,gdata.accountId,'account').run();
+    try{await appendGlobalRescanLog(owner,'warn',`Аккаунт ${String(gdata.accountId).slice(0,8)} слеп на ResolveUsername${result.sessionRefreshed?' (новая сессия)':''} — отлёжка 6 ч`)}catch{/* */}
    }
    if(frozen){
     const cooled=withFrozenStatus(adata,result.error||'Аккаунт заморожен Telegram');

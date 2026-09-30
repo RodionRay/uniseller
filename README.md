@@ -1,40 +1,56 @@
 # Uniseller Leads
 
-Private administration workspace for Telegram sources and sales leads.
+Кабинет для поиска тёплых заявок в Telegram: аккаунты, прокси, группы, лиды, рассылки и инвайты.
+Два процесса: веб-приложение (vinext / React, сервер — wrangler/workerd, база — локальная Cloudflare D1)
+и Telegram-воркер (Node HTTP + Python/Telethon).
 
-## Implemented
-- D1 persistence, per-user server authorization, same-origin mutations.
-- CRUD accounts, proxies, groups and manually entered leads.
-- Proxy import, account/proxy assignment, dependency validation on removal.
-- AES-GCM encrypted proxy passwords and OpenAI API keys.
-- OpenAI Responses API draft generation and manual editing/copying.
-- Russian responsive UI inspired by Air on Refero Styles.
+## Что работает сейчас
+- **Аккаунты Telegram**: импорт `tdata` и `.session` (архивы zip/rar), проверка аккаунта, профили и фото,
+  назначение прокси; прокси — импорт списком, проверка SOCKS5/HTTP (`lib/proxy-check.ts`).
+- **Группы и лиды**: вступление в группы (`lib/processes/join-flow.ts`), сканирование сообщений и отбор
+  лидов (`lib/processes/scan-flow.ts`, `lib/lead-*.ts`), AI-черновики ответов и отправка после подтверждения.
+- **Рассылки и инвайты**: `lib/processes/mailing-tick.ts`, `lib/processes/invite-tick.ts`, сбор аудитории.
+- **Автообход**: воркер каждые 5 минут вызывает `POST /api/cron/auto-rescan` (Bearer `CRON_SECRET`).
+- **Вход**: email + пароль, Google / Яндекс / VK OAuth, Telegram Login; администратор из env.
+  Самостоятельная регистрация закрыта, пока `REGISTRATION_OPEN` не равен `true`
+  (это касается и новых пользователей через OAuth/Telegram). Вход ограничен: 10 неудачных попыток на пару
+  IP + email за 15 минут, затем `429`.
+- **Сотрудники**: приглашения в кабинет с ролями и доступами (`lib/staff.ts`).
+- **Здоровье**: `GET /api/health` — D1, обязательные переменные окружения (только имена, без значений),
+  доступность воркера; `503`, если что-то не так.
 
-## Not implemented yet
-Telegram authorization / tdata import, joining groups, proxy connectivity checks, background message collection, automatic lead qualification and Telegram sending. These require a separate long-running Telegram connector; Sites has no raw TCP support. UI labels these limitations.
+Секретные поля записей (`records.secret`: пароли прокси, ключи, данные сессий) шифруются AES-GCM ключом
+`ENCRYPTION_KEY` — без него данные из бэкапа не расшифровать.
 
-## Development
-1. Copy `.env.example` to `.env` and set secrets:
-   - `ENCRYPTION_KEY` — 64 hex chars (`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`)
-   - `SESSION_SECRET` — at least 32 random chars
-   - `ADMIN_EMAIL` / `ADMIN_PASSWORD_HASH` — hash via `npm run auth:hash -- 'your-password'` (colon-separated `pbkdf2:...`, no `$`)
-2. `npm run install:ci`
-3. `npm run build`
-4. Apply D1 migration once (local wrangler state):
-   `node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --persist-to .wrangler/state --config dist/server/wrangler.json --file drizzle/0000_even_hydra.sql`
-5. One command for кабинет + Telegram-воркер:
-   `npm run dev`
-   (воркер сам перезапускается при падении; отдельно `tg:worker` не нужен)
-   Только UI без воркера: `npm run dev:web`
-6. Open http://localhost:5173/login
+## Локальный запуск
+1. `cp .env.example .env` и заполнить обязательные переменные (команды генерации — в `.env.example`).
+   Пароль администратора: `npm run auth:hash -- 'пароль'` → `ADMIN_PASSWORD_HASH`.
+2. `npm install`
+3. Воркер: `cd telegram-worker && python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+4. База: `npm run build && npm run db:migrate` (локальная D1 в `.wrangler/state`).
+5. `npm run dev` — кабинет (http://localhost:5173) и воркер одной командой.
 
-Runtime DB is Cloudflare D1 (local file under `.wrangler/state`). `better-sqlite3` is only for optional Node scripts (`npm run db:migrate`).
+Продакшн-сборка локально: `npm run build && npm start` (тот же сервер, что в Docker).
 
-## Not implemented yet
-Telegram authorization / tdata import, joining groups, proxy connectivity checks, background message collection, automatic lead qualification and Telegram sending. These require a separate long-running Telegram connector; Sites has no raw TCP support. UI labels these limitations.
+## База данных и миграции
+Схема — `db/schema.ts`, миграции генерирует `npm run db:generate` (drizzle-kit) в `drizzle/`.
+Применяются одной командой: **`npm run db:migrate`** (`wrangler d1 migrations apply DB --local`, учёт в
+таблице `d1_migrations`; каталог задан `migrations_dir` в `vite.config.ts`). Все миграции написаны как
+`CREATE ... IF NOT EXISTS`, поэтому безопасны на базе, где таблицы уже есть.
 
-## Validation
-Build and TypeScript pass. Local HTTP checks cover authentication, origin rejection, input validation, secret redaction, CRUD, references and missing AI configuration. Live Telegram and OpenAI calls have not been tested.
+Существующая локальная база, созданная до этой схемы (0000 вручную, остальные таблицы — во время работы):
+```sh
+npm run build
+npm run db:baseline -- --dry-run   # покажет, какие миграции будут отмечены применёнными
+npm run db:baseline                # отметит их в d1_migrations (только если все их таблицы уже есть)
+npm run db:migrate                 # применит оставшиеся (0002 при отсутствии таблиц, 0003 rate_limits)
+```
+Резервную копию перед этим — `node scripts/d1-backup.mjs` (см. `docs/DEPLOY.md`).
 
-Motion references: Fade Slide Tabs by Ruixen UI and Animate Digits by unlumen on 21st.dev. Admin visual language inspired by Spike (WrapPixel): Plus Jakarta Sans, `#0085db`, light paper cards on `#F0F5F9`.
+## Проверки
+`npm run lint` · `npx tsc --noEmit` · `npx vitest run` · `npm run build` · `npm audit --audit-level=high`
+— то же выполняет CI (`.github/workflows/ci.yml`).
 
+## Развёртывание
+Один Linux VPS, `docker compose` (web + worker), Caddy для HTTPS, ежедневный бэкап D1:
+**[docs/DEPLOY.md](docs/DEPLOY.md)**.

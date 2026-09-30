@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isSameOriginRequest } from "@/lib/env";
+import { isSameOriginRequest, requestOrigin } from "@/lib/env";
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth";
 import { findUserById } from "@/lib/users";
@@ -176,13 +176,11 @@ async function handlePost(
       access: access || accessForRole(role),
       days,
     });
-    const base =
-      origin ||
-      `${new URL(req.url).protocol}//${req.headers.get("host") || "localhost:5173"}`;
+    // APP_URL, not the client-controlled Host header, is the origin of a link the owner shares.
     return reply({
       ok: true,
       invite,
-      url: inviteUrl(base, invite.token),
+      url: inviteUrl(requestOrigin(req), invite.token),
     });
   }
 

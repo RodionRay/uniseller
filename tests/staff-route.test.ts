@@ -18,6 +18,7 @@ vi.mock("@/lib/staff", async () => {
     },
     listMembers: async () => [],
     listPendingInvites: async () => [],
+    createInvite: async () => ({ id: "i1", token: "tok-1234567890abcdef" }),
   };
 });
 
@@ -86,5 +87,24 @@ describe("same-origin check behind a reverse proxy", () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+describe("invite link origin", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  // The Host header is client-controlled: a forged one must not end up in the link the owner shares.
+  it("builds the invite URL from APP_URL, not from the Host header", async () => {
+    vi.stubEnv("APP_URL", "https://crm.example.com");
+    const res = await POST(
+      new Request("http://web:5173/api/staff", {
+        method: "POST",
+        headers: { host: "evil.example" },
+        body: JSON.stringify({ action: "create_invite", role: "manager" }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const { url } = (await res.json()) as { url: string };
+    expect(new URL(url).origin).toBe("https://crm.example.com");
   });
 });
